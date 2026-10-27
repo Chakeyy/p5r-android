@@ -40,16 +40,48 @@ VkPipelineCache pipeline_cache() {
     if (const char* e = std::getenv("NX_PIPELINE_CACHE"); e && e[0] == '0') return VK_NULL_HANDLE;
     VkPhysicalDeviceProperties p{};
     p_vkGetPhysicalDeviceProperties(vk_physical(), &p);
-    char name[64];
-    std::snprintf(name, sizeof name, "/pipelines_%04x_%04x.bin", p.vendorID, p.deviceID);
-    g_path = plat::data_root() + name;
+    const char* custom_path = plat::get_pipeline_cache_path();
+    if (custom_path && *custom_path) {
+        g_path = custom_path;
+    } else {
+        char name[64];
+        std::snprintf(name, sizeof name, "/pipelines_%04x_%04x.bin", p.vendorID, p.deviceID);
+        g_path = plat::data_root() + name;
+    }
     std::vector<uint8_t> data;
     if (FILE* f = plat::fopen_utf8(g_path, "rb")) {
         plat::fseek64(f, 0, SEEK_END);
         int64_t n = plat::ftell64(f);
         plat::fseek64(f, 0, SEEK_SET);
-        if (n > 0) data.resize(size_t(n)), data.resize(std::fread(data.data(), 1, data.size(), f));
+        if (n > 0) {
+            data.resize(size_t(n));
+            size_t read_bytes = std::fread(data.data(), 1, data.size(), f);
+            data.resize(read_bytes);
+        }
         std::fclose(f);
+    }
+    struct CacheHeader {
+        uint32_t headerSize;
+        uint32_t headerVersion;
+        uint32_t vendorID;
+        uint32_t deviceID;
+        uint8_t  pipelineCacheUUID[VK_UUID_SIZE];
+    };
+    bool valid_header = false;
+    if (data.size() >= sizeof(CacheHeader)) {
+        const auto* h = reinterpret_cast<const CacheHeader*>(data.data());
+        if (h->headerSize >= sizeof(CacheHeader) &&
+            h->headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+            h->vendorID == p.vendorID &&
+            h->deviceID == p.deviceID &&
+            std::memcmp(h->pipelineCacheUUID, p.pipelineCacheUUID, VK_UUID_SIZE) == 0) {
+            valid_header = true;
+        } else {
+            log("nvn/vk: pipeline cache %s has mismatched header, resetting", g_path.c_str());
+        }
+    }
+    if (!valid_header && !data.empty()) {
+        data.clear();
     }
     VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     ci.initialDataSize = data.size();
@@ -163,7 +195,13 @@ void creation_log(uint64_t frames) {
     g_prewarmed = g_waited = g_waited_ns = g_skipped = 0;
     g_pipelines = 0, g_pipeline_ns = 0, g_astc = g_astc_ns = 0;
     static uint64_t windows = 0;
-    if (++windows % 10 == 0) pipeline_cache_save(), warm_save();
+    static uint64_t last_save_ns = 0;
+    uint64_t now_ns = plat::monotonic_ns();
+    if (++windows % 10 == 0 || (now_ns - last_save_ns >= 120ULL * 1'000'000'000ULL)) {
+        last_save_ns = now_ns;
+        pipeline_cache_save();
+        warm_save();
+    }
 }
 
 }  // namespace nx::nvn

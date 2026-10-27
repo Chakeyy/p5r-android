@@ -62,10 +62,15 @@ VkSampler sampler_for(const SamplerInfo& s, bool shadow, bool biased) {
     ci.minLod = m <= 1 ? 0.0f : std::max(0.0f, s.lod_min);
     ci.maxLod = m <= 1 ? 0.25f : std::max(ci.minLod, s.lod_max);  // no mipmapping: level 0 only
     // NX_MAX_ANISO=<n>: anisotropic filtering at most n taps (1: off). P5R asks 16 for its ground and walls, which a
-    // small GPU pays in every pixel of the 3D passes.
+    // small GPU pays in every pixel of the 3D passes. Clamped to 2 on Android/ARM to prevent Mali memory bus saturation.
     static const float aniso_cap = [] {
         const char* e = std::getenv("NX_MAX_ANISO");
-        return std::clamp(e ? float(std::atof(e)) : 16.0f, 1.0f, 16.0f);
+#if defined(__ANDROID__) || defined(__aarch64__)
+        float def = 2.0f;
+#else
+        float def = 16.0f;
+#endif
+        return std::clamp(e ? float(std::atof(e)) : def, 1.0f, 16.0f);
     }();
     ci.maxAnisotropy = std::min(s.max_anisotropy, aniso_cap);
     ci.anisotropyEnable = ci.maxAnisotropy > 1.0f;

@@ -416,6 +416,7 @@ Pool& pool() {
         pl->threads = std::min(n, 8u);
         for (unsigned i = 0; i < pl->threads; i++)
             std::thread([pl] {
+                plat::pin_current_thread_to_little_cores("VK-PipeCompile");
                 t_worker = true;
                 for (;;) {
                     std::shared_ptr<PipeTask> t;

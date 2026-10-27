@@ -26,6 +26,7 @@ namespace replay {
 State g_state;
 Stats g_stats;
 bool g_hud_target = false;
+bool g_shadow_target = false;
 
 const uint8_t* guest_bytes(uint64_t gpu) {
     uint64_t off = 0;
@@ -251,6 +252,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     }
     if (extent.width == UINT32_MAX) extent = {1, 1};
     VkRenderingAttachmentInfo stencil = depth;  // same view, its own loadOp
+    stencil.storeOp = g_shadow_target ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
     uint32_t cleared = clears_apply(t, colors, depth, stencil);  // pending clears of these targets: loadOp CLEAR
     if (exp_render_pass() & 1) {  // NX_EXP_RP=noload: what loading the targets costs (the picture breaks)
         for (uint32_t k = 0; k < t.color_count; k++)
@@ -377,7 +379,7 @@ bool shadow_draw_skipped(const Targets& t) {
     }();
     if (!off || !depth_only(t)) return false;
     const GpuImage* d = image_of(t.depth);
-    return d && d->width == d->height && d->width >= 512 && !(d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+    return d && d->width == d->height && (d->width >= 256 || d->shadow) && !(d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
 }
 
 // Live experiments while playing (debugging HUD glitches without a restart): a file named live_flags in the data
@@ -612,6 +614,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     {   // NX_HUD_1080: a 1920x1080 image of a 1280x720 target (viewport, scissor and the shaders' render scale)
         GpuImage* hi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : (t.depth ? image_of(t.depth) : nullptr);
         g_hud_target = hi && hi->hud;
+        g_shadow_target = depth_only(t) && t.depth && image_of(t.depth) && image_of(t.depth)->shadow;
     }
     bool need_break = gathered & kNeedBreak;
     if (gathered & kSampledPending) clears_flush_reason(11), clears_flush(cb);  // cleared (and stored) before it is sampled
@@ -804,6 +807,14 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             const int64_t x1 = std::min<int64_t>(hud_up_end(int32_t(sc.offset.x + int64_t(sc.extent.width))), g_pass_extent.width);
             const int64_t y1 = std::min<int64_t>(hud_up_end(int32_t(sc.offset.y + int64_t(sc.extent.height))), g_pass_extent.height);
             sc = {{x0, y0}, {uint32_t(std::max<int64_t>(0, x1 - x0)), uint32_t(std::max<int64_t>(0, y1 - y0))}};
+        }
+    }
+    if (g_shadow_target) {  // NX_MALI_LOW_SHADOWS: 0.5x resolution shadow depth target
+        if (g_state.has_viewport) vp.x *= 0.5f, vp.y *= 0.5f, vp.width *= 0.5f, vp.height *= 0.5f;
+        if (g_state.has_scissor) {
+            sc.offset.x /= 2, sc.offset.y /= 2;
+            sc.extent.width = std::max<uint32_t>(1u, std::min<uint32_t>(sc.extent.width / 2, g_pass_extent.width));
+            sc.extent.height = std::max<uint32_t>(1u, std::min<uint32_t>(sc.extent.height / 2, g_pass_extent.height));
         }
     }
     // NX_EXP_3D (an experiment, the picture breaks): on the 3D draws (depth test, a 960-wide pass) "scissor" keeps

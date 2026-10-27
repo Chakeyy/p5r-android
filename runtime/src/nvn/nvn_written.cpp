@@ -329,7 +329,7 @@ void apply_write_back(const WriteBack& w) {
     const uint64_t t0 = plat::monotonic_ns();
     g_wb_count++, g_wb_bytes += w.size;
     if (whole || !w.before || w.before->size() < w.size) {
-        std::memcpy(w.to, w.from, w.size);
+        plat::fast_memcpy(w.to, w.from, w.size);
         g_wb_ns += plat::monotonic_ns() - t0;
         return;
     }
@@ -342,7 +342,7 @@ void apply_write_back(const WriteBack& w) {
     const uint8_t* from = w.from;
     if (bulk) {
         if (copy.size() < w.size) copy.resize(w.size);
-        std::memcpy(copy.data(), w.from, w.size);
+        plat::fast_memcpy(copy.data(), w.from, w.size);
         from = copy.data();
     }
     uint64_t k = 0, changed = 0;

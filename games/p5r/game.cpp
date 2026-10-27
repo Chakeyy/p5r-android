@@ -26,7 +26,7 @@ uint64_t presents_recorded();  // runtime nvn_state.cpp: nvnQueuePresentTexture 
 void linear_write_back_pause(bool paused);  // runtime nvn_draw.cpp: no copies of linear targets back to memory
 }
 
-const game::Info game::kInfo = {"p5r", "Persona 5 Royal", 0x01005CA01580E000ull, "io.github.p5rrecomp",
+const game::Info game::kInfo = {"p5r", "Persona 5 Royal", 0x01005CA01580E000ull, "io.github.p5rrecomp.opt",
                                 "private/p5r", 0 /* main.npdm: no system resource (SDK 13) */,
                                 "708BCACA873EA32B" /* 1.0.0, the base game without the update */};
 

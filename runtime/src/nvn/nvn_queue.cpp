@@ -25,6 +25,7 @@
 #include "nvn.h"
 #include "nvn_ultrawide.h"
 #include "platform.h"
+#include "kernel.h"
 
 namespace nx {
 extern std::atomic<uint64_t> g_movie_gots;      // hle_movie.cpp
@@ -253,6 +254,13 @@ void SyncWait(CPU& c) {
 void QueueInitialize(CPU& c) { c.x[0] = 1; }  // NVNboolean (NVNqueue*, const NVNqueueBuilder*)
 void QueueFinalize(CPU&) {}
 void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHandle*)
+    static thread_local bool s_vk_pinned = false;
+    if (!s_vk_pinned) {
+        s_vk_pinned = true;
+        if (!self_thread() || self_thread()->id != 1) {
+            plat::pin_current_thread_to_big_cores("VK-Render");
+        }
+    }
     plat::perf_hint_thread();  // this thread replays: part of every frame (perf_hint.cpp)
     std::vector<std::shared_ptr<CmdList>> lists;
     static uint64_t submitted = 0, missing = 0;
@@ -599,6 +607,13 @@ void pace_present(int interval) {
 }
 
 void QueuePresentTexture(CPU& c) {
+    static thread_local bool s_vk_pinned = false;
+    if (!s_vk_pinned) {
+        s_vk_pinned = true;
+        if (!self_thread() || self_thread()->id != 1) {
+            plat::pin_current_thread_to_big_cores("VK-Render");
+        }
+    }
     dropouts_present();
     const uint64_t origin = g_frame_origin.exchange(0);  // set by the game for this frame (frame_origin_ns), or 0
     // The frame's work, from the end of the last present's pacing to now (perf_hint.cpp: ADPF on Android).
@@ -614,15 +629,15 @@ void QueuePresentTexture(CPU& c) {
     plat::perf_hint_thread();
     if (work_from) plat::perf_hint_frame(int64_t(t_in - work_from));
     if (auto* w = get<Window>(c.x[1])) {
-        // At most two presents queued: the game runs at most two frames ahead of the replay.
-        static uint64_t queued[2] = {};
+        // At most three presents queued to match triple-buffered swapchain
+        static uint64_t queued[3] = {};
         static int next_slot = 0;
         worker_wait(queued[next_slot]);
         if (int(c.x[2]) >= 0 && size_t(c.x[2]) < w->textures.size()) {
             uint64_t texture = w->textures[size_t(c.x[2])];
             std::array<int32_t, 4> crop{w->crop[0], w->crop[1], w->crop[2], w->crop[3]};
             queued[next_slot] = worker_run([texture, crop, origin] { gpu_present(texture, crop.data(), origin); });
-            next_slot ^= 1;
+            next_slot = (next_slot + 1) % 3;
         }
         pace_present(w->interval);
     }
