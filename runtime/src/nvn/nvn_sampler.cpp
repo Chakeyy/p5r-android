@@ -4,6 +4,11 @@
 #include <cstring>
 #include <unordered_map>
 
+#if defined(__aarch64__) && (defined(__ARM_FEATURE_CRC32) || defined(__ARM_FEATURE_CRYPTO) || defined(__ARM_ARCH_8A))
+#include <arm_acle.h>
+#define USE_ARM_CRC32 1
+#endif
+
 #include "nvn_pipeline.h"
 
 namespace nx::nvn {
@@ -86,8 +91,29 @@ VkSampler sampler_for(const SamplerInfo& s, bool shadow, bool biased) {
 
 // ---- pitch-linear texture contents (moved from nvn_pipeline.cpp) ------------------------------------------------
 
-// Four independent lanes: one multiply chain ran at ~1 byte per cycle (Wonder's 16 MB glyph cache: ~5 ms).
+// Fast memory hashing for buffer verification. On AArch64 with CRC32 extension,
+// hardware __crc32cd operates at 1 cycle per 8 bytes across 4 unrolled streams.
 uint64_t hash_memory(const uint8_t* p, uint64_t size) {
+#if defined(USE_ARM_CRC32)
+    uint32_t c0 = 0xFFFFFFFF, c1 = 0xFFFFFFFF, c2 = 0xFFFFFFFF, c3 = 0xFFFFFFFF;
+    const uint64_t n = size / 32;
+    const uint64_t* w = reinterpret_cast<const uint64_t*>(p);
+    for (uint64_t k = 0; k < n; k++) {
+        c0 = __crc32cd(c0, w[4 * k + 0]);
+        c1 = __crc32cd(c1, w[4 * k + 1]);
+        c2 = __crc32cd(c2, w[4 * k + 2]);
+        c3 = __crc32cd(c3, w[4 * k + 3]);
+    }
+    for (uint64_t k = n * 4; k < size / 8; k++) {
+        c0 = __crc32cd(c0, w[k]);
+    }
+    for (uint64_t k = (size & ~7ull); k < size; k++) {
+        c0 = __crc32cb(c0, p[k]);
+    }
+    const uint32_t lo = c0 ^ c1;
+    const uint32_t hi = c2 ^ c3;
+    return (uint64_t(hi) << 32) | lo;
+#else
     uint64_t h[4] = {0x9E3779B97F4A7C15ull, 1, 2, 3}, n = size / 32;
     const uint64_t* w = reinterpret_cast<const uint64_t*>(p);
     for (uint64_t k = 0; k < n; k++)
@@ -95,6 +121,7 @@ uint64_t hash_memory(const uint8_t* p, uint64_t size) {
     uint64_t r = h[0] ^ h[1] * 3 ^ h[2] * 5 ^ h[3] * 7;
     for (uint64_t k = n * 4; k < size / 8; k++) r = (r ^ w[k]) * 0x100000001B3ull + (r >> 29);
     return r;
+#endif
 }
 
 // A pitch-linear texture the GPU does not write: did the CPU change it since the last upload?

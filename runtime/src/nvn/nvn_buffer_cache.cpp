@@ -56,6 +56,8 @@ std::vector<Slot> g_free[kClasses];  // free slots per size class
 struct Seen {
     uint64_t size = 0, hash = 0;
     uint32_t count = 0;
+    uint32_t unstable_streak = 0;
+    uint64_t skip_until = 0;
     uint64_t submit = 0;  // g_submits when last seen
 };
 std::unordered_map<const uint8_t*, Seen> g_seen;
@@ -86,7 +88,11 @@ struct {
 } g_stats_cache;
 
 bool on() {
-    return false;
+    static const bool v = [] {
+        const char* e = std::getenv("NX_BUFFER_CACHE");
+        return !e || e[0] != '0';
+    }();
+    return v;
 }
 
 uint64_t budget() {
@@ -187,13 +193,15 @@ void cache_begin_submit() {
 
 bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
     if (!on() || !p || !size || padded > kMaxCopy || align > kAlign) return false;
-    const uint64_t t0 = plat::monotonic_ns();
-    uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
-    for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
-    g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
-    const uint64_t serial = frame_recording_serial();
+
+    // Check if this buffer is already cached
     auto it = g_entries.find(p);
     if (it != g_entries.end()) {
+        const uint64_t t0 = plat::monotonic_ns();
+        uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
+        for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+        g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
+
         Entry& e = it->second;
         if (e.size == size && e.padded == padded && e.hash == h) {
             // NX_BUFFER_CACHE_VERIFY=1: every hit compared with the guest bytes (slow: the copy is uncached memory).
@@ -204,7 +212,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
                                      (unsigned long long)size, (const void*)p);
                 g_stats_cache.wrong++;
             }
-            e.serial = std::max(e.serial, serial), e.seen = g_submits;
+            e.serial = std::max(e.serial, frame_recording_serial()), e.seen = g_submits;
             g_stats_cache.hits++, g_stats_cache.hit_bytes += padded;
             out = {g_blocks[e.block].buffer, e.offset, g_blocks[e.block].ptr + e.offset};
             return true;
@@ -212,12 +220,31 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
         retire(e);  // read by the submits up to e.serial: freed after them
         g_entries.erase(it);
     }
-    // Not cached: a copy here only once the bytes stayed the same for kStableSeen submits in a row.
+
+    // Not cached: check if this buffer changes frequently (volatile dynamic uniform/constant blocks)
     Seen& seen = g_seen[p];
-    if (seen.size == size && seen.hash == h && seen.submit + kSeenGap >= g_submits)
+    if (seen.skip_until > g_submits) {
+        g_stats_cache.unstable++;
+        return false;  // Bypass hashing entirely for volatile dynamic buffers
+    }
+
+    const uint64_t t0 = plat::monotonic_ns();
+    uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
+    for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+    g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
+
+    const uint64_t serial = frame_recording_serial();
+    if (seen.size == size && seen.hash == h && seen.submit + kSeenGap >= g_submits) {
         seen.count++;
-    else
+        seen.unstable_streak = 0;
+    } else {
         seen.count = 1;
+        seen.unstable_streak++;
+        if (seen.unstable_streak >= 2) {
+            // Unstable across consecutive checks: back off for 30 submits (~10 frames)
+            seen.skip_until = g_submits + 30;
+        }
+    }
     seen.size = size, seen.hash = h, seen.submit = g_submits;
     if (seen.count < kStableSeen) {
         g_stats_cache.unstable++;

@@ -72,7 +72,6 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
         std::memset(u.ptr, 0, padded);
         return u;
     }
-    frame_guest_read(p, size);  // deferred write-backs over these bytes land first (nvn_frames.cpp)
     static const bool off = std::getenv("NX_NO_DEDUP") != nullptr;  // bisecting: a fresh copy every time
     Front& f = front_of(p);
     const Entry* e = nullptr;
@@ -86,6 +85,7 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
         g_saved += padded;
         return e->upload;
     }
+    frame_guest_read(p, size);  // deferred write-backs over these bytes land first (nvn_frames.cpp)
     Upload u;
     if (g_upload_kind != kUploadOther && cache_upload(p, size, padded, align, u)) {  // nvn_buffer_cache.cpp
         g_copies[p] = {size, padded, u};
