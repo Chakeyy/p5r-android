@@ -1085,7 +1085,7 @@ VkExtent2D pass_extent() { return g_pass_extent; }
 void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); }
 // After a clear inside the pass (nvn_clears.cpp). A masked one is a fullscreen draw with its own pipeline, viewport
 // and scissor (nvn_mask_clear.cpp): the next draw sets everything again.
-void pass_mark_written(uint32_t bits) { g_pass_written |= bits, g_bound = Bound{}; }
+void pass_mark_written(uint32_t bits) { g_pass_written |= bits, g_bound = Bound{}, sets_invalidate_bound(); }
 
 bool replay::pass_wrote(const GpuImage* img) {
     if (!g_rendering || !img) return false;

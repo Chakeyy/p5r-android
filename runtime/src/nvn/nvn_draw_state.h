@@ -153,6 +153,7 @@ Upload zero_stream();  // 64 zero bytes for vertex binding 15
 bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
 std::vector<WriteBack>& separate_write_backs();  // NX_COMPUTE_SEPARATE=1: a write-back per binding
 void sets_begin_submit();
+void sets_invalidate_bound();
 void sets_log();
 // nvn_draw.cpp: `img` is a target of the open pass that a draw or clear of the pass wrote.
 bool pass_wrote(const GpuImage* img);
