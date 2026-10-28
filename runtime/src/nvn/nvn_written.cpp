@@ -346,11 +346,55 @@ void apply_write_back(const WriteBack& w) {
         from = copy.data();
     }
     uint64_t k = 0, changed = 0;
+    for (; k + 32 <= w.size; k += 32) {
+        uint64_t f0, f1, f2, f3;
+        uint64_t w0, w1, w2, w3;
+        std::memcpy(&f0, from + k, 8);
+        std::memcpy(&w0, was + k, 8);
+        std::memcpy(&f1, from + k + 8, 8);
+        std::memcpy(&w1, was + k + 8, 8);
+        std::memcpy(&f2, from + k + 16, 8);
+        std::memcpy(&w2, was + k + 16, 8);
+        std::memcpy(&f3, from + k + 24, 8);
+        std::memcpy(&w3, was + k + 24, 8);
+
+        uint64_t d0 = f0 ^ w0;
+        uint64_t d1 = f1 ^ w1;
+        uint64_t d2 = f2 ^ w2;
+        uint64_t d3 = f3 ^ w3;
+
+        if ((d0 | d1 | d2 | d3) == 0) continue;
+
+        if (d0) {
+            changed++;
+            if (static_cast<uint32_t>(d0)) std::memcpy(w.to + k, from + k, 4);
+            if (static_cast<uint32_t>(d0 >> 32)) std::memcpy(w.to + k + 4, from + k + 4, 4);
+        }
+        if (d1) {
+            changed++;
+            if (static_cast<uint32_t>(d1)) std::memcpy(w.to + k + 8, from + k + 8, 4);
+            if (static_cast<uint32_t>(d1 >> 32)) std::memcpy(w.to + k + 12, from + k + 12, 4);
+        }
+        if (d2) {
+            changed++;
+            if (static_cast<uint32_t>(d2)) std::memcpy(w.to + k + 16, from + k + 16, 4);
+            if (static_cast<uint32_t>(d2 >> 32)) std::memcpy(w.to + k + 20, from + k + 20, 4);
+        }
+        if (d3) {
+            changed++;
+            if (static_cast<uint32_t>(d3)) std::memcpy(w.to + k + 24, from + k + 24, 4);
+            if (static_cast<uint32_t>(d3 >> 32)) std::memcpy(w.to + k + 28, from + k + 28, 4);
+        }
+    }
     for (; k + 8 <= w.size; k += 8) {
-        if (std::memcmp(from + k, was + k, 8) == 0) continue;
+        uint64_t f, w_val;
+        std::memcpy(&f, from + k, 8);
+        std::memcpy(&w_val, was + k, 8);
+        uint64_t d = f ^ w_val;
+        if (!d) continue;
         changed++;
-        for (uint64_t b = k; b < k + 8; b += 4)
-            if (std::memcmp(from + b, was + b, 4) != 0) std::memcpy(w.to + b, from + b, 4);
+        if (static_cast<uint32_t>(d)) std::memcpy(w.to + k, from + k, 4);
+        if (static_cast<uint32_t>(d >> 32)) std::memcpy(w.to + k + 4, from + k + 4, 4);
     }
     for (; k < w.size; k++)
         if (from[k] != was[k]) w.to[k] = from[k];
