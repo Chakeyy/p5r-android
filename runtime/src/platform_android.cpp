@@ -556,8 +556,6 @@ void crash(int sig, siginfo_t* info, void* uc) {
 }
 
 void game_thread(void*) {
-    nx::plat::pin_current_thread_to_core(7, "NCE-Main");
-    nx::plat::set_thread_priority(-8);
     nx::plat::perf_hint_thread();
     try {
         nx::boot();

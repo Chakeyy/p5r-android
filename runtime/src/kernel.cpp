@@ -382,7 +382,6 @@ static void thread_main(void* p) {
     char name[16];
     std::snprintf(name, sizeof name, "g%llx", (unsigned long long)t->id);
     plat::set_thread_name(name);
-    plat::set_thread_priority(4);
     call(t->ctx, t->entry);
     // Returning from the entry point is like svcExitThread.
     std::lock_guard lk(g_k);
