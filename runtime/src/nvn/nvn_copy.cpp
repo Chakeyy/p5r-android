@@ -138,6 +138,14 @@ void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
     };
     if (src->hud) hud_rect(info.src);
     if (dst->hud) hud_rect(info.dst);
+    auto low_3d_rect = [](int32_t* r) {
+        r[0] = (r[0] * 3) / 4;
+        r[1] = (r[1] * 3) / 4;
+        r[3] = std::max(1, (r[3] * 3) / 4);
+        r[4] = std::max(1, (r[4] * 3) / 4);
+    };
+    if (src->low_3d) low_3d_rect(info.src);
+    if (dst->low_3d) low_3d_rect(info.dst);
     bool same = src == dst;
     static const bool no_same = std::getenv("NX_COPY_NO_SAME_IMAGE") != nullptr;  // bisecting: the old way
     if (same && no_same) return;

@@ -27,6 +27,7 @@ State g_state;
 Stats g_stats;
 bool g_hud_target = false;
 bool g_shadow_target = false;
+bool g_low_3d_target = false;
 
 const uint8_t* guest_bytes(uint64_t gpu) {
     uint64_t off = 0;
@@ -360,6 +361,7 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     static const bool off = std::getenv("NX_NO_COMPUTE") != nullptr;  // debug: skip compute dispatches
     if (off) return;
     g_hud_target = false;  // no render target: render scale 1 in its support buffer
+    g_low_3d_target = false;
     const auto* shaders = program_shaders(g_state.stage_programs[5]);
     const ShaderInfo* cs = nullptr;
     if (shaders)
@@ -666,6 +668,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         GpuImage* hi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : (t.depth ? image_of(t.depth) : nullptr);
         g_hud_target = hi && hi->hud;
         g_shadow_target = depth_only(t) && t.depth && image_of(t.depth) && image_of(t.depth)->shadow;
+        g_low_3d_target = hi && hi->low_3d;
     }
     bool need_break = gathered & kNeedBreak;
     if (gathered & kSampledPending) clears_flush_reason(11), clears_flush(cb);  // cleared (and stored) before it is sampled
@@ -864,6 +867,14 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             sc.offset.x /= 2, sc.offset.y /= 2;
             sc.extent.width = std::max<uint32_t>(1u, std::min<uint32_t>(sc.extent.width / 2, g_pass_extent.width));
             sc.extent.height = std::max<uint32_t>(1u, std::min<uint32_t>(sc.extent.height / 2, g_pass_extent.height));
+        }
+    }
+    if (g_low_3d_target) {  // NX_LOW_3D: 0.75x resolution 3D render target (720x405)
+        if (g_state.has_viewport) vp.x *= 0.75f, vp.y *= 0.75f, vp.width *= 0.75f, vp.height *= 0.75f;
+        if (g_state.has_scissor) {
+            sc.offset.x = (sc.offset.x * 3) / 4, sc.offset.y = (sc.offset.y * 3) / 4;
+            sc.extent.width = std::max<uint32_t>(1u, std::min<uint32_t>((sc.extent.width * 3) / 4, g_pass_extent.width));
+            sc.extent.height = std::max<uint32_t>(1u, std::min<uint32_t>((sc.extent.height * 3) / 4, g_pass_extent.height));
         }
     }
     // NX_EXP_3D (an experiment, the picture breaks): on the 3D draws (depth test, a 960-wide pass) "scissor" keeps

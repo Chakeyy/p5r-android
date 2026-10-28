@@ -38,7 +38,13 @@ struct GpuImage {
     bool uw = false;          // NX_ULTRAWIDE: a widened render target (nvn_ultrawide.cpp)
     bool hud = false;         // NX_HUD_1080: a 1280x720 render target made at 1920x1080 or 1600x900 (hud_1080_texture)
     bool shadow = false;      // NX_MALI_LOW_SHADOWS: 0.5x downscaled shadow depth map
+    bool low_3d = false;      // NX_LOW_3D: 0.75x downscaled 3D render target (720x405)
 };
+
+// NX_LOW_3D (nvn_image.cpp): 3D scene render targets (960x540) are created at 720x405 (0.75x)
+// to dramatically cut GPU fillrate on low-end Mali, while HUD/menus stay at 720p.
+bool low_3d_on();
+bool low_3d_texture(const Texture& t);
 
 // NX_HUD_1080 (nvn_image.cpp): render targets of the handheld screen's size, 1280x720, are made at 3/2 of it,
 // 1920x1080, so the 2D layers drawn into them (a game's HUD, menus and the window) reach the screen at the size their

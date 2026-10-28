@@ -5,6 +5,7 @@ on:
     branches:
       - perf/mali-g57-optimizations
       - perf/android-low-end
+      - 'perf/**'
       - main
   workflow_dispatch:
 

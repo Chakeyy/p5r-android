@@ -420,8 +420,8 @@ void window_size(uint32_t& w, uint32_t& h) {
     else if (r == "720" || r == "1280x720") configured_height = 720;
 
     if (configured_height == 540) {
-        w = 960;
-        h = 540;
+        w = 1280;
+        h = 720;
         return;
     } else if (configured_height == 1080) {
         w = 1920;
@@ -783,12 +783,17 @@ extern "C" void android_main(android_app* app) {
                 if (eq != std::string::npos && line.substr(0, eq) == "resolution")
                     setenv("NX_RES", line.substr(eq + 1).c_str(), 0);
             }
-            // If resolution is 1080, NX_HANDHELD=0; if 720 or 540, NX_HANDHELD=1
+            // If resolution is 1080, NX_HANDHELD=0; if 720, NX_HANDHELD=1; if 540, NX_HANDHELD=1 and NX_LOW_3D=1 (true 405p 3D)
             std::string r = setting("resolution");
             if (r == "1080") {
                 unsetenv("NX_HANDHELD");
-            } else if (r == "540" || r == "720") {
+                unsetenv("NX_LOW_3D");
+            } else if (r == "540") {
                 setenv("NX_HANDHELD", "1", 1);
+                setenv("NX_LOW_3D", "1", 1);
+            } else if (r == "720") {
+                setenv("NX_HANDHELD", "1", 1);
+                unsetenv("NX_LOW_3D");
             } else if (const char* h = getenv("NX_HANDHELD"); h && h[0] == '0') {
                 unsetenv("NX_HANDHELD");
             } else {

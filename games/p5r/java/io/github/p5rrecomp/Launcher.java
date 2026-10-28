@@ -299,8 +299,8 @@ public class Launcher extends Activity {
                         "日本語", "한국어", "简体中文", "繁體中文"}, 0));
         options.add(new Option("resolution", "Resolución", "Resolution",
                 new String[] {"540", "720", "1080"},
-                new String[] {"540p (portátil / gama baja)", "720p (portátil)", "1080p (sobremesa)"},
-                new String[] {"540p (Handheld / Low-End)", "720p (Handheld)", "1080p (Docked)"}, 1));
+                new String[] {"540p (3D a 405p - máxima fluidez)", "720p (portátil)", "1080p (sobremesa)"},
+                new String[] {"540p (3D 405p - Max Performance)", "720p (Handheld)", "1080p (Docked)"}, 1));
         options.add(new Option("NX_FSR", "Superresolución (FSR 1.0)", "Super resolution (FSR 1.0)",
                 new String[] {"0", "1"},
                 new String[] {"Desactivada", "Activada"},
