@@ -99,6 +99,44 @@ void bind_vertex(VkCommandBuffer cb, uint32_t binding, const Upload& u) {
     now = u, g_bound.vertex_set |= 1u << binding, g_state_set++;
 }
 
+// Binds active vertex streams (plus binding 15 zero_stream) in contiguous batches.
+void bind_vertex_streams(VkCommandBuffer cb, uint32_t used_mask, const Upload* streams) {
+    bool need[16] = {};
+    const Upload zero = zero_stream();
+    for (uint32_t s = 0; s < 16; s++) {
+        const bool active = (s == 15) ? true : (used_mask >> s & 1);
+        if (!active) continue;
+        const Upload& u = (s == 15) ? zero : streams[s];
+        const Upload& now = g_bound.vertex[s];
+        if ((g_bound.vertex_set >> s & 1) && now.buffer == u.buffer && now.offset == u.offset) {
+            g_state_kept++;
+        } else {
+            need[s] = true;
+        }
+    }
+
+    for (uint32_t s = 0; s < 16;) {
+        if (!need[s]) {
+            s++;
+            continue;
+        }
+        uint32_t n = 1;
+        while (s + n < 16 && need[s + n]) n++;
+        VkBuffer bufs[16];
+        VkDeviceSize offs[16];
+        for (uint32_t i = 0; i < n; i++) {
+            const Upload& u = (s + i == 15) ? zero : streams[s + i];
+            bufs[i] = u.buffer;
+            offs[i] = u.offset;
+            g_bound.vertex[s + i] = u;
+            g_bound.vertex_set |= 1u << (s + i);
+            g_state_set++;
+        }
+        p_vkCmdBindVertexBuffers(cb, s, n, bufs, offs);
+        s += n;
+    }
+}
+
 // Viewport, scissor, blend constants and the rasterizer's dynamic state (every pipeline declares them dynamic).
 void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
     Bound& b = g_bound;
@@ -346,8 +384,15 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     if (gpu_profile_on()) gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+    mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT;
+    const VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT;
+    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst_stages, 0, 1, &mb, 0,
                            nullptr, 0, nullptr);
     g_stats.dispatches++;
 }
@@ -769,10 +814,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
     bind_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
 
-    // The vertex buffers resolved above, plus the zero stream (binding 15).
-    for (uint32_t s = 0; s < 15; s++)
-        if (in.used >> s & 1) bind_vertex(cb, s, in.vertex[s]);
-    bind_vertex(cb, 15, zero_stream());
+    // The vertex buffers resolved above, plus the zero stream (binding 15), batched in contiguous runs.
+    bind_vertex_streams(cb, in.used, in.vertex);
 
     VkViewport vp{0, 0, float(g_pass_extent.width), float(g_pass_extent.height), 0, 1};
     if (g_state.has_viewport)
