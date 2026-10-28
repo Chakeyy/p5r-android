@@ -61,12 +61,17 @@ jobs:
       - name: Prepare APK Output
         id: prep
         run: |
+          REF_NAME="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
+          SLUG=$(echo "${REF_NAME}" | sed 's|perf/||; s|fix/||; s|android-||; s|/|-|g')
+          REV_COUNT=$(git rev-list --count v0.4.1..HEAD 2>/dev/null || echo "0")
           SHORT_SHA=$(git rev-parse --short HEAD)
-          APK_NAME="p5r-v0.4.1-opt-${SHORT_SHA}.apk"
+          DATE=$(date +'%Y%m%d')
+          BASE_NAME="p5r-v0.4.1-${SLUG}-r${REV_COUNT}-${DATE}-${SHORT_SHA}"
+          APK_NAME="${BASE_NAME}.apk"
           cp private/p5r/apk_nce/p5r.apk "${APK_NAME}"
           ls -lh "${APK_NAME}"
           echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
-          echo "artifact_name=p5r-v0.4.1-opt-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "artifact_name=${BASE_NAME}" >> $GITHUB_OUTPUT
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
