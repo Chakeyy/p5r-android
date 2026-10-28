@@ -93,7 +93,7 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
         return u;
     }
     u = upload_alloc(padded, align);
-    std::memcpy(u.ptr, p, size);
+    plat::fast_memcpy(u.ptr, p, size);
     if (padded > size) std::memset(u.ptr + size, 0, padded - size);
     if (upload_stats_on()) count_copy(p, size);
     g_copies[p] = {size, padded, u};

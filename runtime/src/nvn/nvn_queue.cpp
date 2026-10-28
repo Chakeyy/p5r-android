@@ -259,6 +259,7 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
         s_vk_pinned = true;
         if (!self_thread() || self_thread()->id != 1) {
             plat::pin_current_thread_to_big_cores("VK-Render");
+            plat::set_thread_priority(-10);
         }
     }
     plat::perf_hint_thread();  // this thread replays: part of every frame (perf_hint.cpp)
@@ -612,6 +613,7 @@ void QueuePresentTexture(CPU& c) {
         s_vk_pinned = true;
         if (!self_thread() || self_thread()->id != 1) {
             plat::pin_current_thread_to_big_cores("VK-Render");
+            plat::set_thread_priority(-10);
         }
     }
     dropouts_present();

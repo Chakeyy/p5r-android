@@ -34,9 +34,9 @@ namespace {
 constexpr uint64_t kBlock = 16ull << 20;  // bytes per memory block
 constexpr uint64_t kAlign = 256;          // every copy: the largest buffer offset alignment Vulkan allows
 constexpr uint64_t kMaxCopy = 4ull << 20; // larger ranges stay in the ring (one copy per submit)
-constexpr uint64_t kStaleSubmits = 600;   // a copy no submit bound for this long is freed (~200 frames)
+constexpr uint64_t kStaleSubmits = 3600;  // keep resident across camera turns (~1200 frames)
 constexpr uint32_t kStableSeen = 2;       // the same bytes this many times in a row before they get a copy here
-constexpr uint64_t kSeenGap = 6;          // "in a row": at most this many submits apart (P5R: 3 submits a frame)
+constexpr uint64_t kSeenGap = 24;         // tolerate temporary frustum-cull intervals (~8 frames)
 constexpr uint32_t kClasses = 15;         // copy sizes 256 B << class, up to 4 MB
 
 struct Block {
@@ -260,7 +260,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     g_used += class_bytes(c);
     uint8_t* dst = g_blocks[slot.block].ptr + slot.offset;
     frame_guest_read(p, size);
-    std::memcpy(dst, p, size);
+    plat::fast_memcpy(dst, p, size);
     if (padded > size) std::memset(dst + size, 0, padded - size);
     g_entries[p] = {size, padded, h, slot.block, slot.offset, c, serial, g_submits};
     g_stats_cache.misses++, g_stats_cache.miss_bytes += padded;

@@ -36,6 +36,7 @@ void pin_current_thread_to_big_cores(const char* thread_name);
 void pin_current_thread_to_core(int core_id, const char* thread_name);
 void pin_current_thread_to_little_cores(const char* thread_name);
 void reset_current_thread_affinity(const char* thread_name);
+void set_thread_priority(int priority);
 // Samples the given threads (thread CPU time, 1 kHz) for `seconds`: host pc, a few host frames and the guest lr
 // (read through guest_lr[k], the thread's x30). Writes one line per sample to `path`:
 //   <tid> <guest lr> <module>:<offset> [<module>:<offset> ...]   (host pc first, then callers)
@@ -151,4 +152,5 @@ using nx::plat::pin_current_thread_to_big_cores;
 using nx::plat::pin_current_thread_to_core;
 using nx::plat::pin_current_thread_to_little_cores;
 using nx::plat::reset_current_thread_affinity;
+using nx::plat::set_thread_priority;
 }

@@ -72,6 +72,7 @@ void pin_current_thread_to_big_cores(const char*) {}
 void pin_current_thread_to_core(int, const char*) {}
 void pin_current_thread_to_little_cores(const char*) {}
 void reset_current_thread_affinity(const char*) {}
+void set_thread_priority(int) {}
 float default_render_scale() { return 1.0f; }
 void release_window(void*) {}
 uint64_t window_generation() { return 1; }
