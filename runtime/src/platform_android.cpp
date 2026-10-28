@@ -807,7 +807,7 @@ extern "C" void android_main(android_app* app) {
     struct sigaction sa{};
     sa.sa_sigaction = crash;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, &g_previous[s]);
+    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) sigaction(s, &sa, &g_previous[s]);
 
     nx::log("%s (Switch recomp) on Android, data at %s (own folder %s: %s)", nx::game::kInfo.title, g_root.c_str(),
             own.c_str(), has_data(own) ? "has the data" : kDataProbe);

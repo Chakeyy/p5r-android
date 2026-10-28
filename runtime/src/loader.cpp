@@ -56,18 +56,21 @@ void log(const char* fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     std::lock_guard lk(g_log_lock);
-    if (!g_log_file && plat::kDiagnostics) {  // NX_RELEASE: the system log only
-        const char* path = std::getenv("NX_LOG");
+    if (!g_log_file) {
+        std::string root = plat::data_root();
+        if (!root.empty()) {
+            const char* path = std::getenv("NX_LOG");
 #if defined(__ANDROID__)
-        std::string def = plat::data_root() + "/nx.log";  // next to the data, readable from the phone
+            std::string def = root + "/nx.log";  // next to the data, readable from the phone
 #else
-        std::string def = plat::data_root() + "/../nx.log";
+            std::string def = root + "/../nx.log";
 #endif
-        std::string file = path ? path : def;
-        // Keep the previous session's log (a problem report should survive reopening the game).
-        std::remove((file + ".prev").c_str());
-        std::rename(file.c_str(), (file + ".prev").c_str());
-        g_log_file = std::fopen(file.c_str(), "w");
+            std::string file = path ? path : def;
+            // Keep the previous session's log (a problem report should survive reopening the game).
+            std::remove((file + ".prev").c_str());
+            std::rename(file.c_str(), (file + ".prev").c_str());
+            g_log_file = std::fopen(file.c_str(), "w");
+        }
     }
     plat::log_line(buf);
     if (g_log_file) {
