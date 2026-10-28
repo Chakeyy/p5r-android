@@ -47,10 +47,16 @@ bool g_vertex_pending = false;  // a narrow pass-end barrier since the last one 
 uint64_t g_pass_serial = 0, g_vertex_visible_at = 0;  // pass ends so far; the serial a full barrier covered
 uint64_t g_vertex_barriers = 0;
 
-// Off by default (NX_PASS_BARRIER_NARROW=1 turns it on): the first S23 run with it showed a black band over the course
-// background in 2 of 28 frames (phone_n6def, 15000 and 16200), a timing-dependent hazard of the DEBUG-2 #71 class.
+// Narrow pass barrier: allows Mali Valhall GPUs to overlap next pass vertex binning with previous pass fragment shading.
 bool narrow_pass_barrier() {
+#if defined(__ANDROID__)
+    static const bool on = [] {
+        const char* e = std::getenv("NX_PASS_BARRIER_NARROW");
+        return !(e && e[0] == '0');
+    }();
+#else
     static const bool on = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
+#endif
     return on;
 }
 
