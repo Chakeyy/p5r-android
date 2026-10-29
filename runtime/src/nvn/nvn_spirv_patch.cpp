@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 
 #include "nvn_pipeline.h"
 
@@ -653,6 +654,86 @@ bool optimize_spirv_mali(const std::vector<uint32_t>& in, std::vector<uint32_t>&
     return modified;
 }
 
+// Inject RelaxedPrecision (FP16 / mediump) for ARM Mali GPUs (e.g. Mali-G57 MC2 Bifrost/Valhall).
+// Mali execution engines have 2x peak throughput for FP16 ALU instructions and halved register pressure.
+// We decorate fragment color ALU (OpFAdd, OpFSub, OpFMul, OpVectorTimesScalar, OpDot) and
+// sampled texel outputs (OpImageSampleImplicitLod, OpImageSampleExplicitLod) with RelaxedPrecision.
+// Vertex positions, UV interpolation, OpFDiv, and depth calculations remain in full FP32.
+bool inject_fp16_relaxed_precision_mali(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
+    if (in.size() < 5) return false;
+
+    uint32_t f32_type = 0;
+    std::unordered_set<uint32_t> fp32_types;
+    std::unordered_set<uint32_t> already_relaxed;
+    std::unordered_set<uint32_t> builtins;
+    std::vector<uint32_t> targets;
+    targets.reserve(128);
+
+    size_t insert_pos = 0;
+
+    for (size_t i = 5; i < in.size();) {
+        uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+        if (!len || i + len > in.size()) return false;
+        const uint32_t* w = &in[i];
+
+        if (!insert_pos && ((op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == 59)) {
+            insert_pos = i;
+        }
+
+        if (op == 22 /* OpTypeFloat */ && len == 3 && w[2] == 32) {
+            f32_type = w[1];
+            fp32_types.insert(w[1]);
+        } else if (op == 23 /* OpTypeVector */ && len == 4) {
+            if (f32_type && w[2] == f32_type) {
+                fp32_types.insert(w[1]);
+            }
+        } else if (op == 71 /* OpDecorate */ && len >= 3) {
+            if (w[2] == 0 /* DecorationRelaxedPrecision */) {
+                already_relaxed.insert(w[1]);
+            } else if (w[2] == 11 /* DecorationBuiltIn */) {
+                builtins.insert(w[1]);
+            }
+        } else if (len >= 3) {
+            // OpImageSampleImplicitLod (87), OpImageSampleExplicitLod (88)
+            // OpFAdd (129), OpFSub (131), OpFMul (133), OpVectorTimesScalar (142), OpDot (148)
+            if (op == 87 || op == 88 || op == 129 || op == 131 || op == 133 || op == 142 || op == 148) {
+                uint32_t res_type = w[1];
+                uint32_t res_id = w[2];
+                if (fp32_types.count(res_type)) {
+                    targets.push_back(res_id);
+                }
+            }
+        }
+        i += len;
+    }
+
+    if (targets.empty() || !insert_pos) return false;
+
+    std::vector<uint32_t> final_targets;
+    final_targets.reserve(targets.size());
+    for (uint32_t id : targets) {
+        if (!already_relaxed.count(id) && !builtins.count(id)) {
+            already_relaxed.insert(id);
+            final_targets.push_back(id);
+        }
+    }
+
+    if (final_targets.empty()) return false;
+
+    out.clear();
+    out.reserve(in.size() + final_targets.size() * 3);
+    out.assign(in.begin(), in.begin() + insert_pos);
+
+    for (uint32_t id : final_targets) {
+        out.push_back((3u << 16) | 71u); // OpDecorate
+        out.push_back(id);
+        out.push_back(0u);              // DecorationRelaxedPrecision
+    }
+
+    out.insert(out.end(), in.begin() + insert_pos, in.end());
+    return true;
+}
+
 std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, uint32_t unwritten, bool* int_inputs) {
     std::vector<uint32_t> code = s->spirv, next;  // each pass reads `code` and leaves its result in `next`
     if (strip_interlock(code, next)) code.swap(next);
@@ -701,6 +782,19 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
         return !(e && e[0] == '0');
     }();
     if (mali_opt && optimize_spirv_mali(code, next)) code.swap(next);
+    static const bool mali_fp16 = [] {
+        const char* e = std::getenv("NX_MALI_FP16");
+#if defined(__ANDROID__) || defined(__aarch64__)
+        return !(e && e[0] == '0');
+#else
+        return e && e[0] == '1';
+#endif
+    }();
+    if (mali_fp16 && s->stage == ShaderStage::Fragment && inject_fp16_relaxed_precision_mali(code, next)) {
+        code.swap(next);
+        static int fp16_logs = 0;
+        if (fp16_logs++ < 5) log("nvn/vk: shader %s: injected FP16 RelaxedPrecision decorations", s->hash.c_str());
+    }
     return code;
 }
 

@@ -114,9 +114,13 @@ bool low_3d_on() {
 
 bool low_3d_texture(const Texture& t) {
     if (!low_3d_on()) return false;
-    // P5R 3D scene render targets in handheld mode: 960x540, 2D, 1 layer, 1 mip
-    if (t.target == 1 && t.width == 960 && t.height == 540 && t.levels <= 1 && t.samples <= 1)
-        return true;
+    // P5R 3D scene render targets (960x540) and post-process chain targets (480x270, 240x135) in handheld mode
+    if (t.target == 1 && t.levels <= 1 && t.samples <= 1) {
+        if ((t.width == 960 && t.height == 540) ||
+            (t.width == 480 && t.height == 270) ||
+            (t.width == 240 && t.height == 135))
+            return true;
+    }
     return false;
 }
 
@@ -171,8 +175,8 @@ GpuImage* image_of(uint64_t guest) {
     if (hud_1080_texture(*t)) img->hud = true, img->width = uint32_t(hud_up(1280)), img->height = uint32_t(hud_up(720));
     if (low_3d_texture(*t)) {
         img->low_3d = true;
-        img->width = (t->width * 3) / 4;   // 720
-        img->height = (t->height * 3) / 4; // 405
+        img->width = std::max(1u, (t->width * 3) / 4);   // 960->720, 480->360, 240->180
+        img->height = std::max(1u, (t->height * 3) / 4); // 540->405, 270->202, 135->101
     }
     static const bool low_shadows = [] {
         const char* e = std::getenv("NX_MALI_LOW_SHADOWS");

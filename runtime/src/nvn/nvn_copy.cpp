@@ -139,10 +139,14 @@ void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
     if (src->hud) hud_rect(info.src);
     if (dst->hud) hud_rect(info.dst);
     auto low_3d_rect = [](int32_t* r) {
-        r[0] = (r[0] * 3) / 4;
-        r[1] = (r[1] * 3) / 4;
-        r[3] = std::max(1, (r[3] * 3) / 4);
-        r[4] = std::max(1, (r[4] * 3) / 4);
+        int32_t x0 = (r[0] * 3) / 4;
+        int32_t y0 = (r[1] * 3) / 4;
+        int32_t x1 = ((r[0] + r[3]) * 3 + 2) / 4;
+        int32_t y1 = ((r[1] + r[4]) * 3 + 2) / 4;
+        r[0] = x0;
+        r[1] = y0;
+        r[3] = std::max(1, x1 - x0);
+        r[4] = std::max(1, y1 - y0);
     };
     if (src->low_3d) low_3d_rect(info.src);
     if (dst->low_3d) low_3d_rect(info.dst);
@@ -228,7 +232,7 @@ void replay_buffer_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
     Texture* t = get<Texture>(c.a[1]);
     const uint8_t* src = replay::guest_bytes(c.a[0]);
     GpuImage* img = t && src ? fill_target(cb, c.a[1]) : nullptr;
-    if (img && img->hud) img = nullptr;  // NX_HUD_1080: texels at 1280x720 for a 1920x1080 image (never seen)
+    if (img && (img->hud || img->low_3d || img->shadow)) img = nullptr;  // unscaled texels for downscaled/upscaled targets
     if (!img || !upload_region(cb, *t, *img, info.dst_view.base_level, info.dst_view.min_layer, info.dst, src)) {
         if (++failed <= 10)
             log("nvn: buffer-to-texture copy %llx -> %llx not replayed (%s)", (unsigned long long)c.a[0],
