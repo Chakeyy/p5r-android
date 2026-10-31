@@ -62,6 +62,9 @@ final class Lang {
                 "Automatica (lingua del dispositivo)", "Automático (idioma do dispositivo)", "自動（端末の言語）",
                 "자동 (기기 언어)", "自动（设备语言）", "自動（裝置語言）");
         put("Resolution", "Résolution", "Auflösung", "Risoluzione", "Resolução", "解像度", "해상도", "分辨率", "解析度");
+        put("540p (3D 405p - Max Performance)", "540p (3D à 405p - performance max)", "540p (3D 405p - Max. Leistung)",
+                "540p (3D a 405p - massime prestazioni)", "540p (3D a 405p - máxima performance)", "540p（3D 405p - 最高パフォーマンス）",
+                "540p (3D 405p - 최대 성능)", "540p（3D 405p - 极限流畅）", "540p（3D 405p - 極限流暢）");
         put("540p (Handheld / Low-End)", "540p (portable / bas de gamme)", "540p (Handheld / Einsteiger)",
                 "540p (portatile / fascia bassa)", "540p (portátil / básica)", "540p（携帯 / 低スペック）",
                 "540p (휴대 / 보급형)", "540p（掌机 / 低配）", "540p（掌機 / 低配）");

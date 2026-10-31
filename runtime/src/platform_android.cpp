@@ -407,6 +407,13 @@ void screen_size(uint32_t& w, uint32_t& h) {
     h = uint32_t(std::min(a, b));
 }
 
+static int parse_resolution_height(const std::string& r) {
+    if (r.find("540") != std::string::npos) return 540;
+    if (r.find("1080") != std::string::npos) return 1080;
+    if (r.find("720") != std::string::npos) return 720;
+    return 0;
+}
+
 // The render size: resolution=WxH or height (540, 720, 1080) if set, else the screen's size times the render scale.
 void window_size(uint32_t& w, uint32_t& h) {
     std::string r = setting("resolution");
@@ -414,14 +421,10 @@ void window_size(uint32_t& w, uint32_t& h) {
     if (const char* e = getenv("NX_RES"); e && *e) r = e;
     if (const char* e = getenv("resolution"); e && *e) r = e;
 
-    int configured_height = 0;
-    if (r == "540" || r == "960x540") configured_height = 540;
-    else if (r == "1080" || r == "1920x1080") configured_height = 1080;
-    else if (r == "720" || r == "1280x720") configured_height = 720;
-
+    int configured_height = parse_resolution_height(r);
     if (configured_height == 540) {
-        w = 960;
-        h = 540;
+        w = 1280;
+        h = 720;
         return;
     } else if (configured_height == 1080) {
         w = 1920;
@@ -783,17 +786,26 @@ extern "C" void android_main(android_app* app) {
                 if (eq != std::string::npos && line.substr(0, eq) == "resolution")
                     setenv("NX_RES", line.substr(eq + 1).c_str(), 0);
             }
-            // If resolution is 1080, NX_HANDHELD=0; if 720 or 540, NX_HANDHELD=1
+            // If resolution is 1080, NX_HANDHELD=0; if 720, NX_HANDHELD=1; if 540, NX_HANDHELD=1 and NX_LOW_3D=1 (true 405p 3D)
             std::string r = setting("resolution");
-            if (r == "1080") {
+            if (r.empty()) r = setting("NX_RES");
+            const char* low_env = getenv("NX_LOW_3D");
+            int h = parse_resolution_height(r);
+            bool low_3d = (h == 540) || (low_env && low_env[0] == '1');
+
+            if (h == 1080 && !low_3d) {
                 unsetenv("NX_HANDHELD");
-            } else if (r == "540" || r == "720") {
+                unsetenv("NX_LOW_3D");
+            } else if (low_3d) {
                 setenv("NX_HANDHELD", "1", 1);
-            } else if (const char* h = getenv("NX_HANDHELD"); h && h[0] == '0') {
-                unsetenv("NX_HANDHELD");
+                setenv("NX_LOW_3D", "1", 1);
             } else {
-                setenv("NX_HANDHELD", "1", 0);
+                setenv("NX_HANDHELD", "1", 1);
+                unsetenv("NX_LOW_3D");
             }
+            nx::log("display: resolution parsed '%s' -> height %d, handheld=%s, low_3d=%s",
+                    r.c_str(), h, getenv("NX_HANDHELD") ? getenv("NX_HANDHELD") : "0",
+                    getenv("NX_LOW_3D") ? getenv("NX_LOW_3D") : "0");
         }
     // The heap (scudo) zero-fills every allocation and gives freed pages back at once by default: in the replay, a
     // memset under each allocation and madvise churn (docs/nvn/android-perf/PLAN.md, phase 2). NX_MALLOC_TUNE=0: as

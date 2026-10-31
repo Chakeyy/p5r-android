@@ -299,8 +299,8 @@ public class Launcher extends Activity {
                         "日本語", "한국어", "简体中文", "繁體中文"}, 0));
         options.add(new Option("resolution", "Resolución", "Resolution",
                 new String[] {"540", "720", "1080"},
-                new String[] {"540p (portátil / gama baja)", "720p (portátil)", "1080p (sobremesa)"},
-                new String[] {"540p (Handheld / Low-End)", "720p (Handheld)", "1080p (Docked)"}, 1));
+                new String[] {"540p (3D a 405p - máxima fluidez)", "720p (portátil)", "1080p (sobremesa)"},
+                new String[] {"540p (3D 405p - Max Performance)", "720p (Handheld)", "1080p (Docked)"}, 1));
         options.add(new Option("NX_FSR", "Superresolución (FSR 1.0)", "Super resolution (FSR 1.0)",
                 new String[] {"0", "1"},
                 new String[] {"Desactivada", "Activada"},
@@ -526,10 +526,17 @@ public class Launcher extends Activity {
         load();
         for (Option o : options) {
             String v = config.get(o.key);
-            if ("resolution".equals(o.key) && v == null) {
-                String hh = config.get("NX_HANDHELD");
-                if ("0".equals(hh)) v = "1080";
-                else if ("1".equals(hh)) v = "720";
+            if ("resolution".equals(o.key)) {
+                if (v == null) {
+                    String hh = config.get("NX_HANDHELD");
+                    if ("0".equals(hh)) v = "1080";
+                    else if ("1".equals(hh)) v = "720";
+                } else {
+                    if (v.contains("540")) v = "540";
+                    else if (v.contains("1080")) v = "1080";
+                    else if (v.contains("720")) v = "720";
+                }
+                if ("1".equals(config.get("NX_LOW_3D"))) v = "540";
             }
             for (int k = 0; v != null && k < o.values.length; k++)
                 if (o.values[k].equals(v)) o.pick = k;
@@ -726,10 +733,23 @@ public class Launcher extends Activity {
         load();
         for (Option o : options) config.put(o.key, o.values[o.pick]);
         String res = config.get("resolution");
+        if (res != null) {
+            if (res.contains("540")) res = "540";
+            else if (res.contains("1080")) res = "1080";
+            else if (res.contains("720")) res = "720";
+        }
         if ("1080".equals(res)) {
+            config.put("resolution", "1080");
             config.put("NX_HANDHELD", "0");
-        } else {
+            config.remove("NX_LOW_3D");
+        } else if ("540".equals(res)) {
+            config.put("resolution", "540");
             config.put("NX_HANDHELD", "1");
+            config.put("NX_LOW_3D", "1");
+        } else {
+            config.put("resolution", "720");
+            config.put("NX_HANDHELD", "1");
+            config.remove("NX_LOW_3D");
         }
         if ("1".equals(config.get("NX_FSR"))) {
             config.put("NX_FSR_SHARP", "0.2");
@@ -740,7 +760,7 @@ public class Launcher extends Activity {
         // GRAPHICS is the launcher's own key: the preset's switches are written with it (and removed for "high").
         // RENDER_SCALE (the old option), NX_RENDER_RES and NX_ANISO_MAX are dropped: P5R sizes its targets from the
         // console mode, not from the reported resolution, and never asks for anisotropic filtering.
-        for (String k : new String[] {"RENDER_SCALE", "NX_RENDER_RES", "NX_ANISO_MAX", "NX_LOD_BIAS", "NX_MAX_ANISO"}) config.remove(k);
+        for (String k : new String[] {"RENDER_SCALE", "NX_RENDER_RES", "NX_ANISO_MAX", "NX_LOD_BIAS", "NX_MAX_ANISO", "RESOLUTION", "NX_RES"}) config.remove(k);
         final String preset = config.get("GRAPHICS");
         if ("low".equals(preset)) {
             config.put("NX_LOD_BIAS", "1");

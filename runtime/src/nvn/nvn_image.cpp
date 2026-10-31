@@ -104,6 +104,26 @@ int32_t hud_quarters() {
     return q;
 }
 
+bool low_3d_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_LOW_3D");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+bool low_3d_texture(const Texture& t) {
+    if (!low_3d_on()) return false;
+    // P5R 3D scene render targets (960x540) and post-process chain targets (480x270, 240x135) in handheld mode
+    if (t.target == 1 && t.levels <= 1 && t.samples <= 1) {
+        if ((t.width == 960 && t.height == 540) ||
+            (t.width == 480 && t.height == 270) ||
+            (t.width == 240 && t.height == 135))
+            return true;
+    }
+    return false;
+}
+
 GpuImage* image_of(uint64_t guest) {
     Texture* t = get<Texture>(guest);
     if (!t) return nullptr;
@@ -153,6 +173,11 @@ GpuImage* image_of(uint64_t guest) {
     img->height = (t->target == 0 || t->target == 3) && !one_d ? 1u : std::max(1u, t->height);
     img->levels = std::max(1u, t->levels);
     if (hud_1080_texture(*t)) img->hud = true, img->width = uint32_t(hud_up(1280)), img->height = uint32_t(hud_up(720));
+    if (low_3d_texture(*t)) {
+        img->low_3d = true;
+        img->width = std::max(1u, (t->width * 3) / 4);   // 960->720, 480->360, 240->180
+        img->height = std::max(1u, (t->height * 3) / 4); // 540->405, 270->202, 135->101
+    }
     static const bool low_shadows = [] {
         const char* e = std::getenv("NX_MALI_LOW_SHADOWS");
 #if defined(__ANDROID__) || defined(__aarch64__)

@@ -15,6 +15,7 @@
 
 #include "nvn_draw_state.h"
 #include "nvn_ultrawide.h"
+#include "nvn_vk.h"
 
 namespace nx::nvn::replay {
 
@@ -439,14 +440,21 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     auto& buffers = d.buffers;
     auto& images = d.images;
     buffers.reserve(1024), images.reserve(1024), writes.reserve(2048);  // pointers into them are kept
-    float vw = g_state.has_viewport ? float(g_state.viewport[2]) : 1280.0f;
-    float vh = g_state.has_viewport ? float(g_state.viewport[3]) : 720.0f;
+    VkExtent2D pe = pass_extent();
+    float fallback_w = g_low_3d_target ? (pe.width ? float(pe.width) : 720.0f) : 1280.0f;
+    float fallback_h = g_low_3d_target ? (pe.height ? float(pe.height) : 405.0f) : 720.0f;
+    float vw = g_state.has_viewport ? float(g_state.viewport[2]) : fallback_w;
+    float vh = g_state.has_viewport ? float(g_state.viewport[3]) : fallback_h;
     if (g_uw_wide && g_state.has_viewport) {  // NX_ULTRAWIDE: the viewport the shaders see is the widened one
         int32_t x = g_state.viewport[0], w = g_state.viewport[2];
         uw_span(x, w, UINT32_MAX);
         vw = float(w);
     }
-    const float scale = g_hud_target ? hud_scale() : 1.0f;  // NX_HUD_1080: the shaders' render scale (gl_FragCoord)
+    if (g_low_3d_target && g_state.has_viewport) {
+        vw *= 0.75f;
+        vh *= 0.75f;
+    }
+    const float scale = g_hud_target ? hud_scale() : g_low_3d_target ? 0.75f : 1.0f;  // NX_HUD_1080 / NX_LOW_3D: the shaders' render scale (gl_FragCoord)
     SupportBuffer sb;  // built when a binding gets a copy of its own
     bool sb_built = false;
     auto support = [&]() -> VkDescriptorBufferInfo {

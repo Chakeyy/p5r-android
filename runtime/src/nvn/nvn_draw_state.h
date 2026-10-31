@@ -59,6 +59,7 @@ struct Stats {
 extern State g_state;
 extern Stats g_stats;
 extern bool g_hud_target;  // NX_HUD_1080: this draw's target is a 1920x1080 image of a 1280x720 texture (nvn_vk.h)
+extern bool g_low_3d_target;  // NX_LOW_3D: this draw's target is a 720x405 image of a 960x540 texture (nvn_vk.h)
 
 const uint8_t* guest_bytes(uint64_t gpu);
 uint32_t handle_texture(uint64_t handle, uint32_t* sampler);
