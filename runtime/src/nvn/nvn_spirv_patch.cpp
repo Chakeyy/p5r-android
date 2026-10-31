@@ -605,6 +605,54 @@ uint32_t unwritten_inputs(const ShaderInfo* vs, const ShaderInfo* fs) {
     return mask;
 }
 
+// Optimization pass for ARM Mali GPUs (e.g. Mali-G57 MC2 Bifrost/Valhall).
+// Strips OpNop (0), OpLine (8), OpNoLine (317) to eliminate dead debug code,
+// and enforces DontUnroll (0x2) on OpLoopMerge (37) to prevent Mali register file spilling.
+bool optimize_spirv_mali(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
+    if (in.size() < 5) return false;
+
+    out.clear();
+    out.reserve(in.size());
+    out.assign(in.begin(), in.begin() + 5);
+
+    bool modified = false;
+    for (size_t i = 5; i < in.size();) {
+        uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+        if (!len || i + len > in.size()) return false;
+
+        // Strip debug/nop instructions
+        if (op == 0 /* OpNop */ || op == 8 /* OpLine */ || op == 317 /* OpNoLine */) {
+            modified = true;
+            i += len;
+            continue;
+        }
+
+        // OpLoopMerge: word 0 = (len << 16) | 37, word 1 = merge id, word 2 = continue id, word 3 = loop control mask
+        if (op == 37 /* OpLoopMerge */ && len >= 4) {
+            uint32_t loop_control = in[i + 3];
+            // Clear Unroll (0x1), set DontUnroll (0x2)
+            uint32_t new_control = (loop_control & ~1u) | 2u;
+            if (new_control != loop_control) {
+                modified = true;
+            }
+            out.push_back(in[i]);
+            out.push_back(in[i + 1]);
+            out.push_back(in[i + 2]);
+            out.push_back(new_control);
+            for (size_t k = 4; k < len; ++k) {
+                out.push_back(in[i + k]);
+            }
+            i += len;
+            continue;
+        }
+
+        out.insert(out.end(), in.begin() + i, in.begin() + i + len);
+        i += len;
+    }
+
+    return modified;
+}
+
 std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, uint32_t unwritten, bool* int_inputs) {
     std::vector<uint32_t> code = s->spirv, next;  // each pass reads `code` and leaves its result in `next`
     if (strip_interlock(code, next)) code.swap(next);
@@ -648,6 +696,11 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
         return e && std::atoi(e) != 0;
     }();
     if (fc && s->stage != ShaderStage::Compute && preserve_inf_nan(code, next)) code.swap(next);
+    static const bool mali_opt = [] {
+        const char* e = std::getenv("NX_MALI_SPIRV_OPT");
+        return !(e && e[0] == '0');
+    }();
+    if (mali_opt && optimize_spirv_mali(code, next)) code.swap(next);
     return code;
 }
 

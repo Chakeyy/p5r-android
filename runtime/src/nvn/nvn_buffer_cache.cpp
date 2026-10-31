@@ -86,11 +86,7 @@ struct {
 } g_stats_cache;
 
 bool on() {
-    static const bool v = [] {
-        const char* e = std::getenv("NX_BUFFER_CACHE");  // off until measured on the tablet
-        return e && e[0] == '1';
-    }();
-    return v;
+    return false;
 }
 
 uint64_t budget() {

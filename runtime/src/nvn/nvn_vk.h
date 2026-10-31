@@ -37,6 +37,7 @@ struct GpuImage {
     uint32_t nvn_format = 0;  // the texture's NVN format
     bool uw = false;          // NX_ULTRAWIDE: a widened render target (nvn_ultrawide.cpp)
     bool hud = false;         // NX_HUD_1080: a 1280x720 render target made at 1920x1080 or 1600x900 (hud_1080_texture)
+    bool shadow = false;      // NX_MALI_LOW_SHADOWS: 0.5x downscaled shadow depth map
 };
 
 // NX_HUD_1080 (nvn_image.cpp): render targets of the handheld screen's size, 1280x720, are made at 3/2 of it,

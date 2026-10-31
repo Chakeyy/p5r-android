@@ -68,7 +68,7 @@ VkRenderPass make_pass(const PassKey& k, uint32_t count) {
         a.format = VkFormat(k[8]);
         a.samples = VK_SAMPLE_COUNT_1_BIT;
         a.loadOp = k[18] ? VkAttachmentLoadOp(k[18] - 1) : VK_ATTACHMENT_LOAD_OP_LOAD;
-        a.storeOp = k[9] & kNoStore ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        a.storeOp = (k[9] & kNoStore) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
         bool st = has_stencil(VkFormat(k[8]));
         a.stencilLoadOp = !st ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
                               : k[19] ? VkAttachmentLoadOp(k[19] - 1) : VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -106,7 +106,12 @@ VkRenderPass pass_for(uint32_t count, const VkFormat* colors, VkFormat depth, co
 bool render_pass_objects() {
     static const bool on = [] {  // also on a device without dynamic rendering (before Vulkan 1.3; nvn_vk.cpp)
         const char* e = std::getenv("NX_RENDER_PASS_OBJECTS");
-        bool v = (e && e[0] == '1') || !vk_dynamic_rendering();
+#if defined(__ANDROID__)
+        bool def = true;
+#else
+        bool def = false;
+#endif
+        bool v = e ? e[0] == '1' : (def || !vk_dynamic_rendering());
         if (v) log("nvn/vk: render pass and framebuffer objects instead of dynamic rendering");
         return v;
     }();

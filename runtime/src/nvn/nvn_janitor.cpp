@@ -23,6 +23,7 @@ std::deque<std::function<void()>> g_jobs;
 bool g_started = false;
 
 void run() {
+    plat::pin_current_thread_to_little_cores("VK-Janitor");
     plat::set_thread_name("nvn janitor");
     for (;;) {
         std::function<void()> job;

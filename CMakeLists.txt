@@ -216,7 +216,7 @@ if(ANDROID)
     add_library(${NX_GAME} SHARED ${NX_RUNTIME_SOURCES} runtime/src/platform_android.cpp
         runtime/src/platform_android_input.cpp runtime/src/platform_android_audio.cpp runtime/src/memguard_android.cpp
         "${GLUE}/android_native_app_glue.c")
-    target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_IMPORTER_DIR}" "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include" "${GLUE}")
+    target_include_directories(${NX_GAME} PRIVATE runtime/include runtime/src "${NX_IMPORTER_DIR}" "${NX_GAME_DIR}" "${NX_VULKAN_SDK}/Include" "${NX_VULKAN_SDK}/include" "${GLUE}")
     # Our ANativeActivity_onCreate (platform_android.cpp) runs first, on the UI thread, then calls the glue's.
     set_source_files_properties("${GLUE}/android_native_app_glue.c" PROPERTIES
         COMPILE_DEFINITIONS "ANativeActivity_onCreate=glue_ANativeActivity_onCreate")

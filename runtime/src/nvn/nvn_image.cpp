@@ -153,6 +153,19 @@ GpuImage* image_of(uint64_t guest) {
     img->height = (t->target == 0 || t->target == 3) && !one_d ? 1u : std::max(1u, t->height);
     img->levels = std::max(1u, t->levels);
     if (hud_1080_texture(*t)) img->hud = true, img->width = uint32_t(hud_up(1280)), img->height = uint32_t(hud_up(720));
+    static const bool low_shadows = [] {
+        const char* e = std::getenv("NX_MALI_LOW_SHADOWS");
+#if defined(__ANDROID__) || defined(__aarch64__)
+        return !(e && e[0] == '0');
+#else
+        return e && e[0] == '1';
+#endif
+    }();
+    if (low_shadows && aspect == 1 && t->width == t->height && t->width >= 1024 && (t->target == 1 || t->target == 4)) {
+        img->shadow = true;
+        img->width = std::max(1u, t->width / 2);
+        img->height = std::max(1u, t->height / 2);
+    }
     uint32_t depth = std::max(1u, t->target == 3 && !one_d && t->depth <= 1 ? t->height : t->depth);  // GL-style layers
     bool is3d = t->target == 2, cube = t->target == 8 || t->target == 9;
     bool array = t->target == 3 || t->target == 4 || t->target == 6 || t->target == 9;

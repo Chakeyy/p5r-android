@@ -280,6 +280,7 @@ bool init() {
     dci.pNext = &features;
     if (!check(p_create_device(g_physical, &dci, nullptr, &g_device), "vkCreateDevice")) return false;
     p_vkGetDeviceQueue(g_device, g_family, 0, &g_queue);
+    pipeline_cache();
     if (display_timing) {
         auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
             reinterpret_cast<PFN_vkGetInstanceProcAddr>(g_gipa)(g_instance, "vkGetDeviceProcAddr"));
@@ -439,6 +440,8 @@ bool make_swapchain() {
     if (!std::getenv("NX_FIFO")) {
         if (has(VK_PRESENT_MODE_MAILBOX_KHR))
             ci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        else if (has(VK_PRESENT_MODE_FIFO_RELAXED_KHR))
+            ci.presentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
         else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR))
             ci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
     }

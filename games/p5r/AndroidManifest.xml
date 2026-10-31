@@ -5,9 +5,9 @@
      all-files access. The native build (NX_NCE, build_android.cmd -Nce) holds no game code: it runs exefs/ as it is.
      The recompiled build (analysis/ and the game's code compiled in) is private to the owner of the game. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="io.github.p5rrecomp"
+    package="io.github.p5rrecomp.opt"
     android:versionCode="7"
-    android:versionName="0.4.3">
+    android:versionName="0.4.1-mali">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
@@ -19,7 +19,7 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application
-        android:label="P5R"
+        android:label="P5R (Mali)"
         android:requestLegacyExternalStorage="true"
         android:hasCode="true"
         android:extractNativeLibs="true"
@@ -30,7 +30,7 @@
         android:theme="@style/Fullscreen">
         <!-- Home screen: data check, options (config.txt), then the game. -->
         <activity
-            android:name=".Launcher"
+            android:name="io.github.p5rrecomp.Launcher"
             android:exported="true"
             android:theme="@android:style/Theme.Material.NoActionBar"
             android:screenOrientation="sensorLandscape">
@@ -43,7 +43,7 @@
              libspirvharness.so, the shader translator). Its own process, so the translator's runtime never shares
              the game's. -->
         <activity
-            android:name=".ImportActivity"
+            android:name="io.github.p5rrecomp.ImportActivity"
             android:exported="false"
             android:process=":import"
             android:theme="@android:style/Theme.Material.NoActionBar"
@@ -51,7 +51,7 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden" />
         <!-- Where the on-screen controls go (NX_TOUCH_LAYOUT), full screen like the game. -->
         <activity
-            android:name=".ControlsEditor"
+            android:name="io.github.p5rrecomp.ControlsEditor"
             android:exported="false"
             android:theme="@style/Fullscreen"
             android:screenOrientation="sensorLandscape"

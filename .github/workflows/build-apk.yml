@@ -1,0 +1,87 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - perf/mali-g57-optimizations
+      - perf/android-low-end
+      - 'perf/**'
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build P5R APK (NCE arm64-v8a)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build cmake zip unzip
+
+      - name: Install Android NDK 28 and Build Tools 35
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install \
+            "ndk;28.2.13676358" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Fetch Vulkan Headers
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          mkdir -p /tmp/vulkan-headers/Include
+          cp -r /tmp/vulkan-headers/include/* /tmp/vulkan-headers/Include/
+          echo "VULKAN_SDK=/tmp/vulkan-headers" >> $GITHUB_ENV
+
+      - name: Download Shader Translator (libspirvharness.so)
+        run: |
+          mkdir -p private/build/spirv_harness_android
+          curl -sSL -L "https://github.com/Brandon04Gonzalez/p5r-android/releases/download/v0.4.1/p5r.apk" -o /tmp/p5r_v041.apk
+          unzip -p /tmp/p5r_v041.apk lib/arm64-v8a/libspirvharness.so > private/build/spirv_harness_android/libspirvharness.so
+          chmod +x private/build/spirv_harness_android/libspirvharness.so
+
+      - name: Build P5R APK
+        run: |
+          chmod +x android/build_apk.sh
+          bash android/build_apk.sh --game p5r --nce --release
+
+      - name: Prepare APK Output
+        id: prep
+        run: |
+          REF_NAME="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
+          PERF_TAG=$(sed -n 's/.*kPerfBuildTag = "\([^"]*\)".*/\1/p' games/p5r/game.cpp | head -n 1)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date +'%Y%m%d')
+          if [ -n "${PERF_TAG}" ]; then
+            BASE_NAME="p5r-v0.4.2-${PERF_TAG}-${DATE}-${SHORT_SHA}"
+          else
+            SLUG=$(echo "${REF_NAME}" | sed 's|perf/||; s|fix/||; s|android-||; s|/|-|g')
+            REV_COUNT=$(git rev-list --count cf896a0..HEAD 2>/dev/null || echo "1")
+            BASE_NAME="p5r-v0.4.2-${SLUG}-r${REV_COUNT}-${DATE}-${SHORT_SHA}"
+          fi
+          APK_NAME="${BASE_NAME}.apk"
+          cp private/p5r/apk_nce/p5r.apk "${APK_NAME}"
+          ls -lh "${APK_NAME}"
+          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
+          echo "artifact_name=${BASE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prep.outputs.artifact_name }}
+          path: ${{ steps.prep.outputs.apk_name }}

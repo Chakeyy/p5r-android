@@ -62,6 +62,13 @@ final class Lang {
                 "Automatica (lingua del dispositivo)", "Automático (idioma do dispositivo)", "自動（端末の言語）",
                 "자동 (기기 언어)", "自动（设备语言）", "自動（裝置語言）");
         put("Resolution", "Résolution", "Auflösung", "Risoluzione", "Resolução", "解像度", "해상도", "分辨率", "解析度");
+        put("540p (Handheld / Low-End)", "540p (portable / bas de gamme)", "540p (Handheld / Einsteiger)",
+                "540p (portatile / fascia bassa)", "540p (portátil / básica)", "540p（携帯 / 低スペック）",
+                "540p (휴대 / 보급형)", "540p（掌机 / 低配）", "540p（掌機 / 低配）");
+        put("720p (Handheld)", "720p (portable)", "720p (Handheld)", "720p (portatile)", "720p (portátil)",
+                "720p（携帯）", "720p (휴대)", "720p（掌机）", "720p（掌機）");
+        put("1080p (Docked)", "1080p (station d'accueil)", "1080p (Dock-Modus)", "1080p (fissa)", "1080p (modo TV)",
+                "1080p（TVモード）", "1080p (독 모드)", "1080p（底座模式）", "1080p（底座模式）");
         put("Interface", "Interface", "Benutzeroberfläche", "Interfaccia", "Interface", "インターフェース", "인터페이스",
                 "界面", "介面");
         put("720p (faster)", "720p (plus rapide)", "720p (schneller)", "720p (più veloce)", "720p (mais rápida)",
@@ -78,8 +85,25 @@ final class Lang {
         put("60 fps (experimental)", "60 fps (expérimental)", "60 fps (experimentell)", "60 fps (sperimentale)",
                 "60 fps (experimental)", "60 fps（実験的）", "60 fps (실험적)", "60 fps（实验性）", "60 fps（實驗性）");
         put("Shadows", "Ombres", "Schatten", "Ombre", "Sombras", "影", "그림자", "阴影", "陰影");
+        put("Shadow quality", "Qualité des ombres", "Schattenqualität", "Qualità delle ombre", "Qualidade das sombras",
+                "影の品質", "그림자 품질", "阴影质量", "陰影品質");
+        put("Low (0.5x - best performance)", "Basse (0.5x - meilleures performances)", "Niedrig (0.5x - beste Leistung)",
+                "Bassa (0.5x - prestazioni migliori)", "Baixa (0.5x - melhor desempenho)", "低 (0.5x - 高性能)",
+                "낮음 (0.5x - 최고 성능)", "低（0.5x - 最佳性能）", "低（0.5x - 最佳效能）");
+        put("Original (1.0x)", "Originale (1.0x)", "Original (1.0x)", "Originale (1.0x)", "Original (1.0x)",
+                "オリジナル (1.0x)", "원본 (1.0x)", "原始（1.0x）", "原始（1.0x）");
+        put("Controller layout", "Disposition de la manette", "Controller-Layout", "Layout del controller",
+                "Layout do controle", "コントローラー配置", "컨트롤러 레이아웃", "手柄布局", "手把配置");
+        put("Auto-detect (Xbox/8BitDo/Switch)", "Détection auto (Xbox/8BitDo/Switch)", "Automatisch (Xbox/8BitDo/Switch)",
+                "Rilevamento auto (Xbox/8BitDo/Switch)", "Detecção automática (Xbox/8BitDo/Switch)", "自動検出 (Xbox/8BitDo/Switch)",
+                "자동 감지 (Xbox/8BitDo/Switch)", "自动检测 (Xbox/8BitDo/Switch)", "自動偵測 (Xbox/8BitDo/Switch)");
+        put("Xbox / Standard (A=Bottom, B=Right)", "Xbox / Standard (A=Bas, B=Droite)", "Xbox / Standard (A=Unten, B=Rechts)",
+                "Xbox / Standard (A=In basso, B=A destra)", "Xbox / Padrão (A=Baixo, B=Direita)", "Xbox / 標準 (A=下, B=右)",
+                "Xbox / 표준 (A=하단, B=우측)", "Xbox / 标准 (A=下, B=右)", "Xbox / 標準 (A=下, B=右)");
+        put("Nintendo Switch (B=Bottom, A=Right)", "Nintendo Switch (B=Bas, A=Droite)", "Nintendo Switch (B=Unten, A=Rechts)",
+                "Nintendo Switch (B=In basso, A=A destra)", "Nintendo Switch (B=Baixo, A=Direita)", "Nintendo Switch (B=下, A=右)",
+                "Nintendo Switch (B=하단, A=우측)", "Nintendo Switch (B=下, A=右)", "Nintendo Switch (B=下, A=右)");
         put("Off", "Désactivé", "Aus", "Disattivato", "Desativado", "オフ", "끔", "关", "關");
-        put("Fullscreen (stretch)", "Plein écran (étirer)", "Vollbild (strecken)", "Schermo intero (allarga)", "Tela cheia (esticar)", "\u5168\u753b\u9762\uff08\u5f15\u304d\u4f38\u3070\u3057\uff09", "\uc804\uccb4 \ud654\uba74 (\ub298\uc774\uae30)", "\u5168\u5c4f\uff08\u62c9\u4f38\uff09", "\u5168\u87a2\u5e55\uff08\u62c9\u4f38\uff09");
         put("On", "Activé", "An", "Attivato", "Ativado", "オン", "켬", "开", "開");
         put("FPS counter", "Compteur de FPS", "FPS-Anzeige", "Contatore FPS", "Contador de FPS", "FPS表示", "FPS 표시",
                 "帧率显示", "FPS 顯示");

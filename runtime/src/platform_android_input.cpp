@@ -29,6 +29,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -82,12 +83,70 @@ bool g_gamepad = false;  // the last input came from a controller: the drawn tou
 uint64_t g_last_touch_ns = 0;  // the drawn controls dim after kTouchIdleNs without a touch
 constexpr uint64_t kTouchIdleNs = 8'000'000'000;
 
-uint64_t key_to_button(int32_t k) {
+bool is_nintendo_device(android_app* app, int32_t device_id) {
+    if (device_id <= 0 || !app || !app->activity || !app->activity->vm) return false;
+    static std::map<int32_t, bool> s_cache;
+    auto it = s_cache.find(device_id);
+    if (it != s_cache.end()) return it->second;
+
+    bool is_nintendo = false;
+    JNIEnv* env = nullptr;
+    JavaVM* vm = app->activity->vm;
+    bool attached = false;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (vm->AttachCurrentThread(&env, nullptr) == JNI_OK) attached = true;
+    }
+    if (env) {
+        jclass dev_cls = env->FindClass("android/view/InputDevice");
+        if (dev_cls) {
+            jmethodID get_device = env->GetStaticMethodID(dev_cls, "getDevice", "(I)Landroid/view/InputDevice;");
+            jobject dev = env->CallStaticObjectMethod(dev_cls, get_device, device_id);
+            if (dev) {
+                jmethodID get_name = env->GetMethodID(dev_cls, "getName", "()Ljava/lang/String;");
+                jstring name_str = static_cast<jstring>(env->CallObjectMethod(dev, get_name));
+                if (name_str) {
+                    const char* chars = env->GetStringUTFChars(name_str, nullptr);
+                    if (chars) {
+                        std::string lower;
+                        for (const char* p = chars; *p; ++p) lower += std::tolower(static_cast<unsigned char>(*p));
+                        env->ReleaseStringUTFChars(name_str, chars);
+                        if (lower.find("nintendo") != std::string::npos ||
+                            lower.find("joy-con") != std::string::npos ||
+                            lower.find("pro controller") != std::string::npos) {
+                            is_nintendo = true;
+                        }
+                    }
+                }
+                env->DeleteLocalRef(dev);
+            }
+            env->DeleteLocalRef(dev_cls);
+        }
+        if (attached) vm->DetachCurrentThread();
+    }
+    return s_cache[device_id] = is_nintendo;
+}
+
+uint64_t key_to_button(android_app* app, int32_t k, int32_t device_id) {
+    static const int layout_mode = [] {
+        const char* e = std::getenv("NX_GAMEPAD_LAYOUT");
+        if (!e || std::strcmp(e, "auto") == 0 || e[0] == '\0') return 0; // 0 = auto
+        if (std::strcmp(e, "xbox") == 0) return 1;                       // 1 = xbox / standard
+        if (std::strcmp(e, "nintendo") == 0) return 2;                   // 2 = nintendo switch
+        return 0;
+    }();
+
+    bool use_nintendo = false;
+    if (layout_mode == 2) {
+        use_nintendo = true;
+    } else if (layout_mode == 0) {
+        use_nintendo = is_nintendo_device(app, device_id);
+    }
+
     switch (k) {
-        case AKEYCODE_BUTTON_A: return kB;  // bottom face button = Nintendo B
-        case AKEYCODE_BUTTON_B: return kA;  // right face button = Nintendo A
-        case AKEYCODE_BUTTON_X: return kY;
-        case AKEYCODE_BUTTON_Y: return kX;
+        case AKEYCODE_BUTTON_A: return use_nintendo ? kB : kA;
+        case AKEYCODE_BUTTON_B: return use_nintendo ? kA : kB;
+        case AKEYCODE_BUTTON_X: return use_nintendo ? kY : kX;
+        case AKEYCODE_BUTTON_Y: return use_nintendo ? kX : kY;
         case AKEYCODE_BUTTON_L1: return kL;
         case AKEYCODE_BUTTON_R1: return kR;
         case AKEYCODE_BUTTON_L2: return kZL;
@@ -118,12 +177,13 @@ uint64_t touch_button(float x, float y) {
 
 }  // namespace
 
-int32_t on_input(android_app*, AInputEvent* e) {
+int32_t on_input(android_app* app, AInputEvent* e) {
     std::lock_guard lk(g_in);
     int32_t type = AInputEvent_getType(e);
     int32_t src = AInputEvent_getSource(e);
+    int32_t device_id = AInputEvent_getDeviceId(e);
     if (type == AINPUT_EVENT_TYPE_KEY) {
-        uint64_t b = key_to_button(AKeyEvent_getKeyCode(e));
+        uint64_t b = key_to_button(app, AKeyEvent_getKeyCode(e), device_id);
         if (!b) return 0;
         g_gamepad = true;
         if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN)
