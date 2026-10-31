@@ -486,7 +486,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
             uint64_t size;
             if (b.set < 2 && b.nvn.source == NvnSource::StorageBuffer && storage(s, b, api_stage(s->stage), p, size) &&
                 p && size && !written_separate())
-                written_bind(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, 0x10000));
+                written_bind(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, pad_min(0x10000)));
         }
     for (const ShaderInfo* s : shaders) {
         int st = api_stage(s->stage);
@@ -534,7 +534,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                     if (!written && s->stage != ShaderStage::Compute && written_overlaps(p, size)) written_count_bind();
                     // At least 64 KB: Metal does not bound-check, and a shader writing past a small or missing
                     // buffer overwrote the next data in the upload buffer (garbage everywhere after a compute).
-                    info = buffer_of(cb, p, size, written ? 0x10000 : pad_min(0x10000), written);
+                    info = buffer_of(cb, p, size, pad_min(0x10000), written);
                     break;
                 }
                 case NvnSource::DriverConstants: {

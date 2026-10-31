@@ -2,6 +2,7 @@
 // game, and what only P5R needs. The game draws through NVN (Atlus' GFD engine); its shaders live in the GFD shader
 // caches BASE/GFDNXHHPRESET*.GSC of ALL_USEU.CPK (tools/gsc_shaders.py). Notes: games/p5r/PROGRESO.md.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -559,7 +560,35 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-void game::renderer_start() {}
+static constexpr const char* kPerfBuildTag = "lowend-r17";
+
+void game::renderer_start() {
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    log("p5r perf build: %s (CLEARS_V2 loadOp=CLEAR, pass continuity, compute barrier+ring coalescing, uncached read & pagefault fix, G99 sched)",
+        kPerfBuildTag);
+#if defined(__ANDROID__)
+    // Low-end Android defaults:
+    // - Render at 0.5x scale (960x540 -> 480x270 internal) unless user overrides NX_RES_SCALE.
+    //   Provides a ~75% fragment shader & memory bandwidth reduction on Mali-G57.
+    setenv("NX_RES_SCALE", "0.5", 0);
+    // - Force bilinear (1x) sampling instead of 16x anisotropic filtering on mobile TBDR GPUs.
+    setenv("NX_MAX_ANISO", "1", 0);
+    // - Enable per-image deferred clears (PROGRESO 77) so P5R's depth-only clears and dual
+    //   shadow-map clears fold into VK_ATTACHMENT_LOAD_OP_CLEAR instead of 12,000+ standalone
+    //   vkCmdClear*Image transfer clears.
+    setenv("NX_CLEARS_V2", "1", 0);
+    // - NOTE: Do NOT enable NX_MALI_FP16 globally in P5R! P5R shaders use packed bitfields,
+    //   integer-as-float encodings, and high-range lighting/skinning math in fragment shaders
+    //   that overflow IEEE754 fp16 (max 65504), causing severe black/corrupted screen glitches.
+    // - Yield briefly when the guest render/worker loop spins on QueryEvent
+    //   so 2-big-core SoCs (Helio G99) don't starve the Vulkan replay thread.
+    setenv("NX_QUERY_SPIN_SLEEP_US", "150", 0);
+    // - Do NOT force-clear color attachments on every new render pass without an explicit
+    //   NVN clear command; this avoids wiping UI/compositor targets updated across passes.
+    setenv("NX_LOAD_CLEAR", "0", 0);
+#endif
+}
 void game::first_frame() {}
 
 }  // namespace nx

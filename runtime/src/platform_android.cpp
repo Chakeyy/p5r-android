@@ -559,6 +559,7 @@ void crash(int sig, siginfo_t* info, void* uc) {
 }
 
 void game_thread(void*) {
+    nx::plat::set_thread_priority(-4);
     nx::plat::perf_hint_thread();
     try {
         nx::boot();

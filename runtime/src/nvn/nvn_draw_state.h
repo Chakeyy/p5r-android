@@ -158,6 +158,7 @@ void sets_invalidate_bound();
 void sets_log();
 // nvn_draw.cpp: `img` is a target of the open pass that a draw or clear of the pass wrote.
 bool pass_wrote(const GpuImage* img);
+void flush_compute_barrier(VkCommandBuffer cb);
 void written_cpu_write(const uint8_t* p, uint64_t size);       // replay-time guest writes (logged when they meet one)
 std::vector<WriteBack> written_take();                         // one write-back per range, at the end of the submit
 void written_reset();

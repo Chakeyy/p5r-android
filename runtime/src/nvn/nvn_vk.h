@@ -348,6 +348,7 @@ void gpu_profile_log(uint64_t frames);
 
 namespace replay {
 void dedup_reset();  // nvn_dedup.cpp
+void written_reset();            // nvn_written.cpp
 bool written_separate();         // nvn_written.cpp (nvn_draw_state.h)
 uint64_t written_bind_count();   // nvn_written.cpp: written_bind calls so far (a dispatch bound storage it writes)
 void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size);  // nvn_draw_trace.cpp

@@ -800,10 +800,14 @@ void gpu_present(uint64_t texture, const int32_t* crop, uint64_t origin_ns) {
     if (dump) transition(g_cb, *src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);  // the present pass left it sampled
     dump = dump && frame_dump_record(g_cb, *src);
     VkSemaphore rendered = async_gpu() ? frame_rendered_semaphore(index) : g_rendered;
+    // Reset cross-submit compute regions at the end of the frame; written_take()
+    // inside frame_submit() will collect any remaining untaken regions first.
+    // Submit the frame's render work with signal = image_ready.
     if (async_gpu())  // the blit's fence is not waited for (vkQueuePresentKHR waits on `rendered`); a dumped frame is
         frame_submit(acquired, rendered, {}, dump);
     else
         end_and_wait(acquired, rendered);
+    replay::written_reset();
     if (dump) frame_dump_write(*src, presents);
     if (due) debug_dump_textures(presents);
     debug_hud_dump(presents);  // dump_hud (nvn_debug.cpp): only when a frame was armed

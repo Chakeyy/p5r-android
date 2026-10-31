@@ -382,6 +382,15 @@ static void thread_main(void* p) {
     char name[16];
     std::snprintf(name, sizeof name, "g%llx", (unsigned long long)t->id);
     plat::set_thread_name(name);
+
+    // On 2-big-core + 6-little-core SoCs (e.g. Helio G99: 2x Cortex-A76 + 6x Cortex-A55),
+    // give lower-priority / core-2/3 background guest worker threads a positive nice
+    // value so the Linux CFS scheduler places them on the 6x Cortex-A55 cores and keeps
+    // the 2x Cortex-A76 big cores free for the Vulkan replay thread and main game thread.
+    if (t->prio > 44 || t->core >= 2) {
+        plat::set_thread_priority(4);
+    }
+
     call(t->ctx, t->entry);
     // Returning from the entry point is like svcExitThread.
     std::lock_guard lk(g_k);
@@ -519,10 +528,13 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
             KThread* t = t_self;
             uint64_t now = plat::monotonic_ns();
             if (now - t->last_yield > 2'000'000) t->yields = 0;
-            if (!spin_naps() || ++t->yields <= 32)
-                plat::yield();
-            else
+            ++t->yields;
+            if (spin_naps() && t->yields > 32)
                 plat::sleep_ns(500'000);
+            else if (t->yields > 64)
+                plat::sleep_ns(200'000);
+            else
+                plat::yield();
             t->last_yield = plat::monotonic_ns();
             return;
         }

@@ -91,6 +91,8 @@ struct Bound {
     uint32_t raster[10] = {};  // raster_dynamic's inputs: stencil reference and masks per face, the depth bias
 } g_bound;
 uint64_t g_state_set = 0, g_state_kept = 0;  // state commands recorded and left out, for the log
+VkPipeline g_last_compute_pipeline = VK_NULL_HANDLE;
+bool g_compute_barrier_pending = false;
 
 template <typename T>
 bool same_bytes(const T& a, const T& b) { return std::memcmp(&a, &b, sizeof(T)) == 0; }
@@ -370,7 +372,10 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     if (!cs) return;
     uint32_t x = uint32_t(c.i[0]), y = uint32_t(c.i[1]), z = uint32_t(c.i[2]);
     const uint8_t* args = c.n == 1 ? guest_bytes(c.a[0]) : nullptr;  // indirect: {x, y, z}
-    if (args) frame_guest_read(args, 12);  // deferred write-backs over the arguments land first (nvn_frames.cpp)
+    if (args) {
+        flush_compute_barrier(cb);
+        frame_guest_read(args, 12);  // deferred write-backs over the arguments land first (nvn_frames.cpp)
+    }
     if (c.n == 1 && !args) return;
     // Written by an earlier dispatch of this submit: only the GPU knows them (vkCmdDispatchIndirect, below).
     bool gpu_args = args && !written_separate() && written_overlaps(args, 12);
@@ -385,23 +390,17 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     draw_end_rendering(cb, 2);
     gather_textures(stages);
     build_sets(cb, stages, layout);
-    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    if (pipeline != g_last_compute_pipeline) {
+        p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        g_last_compute_pipeline = pipeline;
+    }
     bind_sets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout);
     if (gpu_profile_on()) gpu_profile_mark(cb, "compute " + cs->hash);
     if (!gpu_args || !written_indirect(cb, args)) p_vkCmdDispatch(cb, x, y, z);
     if (gpu_profile_on()) gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
-                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                       VK_ACCESS_TRANSFER_READ_BIT;
-    const VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-                                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                           VK_PIPELINE_STAGE_TRANSFER_BIT;
-    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst_stages, 0, 1, &mb, 0,
-                           nullptr, 0, nullptr);
+
+    // Defer compute barrier until vertex/graphics consumption, read-after-write, or transfer.
+    g_compute_barrier_pending = true;
     g_stats.dispatches++;
 }
 
@@ -637,27 +636,60 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             }
         }
     }
-    // A pass that neither tests nor writes depth but keeps its depth image bound while sampling that same image (the
-    // world map's depth-to-colour linearization, fs 0aa56d1b): on Metal the image is then attached and read in one
-    // encoder, which is undefined, and the copy came out 0 everywhere; the composite then took the player for
-    // occluded (a flat silhouette, issue #50; DEBUG-2.md #67). The depth is unused: the pass runs without it.
-    // NX_KEEP_SAMPLED_DEPTH=1: as before.
+    // Feedback lock & pass-continuity optimization:
+    // When depth_test, depth_write, and stencil_test are all off:
+    // 1. If t.depth != 0 and either dimg is sampled by this draw OR an open color-only pass
+    //    is already active on the same color targets (with no pending clears on dimg),
+    //    detach t.depth so we don't break the open color-only render pass.
+    // 2. Conversely, if t.depth == 0 while an open render pass on the same color targets
+    //    already has g_pass.depth != 0 (and g_pass.depth is not sampled by this draw and has
+    //    no pending clears), inherit g_pass.depth so the open color+depth pass continues
+    //    without a tile flush/reload on Mali TBDR.
     Targets detached;
-    const Targets& tt = [&]() -> const Targets& {
-        static const bool keep = std::getenv("NX_KEEP_SAMPLED_DEPTH") != nullptr;
-        const DepthStencilInfo& d = g_state.depth;
-        if (keep || !t.depth || d.depth_test || d.depth_write || d.stencil_test) return t;
-        GpuImage* dimg = image_of(t.depth);
-        if (!dimg) return t;
-        for (const ResolvedTexture& r : g_textures.resolved)
-            if (r.texture && image_of(r.texture) == dimg) {
-                static uint64_t n = 0;
-                if (n++ == 0) log("nvn: a pass samples its own unused depth image: drawn without it (#50)");
-                detached = t, detached.depth = 0;
-                return detached;
+    const Targets* tp = &t;
+    const DepthStencilInfo& d = g_state.depth;
+    if (!d.depth_test && !d.depth_write && !d.stencil_test) {
+        if (t.depth != 0) {
+            GpuImage* dimg = image_of(t.depth);
+            bool sampled = false;
+            for (const ResolvedTexture& r : g_textures.resolved) {
+                if (r.texture && image_of(r.texture) == dimg) {
+                    sampled = true;
+                    break;
+                }
             }
-        return t;
-    }();
+            bool keep_color_only_pass = g_rendering && g_pass.depth == 0 &&
+                                        dimg && !clears_pending_image(dimg);
+            if (sampled || keep_color_only_pass) {
+                detached = t;
+                detached.depth = 0;
+                tp = &detached;
+            }
+        } else if (g_rendering && g_pass.depth != 0 && t.color_count == g_pass.color_count) {
+            GpuImage* pimg = image_of(g_pass.depth);
+            if (pimg && !clears_pending_image(pimg)) {
+                bool sampled = false;
+                for (const ResolvedTexture& r : g_textures.resolved) {
+                    if (r.texture && image_of(r.texture) == pimg) {
+                        sampled = true;
+                        break;
+                    }
+                }
+                if (!sampled) {
+                    detached = t;
+                    detached.depth = g_pass.depth;
+                    detached.views.level[8] = g_pass.views.level[8];
+                    detached.views.layer[8] = g_pass.views.layer[8];
+                    detached.views.format[8] = g_pass.views.format[8];
+                    if (targets_same(g_pass, detached)) {
+                        tp = &detached;
+                    }
+                }
+            }
+        }
+    }
+    const Targets& tt = *tp;
+    flush_compute_barrier(cb);
     vertex_read_barrier(cb, vs);  // G4
     g_uw_wide = false;  // NX_ULTRAWIDE: is this draw's target a widened one (viewport, scissor, clears, vs scale)
     if (uw_on()) {
@@ -807,7 +839,25 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 g_state.viewport[0], g_state.viewport[1], g_state.viewport[2], g_state.viewport[3]);
         }
     }
-    VkPipeline pipeline = graphics_pipeline(key, layout);
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    {
+        static thread_local VkPipeline s_last_pipeline = VK_NULL_HANDLE;
+        static thread_local PipelineKey s_last_key{};
+        static thread_local VkPipelineLayout s_last_layout = VK_NULL_HANDLE;
+
+        if (s_last_pipeline != VK_NULL_HANDLE &&
+            s_last_layout == layout.layout &&
+            std::memcmp(&s_last_key, &key, sizeof(PipelineKey)) == 0) {
+            pipeline = s_last_pipeline;
+        } else {
+            pipeline = graphics_pipeline(key, layout);
+            if (pipeline != VK_NULL_HANDLE) {
+                s_last_pipeline = pipeline;
+                s_last_key = key;
+                s_last_layout = layout.layout;
+            }
+        }
+    }
     if (!pipeline) {
         g_stats.no_pipeline++;
         return false;
@@ -817,6 +867,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     if (g_bound.pipeline != pipeline) {
         p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         g_bound.pipeline = pipeline, g_state_set++;
+        g_last_compute_pipeline = VK_NULL_HANDLE;
         if (gpu_profile_on()) gpu_profile_count(1);
     } else {
         g_state_kept++;
@@ -1058,13 +1109,14 @@ void draw_begin_submit() {
     g_linear_targets.clear(), g_late_write_backs.clear();
     g_vertex_pending = false, g_vertex_visible_at = g_pass_serial;  // each command buffer begins with a full barrier
     g_bound = Bound{};  // a new command buffer
+    g_last_compute_pipeline = VK_NULL_HANDLE;
+    g_compute_barrier_pending = false;
     submit_lists_reset();
     sets_begin_submit();
     clears_begin_submit();
     g_submit_ns = plat::monotonic_ns();
     dedup_reset();
     cache_begin_submit();
-    written_reset();
     pipeline_begin_submit();
 }
 
@@ -1099,6 +1151,8 @@ void draw_log_stats() {
 }
 
 void pass_end_only(VkCommandBuffer cb, int reason) {
+    if (reason != 2 /* Compute */) flush_compute_barrier(cb);
+    g_last_compute_pipeline = VK_NULL_HANDLE;
     if (!g_rendering) return;
     g_pass_ends[reason & 7]++, trace_pass("end: reason", g_pass, uint32_t(reason), 0);
     if (g_render_pass)
@@ -1146,6 +1200,23 @@ void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); 
 // After a clear inside the pass (nvn_clears.cpp). A masked one is a fullscreen draw with its own pipeline, viewport
 // and scissor (nvn_mask_clear.cpp): the next draw sets everything again.
 void pass_mark_written(uint32_t bits) { g_pass_written |= bits, g_bound = Bound{}, sets_invalidate_bound(); }
+
+void replay::flush_compute_barrier(VkCommandBuffer cb) {
+    if (!g_compute_barrier_pending || cb == VK_NULL_HANDLE) return;
+    g_compute_barrier_pending = false;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                       VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    const VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT;
+    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst_stages, 0, 1, &mb, 0,
+                           nullptr, 0, nullptr);
+}
 
 bool replay::pass_wrote(const GpuImage* img) {
     if (!g_rendering || !img) return false;
