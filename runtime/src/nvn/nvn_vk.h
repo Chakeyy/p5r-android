@@ -294,6 +294,7 @@ void occlusion_reset(VkCommandBuffer cb, const Cmd& c, const Targets& t);
 void occlusion_report(VkCommandBuffer cb, const Cmd& c, const Targets& t);
 void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t);
 void occlusion_render_enable();  // SetRenderEnable: the conditional draws end
+bool occlusion_object_skipped();  // inside ResetCounter(1)..ReportCounter(1) while occlusion queries are off
 // Around a draw call inside the pass: its query when it is a query pass draw (-1: none).
 int32_t occlusion_query_begin(VkCommandBuffer cb);
 void occlusion_query_end(VkCommandBuffer cb, int32_t q);

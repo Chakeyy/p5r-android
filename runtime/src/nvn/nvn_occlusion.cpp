@@ -125,13 +125,18 @@ void occlusion_reset(VkCommandBuffer, const Cmd& c, const Targets& t) {
 void occlusion_report(VkCommandBuffer, const Cmd& c, const Targets& t) {
     if (c.n != 1) return;
     trace("report", c, t);
-    if (!on()) return;
+    if (!on()) {
+        g_object = false;
+        return;
+    }
     // One draw since the ResetCounter: its query. Otherwise unknown (drawn).
     const bool one = g_object && g_object_draws == 1 && g_object_query >= 0;
     if (g_object && g_object_draws > 1) g_stats_occl.several++;
     g_reports[c.a[0]] = one ? g_object_query : -1;
     g_object = false;
 }
+
+bool occlusion_object_skipped() { return g_object && !on() && !zero_draws_on(); }
 
 void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t) {
     trace("conditional", c, t);

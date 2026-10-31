@@ -331,7 +331,7 @@ void written_cpu_write(const uint8_t* p, uint64_t size) {
     // UpdateUniformBuffer / ReportCounter into a range a dispatch of this submit writes: the copy misses the bytes
     // (they reach guest memory at replay time) and the write-back replaces them. Not handled: logged.
     static int logs = 0;
-    if (written_overlaps(p, size) && logs++ < 16)
+    if (logs < 16 && !exp_no_write_backs() && written_overlaps(p, size) && logs++ < 16)
         log("nvn: guest write into a compute-written range (%llu bytes): lost at write-back", (unsigned long long)size);
 }
 

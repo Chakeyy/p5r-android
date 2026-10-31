@@ -139,10 +139,13 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                 // NX_FAKE_GPU_TIME=1: every report of a submit carries the submit's start (a GPU with no cost):
                 // the game picks its present interval from the timings it measures (bisecting its 30 fps mode).
                 static const bool fake = std::getenv("NX_FAKE_GPU_TIME") != nullptr;
-                uint64_t v[2] = {++reports, fake ? submit_start_ns() : plat::monotonic_ns()};
+                const uint64_t ts = (fake || c.n == 1) ? submit_start_ns() : plat::monotonic_ns();
+                uint64_t v[2] = {++reports, ts};
                 std::memcpy(p, v, sizeof v);
-                dedup_invalidate(p, sizeof v);
-                written_cpu_write(p, sizeof v);
+                if (c.n != 1) {
+                    dedup_invalidate(p, sizeof v);
+                    written_cpu_write(p, sizeof v);
+                }
             }
             break;
         }

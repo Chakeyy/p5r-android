@@ -575,6 +575,16 @@ bool live_ui_draw(const Targets& t) {
 bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
     g_stats.total++;
     if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
+    if (occlusion_object_skipped() && !g_state.depth.depth_write && !g_state.depth.stencil_test) {
+        bool writes_color = false;
+        for (uint32_t k = 0; k < t.color_count; k++) {
+            if (t.colors[k] && (g_state.mask.mask[k] & 0xF)) {
+                writes_color = true;
+                break;
+            }
+        }
+        if (!writes_color) return false;
+    }
     if (shadow_draw_skipped(t)) return false;
     static thread_local std::vector<const ShaderInfo*> combined;
     const auto* shaders = bound_graphics_shaders(combined);
