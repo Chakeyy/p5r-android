@@ -44,6 +44,26 @@ struct {
     uint64_t visible = 0, hidden = 0;  // NX_OCCL_STATS=1: query results
 } g_stats_occl;
 
+constexpr uint32_t kCpuPools = 4;
+constexpr uint32_t kCpuQueries = 1024;
+struct CpuPool {
+    VkQueryPool pool = VK_NULL_HANDLE;
+    bool reset_once = false;
+    bool in_flight = false;
+    uint32_t used = 0;
+    uint64_t frame = 0;
+    uint64_t addrs[kCpuQueries] = {};
+};
+CpuPool g_cpu_pools[kCpuPools];
+int32_t g_active_pool = -1;
+uint32_t g_last_cpu_pool = 0;
+
+struct VisEntry {
+    bool visible = true;
+    uint64_t frame = 0;
+};
+std::unordered_map<uint64_t, VisEntry> g_vis;
+
 bool forced() { return std::getenv("NX_OCCL_FORCE") != nullptr; }
 
 bool on() {
@@ -55,6 +75,23 @@ bool on() {
         log("nvn: occlusion culling %s", want && can ? "on the GPU (queries and indirect count draws)"
                                          : want ? "off (no VK_KHR_draw_indirect_count)" : "off (NX_OCCL=1: on)");
         return want && can;
+    }();
+    return v;
+}
+
+bool cpu_on() {
+    static const bool v = [] {
+        if (on() || forced() || zero_draws_on()) return false;
+        const char* e = std::getenv("NX_OCCL");
+#if defined(__ANDROID__)
+        bool want = !(e && e[0] == '0');
+#else
+        bool want = e && e[0] == '1';
+#endif
+        if (want) {
+            log("nvn: occlusion culling on the CPU (1-frame delayed queries)");
+        }
+        return want;
     }();
     return v;
 }
@@ -93,6 +130,66 @@ void copy_results(VkCommandBuffer cb) {
 
 void occlusion_begin_submit(VkCommandBuffer cb) {
     g_object = false, g_object_query = -1, g_object_draws = 0, g_conditional = -1;
+    if (cpu_on()) {
+        if (g_active_pool >= 0) {
+            if (g_cpu_pools[g_active_pool].used > 0)
+                g_cpu_pools[g_active_pool].in_flight = true;
+            g_active_pool = -1;
+        }
+
+        // Non-blocking harvest of in-flight pools ready on the GPU
+        for (uint32_t p = 0; p < kCpuPools; p++) {
+            if (!g_cpu_pools[p].in_flight || g_cpu_pools[p].pool == VK_NULL_HANDLE || g_cpu_pools[p].used == 0) continue;
+            uint32_t r[kCpuQueries];
+            VkResult res = p_vkGetQueryPoolResults(vk_device(), g_cpu_pools[p].pool, 0, g_cpu_pools[p].used,
+                                                  g_cpu_pools[p].used * sizeof(uint32_t), r, sizeof(uint32_t), 0);
+            if (res == VK_SUCCESS) {
+                for (uint32_t q = 0; q < g_cpu_pools[p].used; q++) {
+                    if (uint64_t a = g_cpu_pools[p].addrs[q])
+                        g_vis[a] = {false, g_cpu_pools[p].frame};
+                }
+                for (uint32_t q = 0; q < g_cpu_pools[p].used; q++) {
+                    if (uint64_t a = g_cpu_pools[p].addrs[q]) {
+                        if (r[q] != 0) g_vis[a].visible = true;
+                        (r[q] ? g_stats_occl.visible : g_stats_occl.hidden)++;
+                    }
+                }
+                g_cpu_pools[p].in_flight = false;
+            }
+        }
+
+        // Pick a free pool for this submit (rotate from last pool)
+        int32_t chosen = -1;
+        for (uint32_t i = 0; i < kCpuPools; i++) {
+            uint32_t candidate = (g_last_cpu_pool + 1 + i) % kCpuPools;
+            if (!g_cpu_pools[candidate].in_flight) {
+                chosen = int32_t(candidate);
+                g_last_cpu_pool = candidate;
+                break;
+            }
+        }
+
+        if (chosen >= 0) {
+            uint32_t p = uint32_t(chosen);
+            if (!g_cpu_pools[p].pool) {
+                VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                qi.queryType = VK_QUERY_TYPE_OCCLUSION;
+                qi.queryCount = kCpuQueries;
+                if (p_vkCreateQueryPool(vk_device(), &qi, nullptr, &g_cpu_pools[p].pool) != VK_SUCCESS)
+                    g_cpu_pools[p].pool = VK_NULL_HANDLE;
+            }
+            if (g_cpu_pools[p].pool != VK_NULL_HANDLE) {
+                if (!g_cpu_pools[p].reset_once || g_cpu_pools[p].used > 0)
+                    p_vkCmdResetQueryPool(cb, g_cpu_pools[p].pool, 0,
+                                         g_cpu_pools[p].reset_once ? g_cpu_pools[p].used : kCpuQueries);
+                g_cpu_pools[p].reset_once = true;
+                g_cpu_pools[p].used = 0;
+                g_cpu_pools[p].frame = g_frame.load(std::memory_order_relaxed);
+                g_active_pool = chosen;
+            }
+        }
+        return;
+    }
     if (!on()) return;
     if (!g_pool) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -119,12 +216,27 @@ void occlusion_begin_submit(VkCommandBuffer cb) {
 
 void occlusion_reset(VkCommandBuffer, const Cmd& c, const Targets& t) {
     trace("reset", c, t);
-    if (c.n == 1) g_object = true, g_object_query = -1, g_object_draws = 0;  // samples passed
+    if (c.n == 1) {
+        g_object = true, g_object_query = -1, g_object_draws = 0;  // samples passed
+        g_state.render_enable = true;
+        g_conditional = -1;
+    }
 }
 
 void occlusion_report(VkCommandBuffer, const Cmd& c, const Targets& t) {
     if (c.n != 1) return;
     trace("report", c, t);
+    if (cpu_on()) {
+        const bool one = g_object && g_object_draws == 1 && g_object_query >= 0 && g_active_pool >= 0;
+        if (g_object && g_object_draws > 1) g_stats_occl.several++;
+        if (one) {
+            g_cpu_pools[g_active_pool].addrs[g_object_query] = c.a[0];
+        } else if (c.a[0]) {
+            g_vis[c.a[0]] = {true, g_frame.load(std::memory_order_relaxed)};
+        }
+        g_object = false;
+        return;
+    }
     if (!on()) {
         g_object = false;
         return;
@@ -136,7 +248,7 @@ void occlusion_report(VkCommandBuffer, const Cmd& c, const Targets& t) {
     g_object = false;
 }
 
-bool occlusion_object_skipped() { return g_object && !on() && !zero_draws_on(); }
+bool occlusion_object_skipped() { return g_object && !on() && !cpu_on() && !zero_draws_on(); }
 
 void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t) {
     trace("conditional", c, t);
@@ -144,6 +256,22 @@ void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t) {
     g_state.cond_on = true, g_state.cond_mode = c.n, g_state.cond_addr = c.a[0];
     if (forced()) {  // NX_OCCL_FORCE=0|1
         g_state.render_enable = std::getenv("NX_OCCL_FORCE")[0] != '0';
+        return;
+    }
+    if (cpu_on()) {
+        if (c.n == 1) {
+            auto it = g_vis.find(c.a[0]);
+            uint64_t cur_frame = g_frame.load(std::memory_order_relaxed);
+            if (it != g_vis.end() && cur_frame >= it->second.frame && cur_frame - it->second.frame <= 6) {
+                g_state.render_enable = it->second.visible;
+                g_stats_occl.conditional++;
+            } else {
+                g_state.render_enable = true;
+                g_stats_occl.unknown++;
+            }
+        } else {
+            g_state.render_enable = true;
+        }
         return;
     }
     g_state.render_enable = true;
@@ -162,6 +290,21 @@ void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t) {
 void occlusion_render_enable() { g_conditional = -1; }  // SetRenderEnable ends the conditional draws
 
 int32_t occlusion_query_begin(VkCommandBuffer cb) {
+    if (cpu_on()) {
+        if (!g_object || g_active_pool < 0) return -1;
+        g_object_draws++;
+        CpuPool& cp = g_cpu_pools[g_active_pool];
+        if (cp.used >= kCpuQueries) {
+            g_stats_occl.used_up++;
+            return -1;
+        }
+        const int32_t q = int32_t(cp.used++);
+        cp.addrs[q] = 0;
+        p_vkCmdBeginQuery(cb, cp.pool, uint32_t(q), 0);  // not precise: any sample passed is enough
+        g_object_query = q;
+        g_stats_occl.queries++;
+        return q;
+    }
     if (!g_object || !g_pool) return -1;
     g_object_draws++;
     if (g_used >= kQueries) {
@@ -176,6 +319,11 @@ int32_t occlusion_query_begin(VkCommandBuffer cb) {
 }
 
 void occlusion_query_end(VkCommandBuffer cb, int32_t q) {
+    if (cpu_on()) {
+        if (q >= 0 && g_active_pool >= 0)
+            p_vkCmdEndQuery(cb, g_cpu_pools[g_active_pool].pool, uint32_t(q));
+        return;
+    }
     if (q >= 0) p_vkCmdEndQuery(cb, g_pool, uint32_t(q));
 }
 

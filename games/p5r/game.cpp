@@ -564,12 +564,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r19";
+static constexpr const char* kPerfBuildTag = "lowend-r20";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (no-op occlusion draw skip, SAMPLES_PASSED fast-path, CmdList pool, 4KB uniform filter, skip compute WB)",
+    log("p5r perf build: %s (1-frame CPU occlusion culling, no-op occlusion draw skip, SAMPLES_PASSED fast-path, CmdList pool)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
