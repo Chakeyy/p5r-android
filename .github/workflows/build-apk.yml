@@ -68,11 +68,11 @@ jobs:
           SHORT_SHA=$(git rev-parse --short HEAD)
           DATE=$(date +'%Y%m%d')
           if [ -n "${PERF_TAG}" ]; then
-            BASE_NAME="p5r-v0.4.2-${PERF_TAG}-${DATE}-${SHORT_SHA}"
+            BASE_NAME="p5r-v0.5.0-${PERF_TAG}-${DATE}-${SHORT_SHA}"
           else
             SLUG=$(echo "${REF_NAME}" | sed 's|perf/||; s|fix/||; s|android-||; s|/|-|g')
             REV_COUNT=$(git rev-list --count cf896a0..HEAD 2>/dev/null || echo "1")
-            BASE_NAME="p5r-v0.4.2-${SLUG}-r${REV_COUNT}-${DATE}-${SHORT_SHA}"
+            BASE_NAME="p5r-v0.5.0-${SLUG}-r${REV_COUNT}-${DATE}-${SHORT_SHA}"
           fi
           APK_NAME="${BASE_NAME}.apk"
           cp private/p5r/apk_nce/p5r.apk "${APK_NAME}"
