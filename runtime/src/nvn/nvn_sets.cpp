@@ -161,9 +161,9 @@ struct HandleSlot {
     ViewInfo view;
     VkSampler vk_sampler[4] = {};  // sampler_for(sampler, shadow, biased) by shadow + 2 * biased, once a binding asked
 };
-constexpr uint32_t kHandleSlots = 4096;  // was 2048: handles crowd scenes without thrashing
+constexpr uint32_t kHandleSlots = 8192;  // keeps handle slots across submits when epoch/mark are unchanged
 HandleSlot g_handle_slots[kHandleSlots];
-uint64_t g_handle_generation = 1, g_handle_mark = 0;
+uint64_t g_handle_generation = 1, g_handle_mark = 0, g_handle_epoch = 0;
 uint32_t g_handle_used = 0;
 uint64_t g_handle_hits = 0, g_handle_misses = 0, g_sets_skipped = 0;
 
@@ -174,7 +174,11 @@ void handles_reset() { g_handle_generation++, g_handle_used = 0; }
 HandleSlot* handle_slot(uint64_t handle) {
     uint64_t mark = t_replay_mark;
     if (!mark || draw_slow(kSlowHandles)) return nullptr;
-    if (mark != g_handle_mark || g_handle_used > kHandleSlots / 2) handles_reset(), g_handle_mark = mark;
+    if (mark != g_handle_mark || g_handle_used > kHandleSlots / 2) {
+        handles_reset();
+        g_handle_mark = mark;
+        g_handle_epoch = current_epoch();
+    }
     handle &= 0xFFFFFFFFull;  // 20 bits of texture id, 12 of sampler id
     uint64_t tp = g_state.texture_pool, sp = g_state.sampler_pool;
     uint64_t h = (handle + 1) * 0x9E3779B97F4A7C15ull ^ tp * 0xC2B2AE3D27D4EB4Full ^ sp * 0x165667B19E3779F9ull;
@@ -782,7 +786,12 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
 }
 
 void sets_begin_submit() {
-    handles_reset();
+    uint64_t mark = t_replay_mark, epoch = current_epoch();
+    if (!mark || mark != g_handle_mark || epoch != g_handle_epoch || g_handle_used > kHandleSlots / 2) {
+        handles_reset();
+        g_handle_mark = mark;
+        g_handle_epoch = epoch;
+    }
     sets_invalidate_bound();
     if (g_set_arena.capacity() < 65536) g_set_arena.reserve(65536);
     g_set_generation++, g_set_used = 0, g_set_arena.clear();

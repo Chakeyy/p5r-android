@@ -187,20 +187,26 @@ void cache_begin_submit() {
     if (++g_submits % 64 == 0) {
         evict_stale();
         for (auto it = g_seen.begin(); it != g_seen.end();)  // candidates not seen lately
-            it = it->second.submit + kStaleSubmits < g_submits ? g_seen.erase(it) : std::next(it);
+            it = it->second.submit + std::max<uint64_t>(kSeenGap * 2, 64) < g_submits ? g_seen.erase(it) : std::next(it);
     }
 }
 
 bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
     if (!on() || !p || !size || padded > kMaxCopy || align > kAlign) return false;
+    // Small per-draw uniform/storage blocks (< 4 KB) come from P5R's dynamic ring buffer:
+    // intra-submit repeats are already handled in O(1) by dedup_upload (g_front), while
+    // probing g_entries + g_seen across submits caused 1.46M "not stable" map lookups/600f.
+    if (g_upload_kind == kUploadBlock && size < 4096) return false;
+
+    static const bool time_hash = std::getenv("NX_BUFFER_CACHE_STATS") != nullptr;
 
     // Check if this buffer is already cached
     auto it = g_entries.find(p);
     if (it != g_entries.end()) {
-        const uint64_t t0 = plat::monotonic_ns();
+        const uint64_t t0 = time_hash ? plat::monotonic_ns() : 0;
         uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
         for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
-        g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
+        if (time_hash) g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
 
         Entry& e = it->second;
         if (e.size == size && e.padded == padded && e.hash == h) {
@@ -228,10 +234,10 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
         return false;  // Bypass hashing entirely for volatile dynamic buffers
     }
 
-    const uint64_t t0 = plat::monotonic_ns();
+    const uint64_t t0 = time_hash ? plat::monotonic_ns() : 0;
     uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
     for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
-    g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
+    if (time_hash) g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
 
     const uint64_t serial = frame_recording_serial();
     if (seen.size == size && seen.hash == h && seen.submit + kSeenGap >= g_submits) {

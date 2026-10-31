@@ -304,7 +304,10 @@ void scan_tasks() {
     }
     const bool scene = (title || event) && !battle;
     static const bool field_on = env_int("NX_P5R_FIELD_SCENES", 1) != 0;
-    const bool field = field_on && skip && !event && !title && !battle;
+    // Allow discrete step pacing (cap, cap/2, cap/3 = 30, 15, 10) in all non-battle field gameplay
+    // (including free-roam school hallways where EventSkip/General_* are not active) so movement
+    // runs at 100% real-time speed instead of 50% slow-motion whenever FPS dips below 30.
+    const bool field = field_on && !event && !title && !battle && !movie;
     if (scene != g_scene)
         log("p5r: scene %s (%s%s%s): the target %s", scene ? "starts" : "ends", title ? "title " : "", event ? "event " : "",
             battle ? "battle" : "", scene ? "follows the device" : "stays at 30 or more");
@@ -526,6 +529,7 @@ NX_HLE("glslcGetDefaultOptions", glslc_nop);
 NX_HLE("glslcGetVersion", glslc_nop);
 
 void game::after_init() {
+    game::renderer_start();
     // P5R never binds a storage image: colour images without STORAGE keep Adreno's framebuffer compression
     // (nvn_image.cpp). config.txt's NX_IMAGE_STORAGE=1 brings it back.
     // In handheld mode (720p) the game draws its 3D at 960x540 and its post pass, HUD and menus into a 1280x720 target
@@ -560,12 +564,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r17";
+static constexpr const char* kPerfBuildTag = "lowend-r18";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (CLEARS_V2 loadOp=CLEAR, pass continuity, compute barrier+ring coalescing, uncached read & pagefault fix, G99 sched)",
+    log("p5r perf build: %s (CmdList pool, 4KB uniform cache filter, cross-submit handle cache, skip compute WB, free-roam real-time pacing)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
@@ -578,6 +582,11 @@ void game::renderer_start() {
     //   shadow-map clears fold into VK_ATTACHMENT_LOAD_OP_CLEAR instead of 12,000+ standalone
     //   vkCmdClear*Image transfer clears.
     setenv("NX_CLEARS_V2", "1", 0);
+    // - Skip redundant CPU write-backs of GPU compute skinning SSBOs (s.write_backs):
+    //   Submit 2 vertex shaders read Submit 1's compute-skinned buffers directly on the GPU
+    //   via g_regions (nvn_written.cpp), while CPU occlusion culling uses s.late_write_backs.
+    //   Saves ~3.0 ms/frame of r.before snapshot + write-combined readback on Cortex-A76.
+    setenv("NX_EXP_NO_WB", "1", 0);
     // - NOTE: Do NOT enable NX_MALI_FP16 globally in P5R! P5R shaders use packed bitfields,
     //   integer-as-float encodings, and high-range lighting/skinning math in fragment shaders
     //   that overflow IEEE754 fp16 (max 65504), causing severe black/corrupted screen glitches.

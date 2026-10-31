@@ -478,7 +478,10 @@ uint32_t live_flags() {
 bool live_clears_why() { return live_flags() & kLiveClearsWhy; }
 
 bool exp_no_write_backs() {
-    static const bool env = std::getenv("NX_EXP_NO_WB") != nullptr;
+    static const bool env = [] {
+        const char* e = std::getenv("NX_EXP_NO_WB");
+        return e && e[0] != '0';
+    }();
     return env || (live_flags() & kLiveNoWb);
 }
 

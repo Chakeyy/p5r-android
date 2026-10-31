@@ -185,11 +185,13 @@ Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_
     std::memset(r.up.ptr + n, 0, r.cap - n);
     // CRITICAL: Snapshot from cached guest RAM (lo), NEVER from r.up.ptr
     // which is uncached write-combined Vulkan memory (0:DVC)!
-    r.before = alloc_before(n);
-    plat::fast_memcpy(r.before->data(), lo, n);
-    for (It it : current_old)  // their parts: as they were before their own GPU writes
-        if (it->second.before)
-            std::memcpy(r.before->data() + (it->first - lo), it->second.before->data(), it->second.before->size());
+    if (!exp_no_write_backs()) {
+        r.before = alloc_before(n);
+        plat::fast_memcpy(r.before->data(), lo, n);
+        for (It it : current_old)  // their parts: as they were before their own GPU writes
+            if (it->second.before)
+                std::memcpy(r.before->data() + (it->first - lo), it->second.before->data(), it->second.before->size());
+    }
     if (!current_old.empty()) {
         copy_regions(cb, current_old, lo, n, r.up);  // dispatch(): no render pass is open
         for (It it : current_old) g_regions.erase(it);
@@ -335,10 +337,11 @@ void written_cpu_write(const uint8_t* p, uint64_t size) {
 
 std::vector<WriteBack> written_take() {
     std::vector<WriteBack> v;
-    v.reserve(g_regions.size());
+    const bool skip_wb = exp_no_write_backs();
+    if (!skip_wb) v.reserve(g_regions.size());
     for (auto& [p, r] : g_regions) {
         if (r.taken || !r.up.ptr || r.size == 0) continue;
-        v.push_back({r.up.ptr, const_cast<uint8_t*>(p), r.size, r.before});
+        if (!skip_wb) v.push_back({r.up.ptr, const_cast<uint8_t*>(p), r.size, r.before});
         r.taken = true;
     }
     // Retain r.taken regions across submits within the same frame so Submit 2
