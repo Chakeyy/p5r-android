@@ -44,6 +44,12 @@ bool is_supported_build(const char* id) {
     return false;
 }
 
+std::string tid_str(uint64_t t) {
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llX", (unsigned long long)t);
+    return buf;
+}
+
 std::atomic<int> g_phase{0}, g_done{0}, g_total{0};
 std::mutex g_error_lock;
 std::string g_error;
@@ -104,7 +110,7 @@ int run(int nsp_fd, const std::string& nsp_name, const std::string& keys, const 
     if (tfd >= 0) close(tfd);
     if (!game) return fail(err);
     if (!is_supported_title(game->title_id()))
-        return fail("unsupported Title ID: " + nxi::tid_str(game->title_id()) + " (expected Persona 5 Royal US, EU, JP, or Asia)");
+        return fail("unsupported Title ID: " + tid_str(game->title_id()) + " (expected Persona 5 Royal US, EU, JP, or Asia)");
     auto main_it = game->exefs().find("main");
     if (main_it == game->exefs().end() || main_it->second.size() < 0x48) return fail("the game file has no main");
     char id[17];

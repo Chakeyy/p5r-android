@@ -179,6 +179,7 @@ uint64_t key_to_button(android_app* app, int32_t k, int32_t device_id) {
             default: break;
         }
     }
+    switch (k) {
         case AKEYCODE_BUTTON_L1: return kL;
         case AKEYCODE_BUTTON_R1: return kR;
         case AKEYCODE_BUTTON_L2: return kZL;
