@@ -564,17 +564,17 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r21";
+static constexpr const char* kPerfBuildTag = "lowend-r22";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (no-op occlusion draw skip, SAMPLES_PASSED fast-path, CmdList pool)",
+    log("p5r perf build: %s (redundancy filtering for pipelines/descriptors/vertex streams, 8K dedup cache, CmdList pool)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
     // - Render at 0.5x scale (960x540 -> 480x270 internal) unless user overrides NX_RES_SCALE.
-    //   Provides a ~75% fragment shader & memory bandwidth reduction on Mali-G57.
+    //   Provides a ~75% fragment shader & memory bandwidth reduction on mobile GPUs.
     setenv("NX_RES_SCALE", "0.5", 0);
     // - Force bilinear (1x) sampling instead of 16x anisotropic filtering on mobile TBDR GPUs.
     setenv("NX_MAX_ANISO", "1", 0);
@@ -585,13 +585,13 @@ void game::renderer_start() {
     // - Skip redundant CPU write-backs of GPU compute skinning SSBOs (s.write_backs):
     //   Submit 2 vertex shaders read Submit 1's compute-skinned buffers directly on the GPU
     //   via g_regions (nvn_written.cpp), while CPU occlusion culling uses s.late_write_backs.
-    //   Saves ~3.0 ms/frame of r.before snapshot + write-combined readback on Cortex-A76.
+    //   Saves ~3.0 ms/frame of r.before snapshot + write-combined readback on CPU.
     setenv("NX_EXP_NO_WB", "1", 0);
     // - NOTE: Do NOT enable NX_MALI_FP16 globally in P5R! P5R shaders use packed bitfields,
     //   integer-as-float encodings, and high-range lighting/skinning math in fragment shaders
     //   that overflow IEEE754 fp16 (max 65504), causing severe black/corrupted screen glitches.
     // - Yield briefly when the guest render/worker loop spins on QueryEvent
-    //   so 2-big-core SoCs (Helio G99) don't starve the Vulkan replay thread.
+    //   so asymmetric multi-core SoCs don't starve the Vulkan replay thread.
     setenv("NX_QUERY_SPIN_SLEEP_US", "150", 0);
     // - Do NOT force-clear color attachments on every new render pass without an explicit
     //   NVN clear command; this avoids wiping UI/compositor targets updated across passes.

@@ -748,116 +748,122 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         begin_rendering(cb, tt);
     }
 
-    // Pipeline.
-    PipelineKey key;
-    std::memset(&key, 0, sizeof key);  // the key is compared byte for byte
-    key.vs = vs, key.fs = fs;
-    key.topology = mode;
-    key.attrib_count = uint32_t(std::min<size_t>(g_state.attribs.size(), 16));
-    std::copy_n(g_state.attribs.begin(), key.attrib_count, key.attribs);
-    key.stream_count = uint32_t(std::min<size_t>(g_state.streams.size(), 16));
-    std::copy_n(g_state.streams.begin(), key.stream_count, key.streams);
-    std::copy_n(g_state.blend, 8, key.blend);
-    key.color = g_state.color, key.mask = g_state.mask, key.depth = g_state.depth, key.polygon = g_state.polygon;
-    // NX_HUD_KEEP_ALPHA=1 (P5R by default, games/p5r/game.cpp): draws into the HUD/menu targets (RGBA8, 1280 wide or
-    // more, depth tested) with plain alpha blending leave the target's alpha alone. P5R builds alpha on purpose with
-    // its own states (alpha-only masks, MIN/MAX/REVERSE_SUBTRACT; the panels' drop shadows), sets it to 0 under the
-    // art, and a later pass darkens every pixel whose alpha is above 0 and below 1. Its art, drawn with SRC_ALPHA /
-    // ONE_MINUS_SRC_ALPHA on all four channels, left the BC3 alphas (246..254 inside the shapes) and the faces'
-    // translucent layers there: dark specks on the battle portraits. Kept alpha matches the clean picture
-    // (live flag ui_rgb, PROGRESO 70). Only textured draws (the art): the untextured shapes with the same blending
-    // build alpha that a later DST_ALPHA fill reads, as in the voice-language notice, whose black panel came out
-    // grey when they kept it too (PROGRESO 71). NX_HUD_KEEP_ALPHA=all: untextured ones too; 0: as the game asks.
-    static const char* keep_env = std::getenv("NX_HUD_KEEP_ALPHA");
-    static const int keep_hud_alpha = !keep_env ? 0 : keep_env[0] == '1' ? 1 : keep_env[0] == 'a' ? 2 : 0;
-    if (keep_hud_alpha && key.color.blend_enable[0] && live_ui_draw(t) &&
-        (keep_hud_alpha == 2 || !g_textures.bindings.empty())) {
-        const BlendTarget& b = key.blend[0];
-        if (b.src_rgb == 5 && b.dst_rgb == 6 && b.src_a == 5 && b.dst_a == 6 && b.eq_rgb <= 1 && b.eq_a <= 1)
-            key.mask.mask[0] &= 7;
-    }
-    if (const uint32_t live = live_flags(); live && live_ui_draw(t)) {
-        if (live & kLiveUiAlways) key.depth.depth_func = 8;  // NVN ALWAYS
-        if (live & kLiveUiNoWrite) key.depth.depth_write = 0;
-        BlendTarget& b = key.blend[0];
-        if (key.color.blend_enable[0] && b.src_rgb == 5 && b.dst_rgb == 6 && b.src_a == 5 && b.dst_a == 6) {
-            if (live & kLiveUiRgb) key.mask.mask[0] &= 7;
-            if (live & kLiveUiAmax) b.eq_a = 5;  // NVN MAX
-            if (live & kLiveUiAone) b.src_a = 2;  // NVN ONE
-        }
-    }
-    // SetPrimitiveRestart: Vulkan restarts strips and fans at the index type's largest value (NVN's index here is
-    // 0xFFFF, the same for 16-bit indices), and point, line and triangle lists where the device has
-    // VK_EXT_primitive_topology_list_restart (the Adreno 610 has it); NVN's 0xFFFF in 32-bit indices would need a
-    // rewrite (counted by restart_stats). NX_PRIM_RESTART=0: off, as before.
-    static const bool restart_on = !(std::getenv("NX_PRIM_RESTART") && std::getenv("NX_PRIM_RESTART")[0] == '0');
-    const bool strip = mode == 3 || mode == 5 || mode == 6, list = mode == 0 || mode == 1 || mode == 4;
-    key.restart = restart_on && indexed && g_state.restart && (strip || (list && vk_list_restart())) ? 1 : 0;
-    if (indexed && g_state.restart) restart_stats(mode, c);
-    frame_draws(vs, indexed ? uint64_t(c.i[0]) : uint64_t(c.i[1]));
-    key.color_count = t.color_count, key.depth_clamp = g_state.depth_clamp;
-    key.alpha_to_coverage = g_state.alpha_to_coverage;
-    for (uint32_t k = 0; k < t.color_count; k++) {
-        GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
-        key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : unused_slot_format();
-        if (img && (img->nvn_format == 0x3f || t.views.format[k] == 0x3f)) key.ufloat_colors |= 1u << k;  // G4
-    }
-    GpuImage* dimg = tt.depth ? image_of(tt.depth) : nullptr;
-    key.depth_format = dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT ? dimg->format : VK_FORMAT_UNDEFINED;
-    // NX_ULTRAWIDE. The world is widened by the camera aspect patch (nvn_ultrawide.cpp), so only the 16:9 UI is
-    // squeezed by 1/k (centred safe area). The UI is drawn into small BGRA8 layer targets (430x180 for the HUD, never
-    // widened) and composited into the scene target by a quad: the vertex shaders seen drawing into such layer targets
-    // are the "UI" ones, and a UI quad into a widened target that does not sample a widened texture is squeezed.
-    // NX_UW_CAMERA=0 (no camera patch): every geometry draw is squeezed, a world-and-UI shrink.
-    static const bool cam_patch = !(std::getenv("NX_UW_CAMERA") && std::getenv("NX_UW_CAMERA")[0] == '0');
-    if (uw_on() && cam_patch && !g_uw_wide && t.color_count && t.colors[0]) {
-        const Texture* lt = get<Texture>(t.colors[0]);
-        if (lt && lt->format == 0x25 && (lt->flags & 8)) uw_ui_vertex_shader(vs);
-    }
-    // NX_UW_UI=learn: only the vertex shaders learned above; default: every draw without depth test (screen-space UI).
-    static const bool ui_learn = std::getenv("NX_UW_UI") && std::string(std::getenv("NX_UW_UI")) == "learn";
-    const bool ui_pick = !cam_patch || (ui_learn ? uw_is_ui_vertex_shader(vs) : !g_state.depth.depth_test);
-    if (g_uw_wide && uw_vs_scaled(vs) && ui_pick) {
-        // A short draw (a triangle or a quad) that samples a widened render target is a screen-space pass (post
-        // chain, composite): it already covers the widened target.
-        bool samples_wide = false;
-        const uint64_t count = indexed ? uint64_t(c.i[0]) : uint64_t(c.i[1]);
-        if (count <= 6)
-            for (const ResolvedTexture& r : g_textures.resolved)
-                if (r.texture)
-                    if (GpuImage* si = image_of(r.texture); si && si->uw) samples_wide = true;
-        if (!samples_wide) key.uw_x = 1.0f / uw_factor();
-    }
-    if (uw_on()) {  // NX_UW_TRACE=<first draw>:<count>: draws (wide = a widened target)
-        static const char* e = std::getenv("NX_UW_TRACE");
-        static uint64_t from = 0, n = 0;
-        static bool init = [&] { if (e) std::sscanf(e, "%lu:%lu", &from, &n); return true; }();
-        (void)init;
-        if (e && g_stats.total >= from && g_stats.total < from + n) {
-            GpuImage* wi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
-            const Texture* tx = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
-            std::string smp;
-            for (const ResolvedTexture& r : g_textures.resolved) {
-                GpuImage* si = r.texture ? image_of(r.texture) : nullptr;
-                char bb[48];
-                const Texture* st = r.texture ? get<Texture>(r.texture) : nullptr;
-                std::snprintf(bb, sizeof bb, " %ux%u%s(f%x,fmt%x,%llx)", si ? si->width : 0, si ? si->height : 0, si && si->uw ? "w" : "", st ? st->flags : 0, st ? st->format : 0, (unsigned long long)r.texture);
-                smp += bb;
-            }
-            log("uwsamples:%s", smp.c_str());
-            log("uwdraw %llu vs %s fs %s %s count %d tgt %ux%u fl %x fmt %x wide %d scaled %d dt %d dw %d bl %d vp %d %d %d %d", (unsigned long long)g_stats.total,
-                vs->hash.c_str(), fs ? fs->hash.c_str() : "-", indexed ? "idx" : "arr", indexed ? c.i[0] : c.i[1],
-                wi ? wi->width : 0, wi ? wi->height : 0, tx ? tx->flags : 0, wi ? wi->nvn_format : 0, g_uw_wide ? 1 : 0, key.uw_x > 0 ? 1 : 0,
-                g_state.depth.depth_test, g_state.depth.depth_write, g_state.color.blend_enable[0],
-                g_state.viewport[0], g_state.viewport[1], g_state.viewport[2], g_state.viewport[3]);
-        }
-    }
     VkPipeline pipeline = VK_NULL_HANDLE;
-    {
-        static thread_local VkPipeline s_last_pipeline = VK_NULL_HANDLE;
-        static thread_local PipelineKey s_last_key{};
-        static thread_local VkPipelineLayout s_last_layout = VK_NULL_HANDLE;
+    static thread_local VkPipeline s_last_pipeline = VK_NULL_HANDLE;
+    static thread_local PipelineKey s_last_key{};
+    static thread_local VkPipelineLayout s_last_layout = VK_NULL_HANDLE;
+    static thread_local uint32_t s_last_mode = UINT32_MAX;
+    static thread_local Targets s_last_targets{};
 
+    if (!g_state.pipeline_dirty && s_last_pipeline != VK_NULL_HANDLE &&
+        s_last_layout == layout.layout && s_last_mode == mode &&
+        targets_same(s_last_targets, tt)) {
+        pipeline = s_last_pipeline;
+    } else {
+        // Pipeline.
+        PipelineKey key;
+        std::memset(&key, 0, sizeof key);  // the key is compared byte for byte
+        key.vs = vs, key.fs = fs;
+        key.topology = mode;
+        key.attrib_count = uint32_t(std::min<size_t>(g_state.attribs.size(), 16));
+        std::copy_n(g_state.attribs.begin(), key.attrib_count, key.attribs);
+        key.stream_count = uint32_t(std::min<size_t>(g_state.streams.size(), 16));
+        std::copy_n(g_state.streams.begin(), key.stream_count, key.streams);
+        std::copy_n(g_state.blend, 8, key.blend);
+        key.color = g_state.color, key.mask = g_state.mask, key.depth = g_state.depth, key.polygon = g_state.polygon;
+        // NX_HUD_KEEP_ALPHA=1 (P5R by default, games/p5r/game.cpp): draws into the HUD/menu targets (RGBA8, 1280 wide or
+        // more, depth tested) with plain alpha blending leave the target's alpha alone. P5R builds alpha on purpose with
+        // its own states (alpha-only masks, MIN/MAX/REVERSE_SUBTRACT; the panels' drop shadows), sets it to 0 under the
+        // art, and a later pass darkens every pixel whose alpha is above 0 and below 1. Its art, drawn with SRC_ALPHA /
+        // ONE_MINUS_SRC_ALPHA on all four channels, left the BC3 alphas (246..254 inside the shapes) and the faces'
+        // translucent layers there: dark specks on the battle portraits. Kept alpha matches the clean picture
+        // (live flag ui_rgb, PROGRESO 70). Only textured draws (the art): the untextured shapes with the same blending
+        // build alpha that a later DST_ALPHA fill reads, as in the voice-language notice, whose black panel came out
+        // grey when they kept it too (PROGRESO 71). NX_HUD_KEEP_ALPHA=all: untextured ones too; 0: as the game asks.
+        static const char* keep_env = std::getenv("NX_HUD_KEEP_ALPHA");
+        static const int keep_hud_alpha = !keep_env ? 0 : keep_env[0] == '1' ? 1 : keep_env[0] == 'a' ? 2 : 0;
+        if (keep_hud_alpha && key.color.blend_enable[0] && live_ui_draw(t) &&
+            (keep_hud_alpha == 2 || !g_textures.bindings.empty())) {
+            const BlendTarget& b = key.blend[0];
+            if (b.src_rgb == 5 && b.dst_rgb == 6 && b.src_a == 5 && b.dst_a == 6 && b.eq_rgb <= 1 && b.eq_a <= 1)
+                key.mask.mask[0] &= 7;
+        }
+        if (const uint32_t live = live_flags(); live && live_ui_draw(t)) {
+            if (live & kLiveUiAlways) key.depth.depth_func = 8;  // NVN ALWAYS
+            if (live & kLiveUiNoWrite) key.depth.depth_write = 0;
+            BlendTarget& b = key.blend[0];
+            if (key.color.blend_enable[0] && b.src_rgb == 5 && b.dst_rgb == 6 && b.src_a == 5 && b.dst_a == 6) {
+                if (live & kLiveUiRgb) key.mask.mask[0] &= 7;
+                if (live & kLiveUiAmax) b.eq_a = 5;  // NVN MAX
+                if (live & kLiveUiAone) b.src_a = 2;  // NVN ONE
+            }
+        }
+        // SetPrimitiveRestart: Vulkan restarts strips and fans at the index type's largest value (NVN's index here is
+        // 0xFFFF, the same for 16-bit indices), and point, line and triangle lists where the device has
+        // VK_EXT_primitive_topology_list_restart (the Adreno 610 has it); NVN's 0xFFFF in 32-bit indices would need a
+        // rewrite (counted by restart_stats). NX_PRIM_RESTART=0: off, as before.
+        static const bool restart_on = !(std::getenv("NX_PRIM_RESTART") && std::getenv("NX_PRIM_RESTART")[0] == '0');
+        const bool strip = mode == 3 || mode == 5 || mode == 6, list = mode == 0 || mode == 1 || mode == 4;
+        key.restart = restart_on && indexed && g_state.restart && (strip || (list && vk_list_restart())) ? 1 : 0;
+        if (indexed && g_state.restart) restart_stats(mode, c);
+        frame_draws(vs, indexed ? uint64_t(c.i[0]) : uint64_t(c.i[1]));
+        key.color_count = t.color_count, key.depth_clamp = g_state.depth_clamp;
+        key.alpha_to_coverage = g_state.alpha_to_coverage;
+        for (uint32_t k = 0; k < t.color_count; k++) {
+            GpuImage* img = t.colors[k] ? image_of(t.colors[k]) : nullptr;
+            key.color_formats[k] = img ? view_format(*img, t.views.format[k]) : unused_slot_format();
+            if (img && (img->nvn_format == 0x3f || t.views.format[k] == 0x3f)) key.ufloat_colors |= 1u << k;  // G4
+        }
+        GpuImage* dimg = tt.depth ? image_of(tt.depth) : nullptr;
+        key.depth_format = dimg && dimg->aspect != VK_IMAGE_ASPECT_COLOR_BIT ? dimg->format : VK_FORMAT_UNDEFINED;
+        // NX_ULTRAWIDE. The world is widened by the camera aspect patch (nvn_ultrawide.cpp), so only the 16:9 UI is
+        // squeezed by 1/k (centred safe area). The UI is drawn into small BGRA8 layer targets (430x180 for the HUD, never
+        // widened) and composited into the scene target by a quad: the vertex shaders seen drawing into such layer targets
+        // are the "UI" ones, and a UI quad into a widened target that does not sample a widened texture is squeezed.
+        // NX_UW_CAMERA=0 (no camera patch): every geometry draw is squeezed, a world-and-UI shrink.
+        static const bool cam_patch = !(std::getenv("NX_UW_CAMERA") && std::getenv("NX_UW_CAMERA")[0] == '0');
+        if (uw_on() && cam_patch && !g_uw_wide && t.color_count && t.colors[0]) {
+            const Texture* lt = get<Texture>(t.colors[0]);
+            if (lt && lt->format == 0x25 && (lt->flags & 8)) uw_ui_vertex_shader(vs);
+        }
+        // NX_UW_UI=learn: only the vertex shaders learned above; default: every draw without depth test (screen-space UI).
+        static const bool ui_learn = std::getenv("NX_UW_UI") && std::string(std::getenv("NX_UW_UI")) == "learn";
+        const bool ui_pick = !cam_patch || (ui_learn ? uw_is_ui_vertex_shader(vs) : !g_state.depth.depth_test);
+        if (g_uw_wide && uw_vs_scaled(vs) && ui_pick) {
+            // A short draw (a triangle or a quad) that samples a widened render target is a screen-space pass (post
+            // chain, composite): it already covers the widened target.
+            bool samples_wide = false;
+            const uint64_t count = indexed ? uint64_t(c.i[0]) : uint64_t(c.i[1]);
+            if (count <= 6)
+                for (const ResolvedTexture& r : g_textures.resolved)
+                    if (r.texture)
+                        if (GpuImage* si = image_of(r.texture); si && si->uw) samples_wide = true;
+            if (!samples_wide) key.uw_x = 1.0f / uw_factor();
+        }
+        if (uw_on()) {  // NX_UW_TRACE=<first draw>:<count>: draws (wide = a widened target)
+            static const char* e = std::getenv("NX_UW_TRACE");
+            static uint64_t from = 0, n = 0;
+            static bool init = [&] { if (e) std::sscanf(e, "%lu:%lu", &from, &n); return true; }();
+            (void)init;
+            if (e && g_stats.total >= from && g_stats.total < from + n) {
+                GpuImage* wi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
+                const Texture* tx = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
+                std::string smp;
+                for (const ResolvedTexture& r : g_textures.resolved) {
+                    GpuImage* si = r.texture ? image_of(r.texture) : nullptr;
+                    char bb[48];
+                    const Texture* st = r.texture ? get<Texture>(r.texture) : nullptr;
+                    std::snprintf(bb, sizeof bb, " %ux%u%s(f%x,fmt%x,%llx)", si ? si->width : 0, si ? si->height : 0, si && si->uw ? "w" : "", st ? st->flags : 0, st ? st->format : 0, (unsigned long long)r.texture);
+                    smp += bb;
+                }
+                log("uwsamples:%s", smp.c_str());
+                log("uwdraw %llu vs %s fs %s %s count %d tgt %ux%u fl %x fmt %x wide %d scaled %d dt %d dw %d bl %d vp %d %d %d %d", (unsigned long long)g_stats.total,
+                    vs->hash.c_str(), fs ? fs->hash.c_str() : "-", indexed ? "idx" : "arr", indexed ? c.i[0] : c.i[1],
+                    wi ? wi->width : 0, wi ? wi->height : 0, tx ? tx->flags : 0, wi ? wi->nvn_format : 0, g_uw_wide ? 1 : 0, key.uw_x > 0 ? 1 : 0,
+                    g_state.depth.depth_test, g_state.depth.depth_write, g_state.color.blend_enable[0],
+                    g_state.viewport[0], g_state.viewport[1], g_state.viewport[2], g_state.viewport[3]);
+            }
+        }
         if (s_last_pipeline != VK_NULL_HANDLE &&
             s_last_layout == layout.layout &&
             std::memcmp(&s_last_key, &key, sizeof(PipelineKey)) == 0) {
@@ -869,6 +875,11 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 s_last_key = key;
                 s_last_layout = layout.layout;
             }
+        }
+        if (pipeline != VK_NULL_HANDLE) {
+            s_last_mode = mode;
+            s_last_targets = tt;
+            g_state.pipeline_dirty = false;
         }
     }
     if (!pipeline) {

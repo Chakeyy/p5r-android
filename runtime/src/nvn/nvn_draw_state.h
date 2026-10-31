@@ -48,6 +48,9 @@ struct State {
     bool depth_bounds = false, depth_clamp = false;
     bool alpha_to_coverage = false;  // BindMultisampleState (G7)
     float depth_bounds_range[2] = {0, 1};
+    bool descriptors_dirty = true;
+    bool pipeline_dirty = true;
+    bool vertex_dirty = true;
 };
 
 struct Stats {
