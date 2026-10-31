@@ -18,6 +18,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <malloc.h>
 #include <unistd.h>
@@ -210,6 +211,15 @@ void reset_current_thread_affinity(const char* thread_name) {
         __android_log_print(ANDROID_LOG_INFO, "p5r", "Thread '%s' affinity reset to all cores (0-%ld)", thread_name, num_cores - 1);
     } else {
         __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to reset affinity for thread '%s': errno %d", thread_name, rc);
+    }
+}
+
+void set_thread_priority(int priority) {
+    int rc = setpriority(PRIO_PROCESS, 0, priority);
+    if (rc == 0) {
+        __android_log_print(ANDROID_LOG_INFO, "p5r", "Thread priority set to %d", priority);
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to set thread priority %d: errno %d", priority, errno);
     }
 }
 
@@ -546,7 +556,6 @@ void crash(int sig, siginfo_t* info, void* uc) {
 }
 
 void game_thread(void*) {
-    nx::plat::pin_current_thread_to_core(7, "NCE-Main");
     nx::plat::perf_hint_thread();
     try {
         nx::boot();

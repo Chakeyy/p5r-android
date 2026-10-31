@@ -173,6 +173,7 @@ void pin_current_thread_to_big_cores(const char*) {}
 void pin_current_thread_to_core(int, const char*) {}
 void pin_current_thread_to_little_cores(const char*) {}
 void reset_current_thread_affinity(const char*) {}
+void set_thread_priority(int) {}
 
 bool profile(const int64_t*, const uint64_t* const*, size_t, int, const std::string&) { return false; }  // use perf
 

@@ -55,27 +55,21 @@ void log(const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    std::lock_guard lk(g_log_lock);
-    if (!g_log_file) {
-        std::string root = plat::data_root();
-        if (!root.empty()) {
-            const char* path = std::getenv("NX_LOG");
-#if defined(__ANDROID__)
-            std::string def = root + "/nx.log";  // next to the data, readable from the phone
-#else
-            std::string def = root + "/../nx.log";
-#endif
-            std::string file = path ? path : def;
+    plat::log_line(buf);
+    const char* path = std::getenv("NX_LOG");
+    if (path) {
+        std::lock_guard lk(g_log_lock);
+        if (!g_log_file) {
+            std::string file = path;
             // Keep the previous session's log (a problem report should survive reopening the game).
             std::remove((file + ".prev").c_str());
             std::rename(file.c_str(), (file + ".prev").c_str());
             g_log_file = std::fopen(file.c_str(), "w");
         }
-    }
-    plat::log_line(buf);
-    if (g_log_file) {
-        std::fprintf(g_log_file, "%s\n", buf);
-        std::fflush(g_log_file);
+        if (g_log_file) {
+            std::fprintf(g_log_file, "%s\n", buf);
+            std::fflush(g_log_file);
+        }
     }
 }
 

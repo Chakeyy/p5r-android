@@ -214,10 +214,15 @@ struct Targets {
 // Field by field: a memcmp also compared the padding after color_count, which a copy need not keep.
 inline bool targets_same(const Targets& a, const Targets& b) {
     if (a.color_count != b.color_count || a.depth != b.depth) return false;
-    for (uint32_t k = 0; k < 9; k++) {
-        if (k < 8 && a.colors[k] != b.colors[k]) return false;
+    for (uint32_t k = 0; k < a.color_count; k++) {
+        if (a.colors[k] != b.colors[k]) return false;
         if (a.views.level[k] != b.views.level[k] || a.views.layer[k] != b.views.layer[k] ||
             a.views.format[k] != b.views.format[k])
+            return false;
+    }
+    if (a.depth) {
+        if (a.views.level[8] != b.views.level[8] || a.views.layer[8] != b.views.layer[8] ||
+            a.views.format[8] != b.views.format[8])
             return false;
     }
     return true;

@@ -35,7 +35,6 @@ bool enabled() {
 }
 
 void run() {
-    plat::pin_current_thread_to_core(6, "VK-Replay");
     plat::perf_hint_thread();
     plat::set_thread_name("nvn replay");
     for (;;) {

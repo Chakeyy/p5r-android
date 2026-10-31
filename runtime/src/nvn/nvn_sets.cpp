@@ -8,6 +8,11 @@
 #include <memory>
 #include <string>
 
+#if defined(__aarch64__) && (defined(__ARM_FEATURE_CRC32) || defined(__ARM_ACLE))
+#include <arm_acle.h>
+#define HAS_ARM_CRC32 1
+#endif
+
 #include "nvn_draw_state.h"
 #include "nvn_ultrawide.h"
 
@@ -155,7 +160,7 @@ struct HandleSlot {
     ViewInfo view;
     VkSampler vk_sampler[4] = {};  // sampler_for(sampler, shadow, biased) by shadow + 2 * biased, once a binding asked
 };
-constexpr uint32_t kHandleSlots = 2048;  // a course frame names a few hundred handles
+constexpr uint32_t kHandleSlots = 4096;  // was 2048: handles crowd scenes without thrashing
 HandleSlot g_handle_slots[kHandleSlots];
 uint64_t g_handle_generation = 1, g_handle_mark = 0;
 uint32_t g_handle_used = 0;
@@ -318,11 +323,21 @@ struct CachedSet {
     uint32_t at = 0, n = 0;  // its writes in g_set_arena
     VkDescriptorSet set = VK_NULL_HANDLE;
 };
-constexpr uint32_t kSetSlots = 8192;
+constexpr uint32_t kSetSlots = 32768;  // was 8192: supports dense draw scenes without early cutoff
 CachedSet g_set_cache[kSetSlots];
 std::vector<SetWrite> g_set_arena;
 uint64_t g_set_generation = 1, g_set_hits = 0, g_set_misses = 0;
 uint32_t g_set_used = 0;
+
+static inline uint64_t hash_step(uint64_t h, uint64_t v) {
+#if defined(HAS_ARM_CRC32)
+    uint32_t lo = __crc32cd(static_cast<uint32_t>(h), v);
+    uint32_t hi = __crc32cd(static_cast<uint32_t>(h >> 32), v ^ 0x9E3779B97F4A7C15ull);
+    return (uint64_t(hi) << 32) | lo;
+#else
+    return (h ^ v) * 0x100000001B3ull ^ (h >> 31);
+#endif
+}
 
 bool set_cache_on() {
     static const bool on = [] {
@@ -356,7 +371,7 @@ void resolve_sets(const ProgramLayout& layout) {
                 e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
                 e.c = uint64_t(w.pImageInfo->imageLayout);
             for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
-                h = (h ^ v) * 0x100000001B3ull, h ^= h >> 31;
+                h = hash_step(h, v);
             d.key.push_back(e);
         }
         d.sets[k] = VK_NULL_HANDLE;
@@ -761,6 +776,7 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
 void sets_begin_submit() {
     handles_reset();
     sets_invalidate_bound();
+    if (g_set_arena.capacity() < 65536) g_set_arena.reserve(65536);
     g_set_generation++, g_set_used = 0, g_set_arena.clear();
     g_support_used = g_constants_used = 0;
 }
