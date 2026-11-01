@@ -72,7 +72,9 @@ VkRenderPass make_pass(const PassKey& k, uint32_t count) {
         bool st = has_stencil(VkFormat(k[8]));
         a.stencilLoadOp = !st ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
                               : k[19] ? VkAttachmentLoadOp(k[19] - 1) : VK_ATTACHMENT_LOAD_OP_LOAD;
-        a.stencilStoreOp = st && !(k[9] & kNoStore) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        // Persona 5 Royal never samples stencil attachments downstream; on Mali TBDR GPUs,
+        // setting DONT_CARE stops flushing 8-bit stencil per pixel out to system DRAM across every render pass.
+        a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
         dref = {n++, VK_IMAGE_LAYOUT_GENERAL};
         sp.pDepthStencilAttachment = &dref;

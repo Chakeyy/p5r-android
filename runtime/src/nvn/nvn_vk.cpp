@@ -161,7 +161,14 @@ bool init() {
     if (is_mali()) log("nvn/vk: ARM Mali GPU detected");
     if (is_adreno_8xx()) log("nvn/vk: Qualcomm Adreno 8xx GPU detected (disabling chunked submits to avoid battle hang)");
     p_vkGetPhysicalDeviceMemoryProperties(g_physical, &g_memory);
+#if defined(__ANDROID__)
+    // All Android mobile SoCs (Mali, Adreno, PowerVR) share system memory with the CPU.
+    // Some vendor Mali drivers report VK_PHYSICAL_DEVICE_TYPE_OTHER instead of INTEGRATED_GPU;
+    // forcing true guarantees pipelined fence submission (pipelined(), nvn_frames.cpp) without synchronous CPU stalls.
+    g_integrated = true;
+#else
     g_integrated = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+#endif
     // An integrated GPU shares the package's power budget with the CPU: ask the desktop for its performance profile
     // (NX_POWER_PROFILE=1: also with a discrete GPU; 0: never). frame_stats.cpp.
     if (g_integrated || (std::getenv("NX_POWER_PROFILE") && std::getenv("NX_POWER_PROFILE")[0] == '1'))
