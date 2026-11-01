@@ -485,6 +485,8 @@ void cull_job_hook(CPU& c) {
         if (arr && sarr && stride > 0 && sstride > 0) {
             const float* p = after.p[0];  // Near plane normal (p[0], p[1], p[2]) and distance (p[3])
             const uint64_t box = (sp - 0x200) & ~uint64_t(15);
+            uint64_t last_node = 0;
+            uint64_t last_matrix = 0;
             for (int i = 0; i < n && i < 1024; i++) {
                 const uint64_t mesh = ld<uint64_t>(arr + stride * i);
                 if (!mesh) continue;
@@ -497,8 +499,10 @@ void cull_job_hook(CPU& c) {
 
                 CPU scratch = c;
                 scratch.x[31] = sp;
-                const uint64_t matrix = guest_fn(scratch, 0xfa9460, node);
+                uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
                 if (!matrix) continue;
+                last_node = node;
+                last_matrix = matrix;
                 guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
 
                 float b[19];
@@ -685,18 +689,15 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r35";
+static constexpr const char* kPerfBuildTag = "lowend-r36";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (progressive vault clutter culling, balanced worker scheduling, state redundancy filtering)",
+    log("p5r perf build: %s (progressive clutter culling, MRU pipeline cache, ADPF thread fix, Mali stencil bypass)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
-    // - Render at 0.5x scale (960x540 -> 480x270 internal) unless user overrides NX_RES_SCALE.
-    //   Provides a ~75% fragment shader & memory bandwidth reduction on mobile GPUs.
-    setenv("NX_RES_SCALE", "0.5", 0);
     // - Force bilinear (1x) sampling instead of 16x anisotropic filtering on mobile TBDR GPUs.
     setenv("NX_MAX_ANISO", "1", 0);
     // - Enable per-image deferred clears (PROGRESO 77) so P5R's depth-only clears and dual
@@ -711,9 +712,6 @@ void game::renderer_start() {
     // - NOTE: Do NOT enable NX_MALI_FP16 globally in P5R! P5R shaders use packed bitfields,
     //   integer-as-float encodings, and high-range lighting/skinning math in fragment shaders
     //   that overflow IEEE754 fp16 (max 65504), causing severe black/corrupted screen glitches.
-    // - Yield briefly when the guest render/worker loop spins on QueryEvent
-    //   so asymmetric multi-core SoCs don't starve the Vulkan replay thread.
-    setenv("NX_QUERY_SPIN_SLEEP_US", "150", 0);
     // - Do NOT force-clear color attachments on every new render pass without an explicit
     //   NVN clear command; this avoids wiping UI/compositor targets updated across passes.
     setenv("NX_LOAD_CLEAR", "0", 0);

@@ -150,12 +150,6 @@ void bind_vertex_streams(VkCommandBuffer cb, uint32_t used_mask, const Upload* s
 void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
     Bound& b = g_bound;
     const State& s = g_state;
-    uint32_t raster[10] = {s.stencil_ref[0],        s.stencil_ref[1],        s.stencil_compare_mask[0],
-                          s.stencil_compare_mask[1], s.stencil_write_mask[0], s.stencil_write_mask[1]};
-    std::memcpy(raster + 6, &s.bias_factor, 4), std::memcpy(raster + 7, &s.bias_units, 4);
-    std::memcpy(raster + 8, &s.bias_clamp, 4);
-    bool slack = s.depth.depth_test && equal_slack_pass(s.depth);
-    raster[9] = slack;
     bool all = !b.has_dynamic;
     b.has_dynamic = true;
     auto differs = [&](bool d) { return (all || d) ? (g_state_set++, true) : (g_state_kept++, false); };
@@ -163,8 +157,24 @@ void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
     if (differs(!same_bytes(b.scissor, sc))) p_vkCmdSetScissor(cb, 0, 1, &sc), b.scissor = sc;
     if (differs(std::memcmp(b.blend, s.blend_color, sizeof b.blend) != 0))
         p_vkCmdSetBlendConstants(cb, s.blend_color), std::memcpy(b.blend, s.blend_color, sizeof b.blend);
-    if (differs(std::memcmp(b.raster, raster, sizeof raster) != 0))  // stencil reference and masks, depth bias
-        raster_dynamic(cb, slack), std::memcpy(b.raster, raster, sizeof raster);  // (nvn_raster.cpp)
+    if (all || s.raster_dirty) {
+        uint32_t raster[10] = {s.stencil_ref[0],        s.stencil_ref[1],        s.stencil_compare_mask[0],
+                              s.stencil_compare_mask[1], s.stencil_write_mask[0], s.stencil_write_mask[1]};
+        std::memcpy(raster + 6, &s.bias_factor, 4), std::memcpy(raster + 7, &s.bias_units, 4);
+        std::memcpy(raster + 8, &s.bias_clamp, 4);
+        bool slack = s.depth.depth_test && equal_slack_pass(s.depth);
+        raster[9] = slack;
+        if (all || std::memcmp(b.raster, raster, sizeof raster) != 0) {
+            raster_dynamic(cb, slack);
+            std::memcpy(b.raster, raster, sizeof raster);
+            g_state_set++;
+        } else {
+            g_state_kept++;
+        }
+        const_cast<State&>(s).raster_dirty = false;
+    } else {
+        g_state_kept++;
+    }
 }
 
 // No colour image behind any of the targets' colour slots: P5R binds its shadow maps with two empty colour slots.
@@ -299,7 +309,9 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     }
     if (extent.width == UINT32_MAX) extent = {1, 1};
     VkRenderingAttachmentInfo stencil = depth;  // same view, its own loadOp
-    stencil.storeOp = g_shadow_target ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+    // Persona 5 Royal never samples stencil buffers in later passes; discarding stencil stores avoids
+    // writing 8-bit stencil per pixel out to system DRAM across every render pass on Mali TBDR GPUs.
+    stencil.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     uint32_t cleared = clears_apply(t, colors, depth, stencil);  // pending clears of these targets: loadOp CLEAR
     if (exp_render_pass() & 1) {  // NX_EXP_RP=noload: what loading the targets costs (the picture breaks)
         for (uint32_t k = 0; k < t.color_count; k++)
@@ -598,25 +610,50 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
     if (shadow_draw_skipped(t)) return false;
     if (bloom_draw_skipped(t)) return false;
+    static thread_local uint64_t s_cached_pv = UINT64_MAX, s_cached_pf = UINT64_MAX;
     static thread_local std::vector<const ShaderInfo*> combined;
-    const auto* shaders = bound_graphics_shaders(combined);
-    if (!shaders || shaders->empty()) {
-        g_stats.no_program++;
-        return false;
-    }
+    static thread_local const std::vector<const ShaderInfo*>* s_cached_shaders = nullptr;
+    static thread_local const ShaderInfo* s_cached_vs = nullptr;
+    static thread_local const ShaderInfo* s_cached_fs = nullptr;
+    static thread_local const ProgramLayout* s_cached_layout = nullptr;
+
+    const uint64_t cur_pv = g_state.stage_programs[0];
+    const uint64_t cur_pf = g_state.stage_programs[1];
+    const std::vector<const ShaderInfo*>* shaders = nullptr;
     const ShaderInfo* vs = nullptr;
     const ShaderInfo* fs = nullptr;
-    for (const ShaderInfo* s : *shaders) {
-        if (s->stage == ShaderStage::Vertex) vs = s;
-        if (s->stage == ShaderStage::Fragment) fs = s;
-    }
-    if (!vs) {
-        g_stats.no_vertex++;
-        return false;
+    const ProgramLayout* layout_ptr = nullptr;
+
+    if (cur_pv == s_cached_pv && cur_pf == s_cached_pf && s_cached_shaders) {
+        shaders = s_cached_shaders;
+        vs = s_cached_vs;
+        fs = s_cached_fs;
+        layout_ptr = s_cached_layout;
+    } else {
+        shaders = bound_graphics_shaders(combined);
+        if (!shaders || shaders->empty()) {
+            g_stats.no_program++;
+            return false;
+        }
+        for (const ShaderInfo* s : *shaders) {
+            if (s->stage == ShaderStage::Vertex) vs = s;
+            if (s->stage == ShaderStage::Fragment) fs = s;
+        }
+        if (!vs) {
+            g_stats.no_vertex++;
+            return false;
+        }
+        layout_ptr = &program_layout(*shaders);
+        s_cached_pv = cur_pv;
+        s_cached_pf = cur_pf;
+        s_cached_shaders = shaders;
+        s_cached_vs = vs;
+        s_cached_fs = fs;
+        s_cached_layout = layout_ptr;
     }
     std::vector<const ShaderInfo*> swapped;  // NX_SWAP_FS / NX_SKIP_FS (nvn_draw_trace.cpp)
     if (!debug_shader_overrides(shaders, fs, swapped)) return false;
-    const ProgramLayout& layout = program_layout(*shaders);
+    const ProgramLayout& layout = (shaders == s_cached_shaders) ? *layout_ptr : program_layout(*shaders);
 
     // NX_SNAP_FS_BEFORE=<hash>[@<first draw>]: snapshot colour target 0 before draws with that fragment shader
     // (what a feedback pass like a tonemap reads), 8 at most.
@@ -716,17 +753,33 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     const Targets& tt = *tp;
     flush_compute_barrier(cb);
     vertex_read_barrier(cb, vs);  // G4
-    g_uw_wide = false;  // NX_ULTRAWIDE: is this draw's target a widened one (viewport, scissor, clears, vs scale)
-    if (uw_on()) {
-        GpuImage* wi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : (t.depth ? image_of(t.depth) : nullptr);
-        g_uw_wide = wi && wi->uw;
-    }
-    {   // NX_HUD_1080: a 1920x1080 image of a 1280x720 target (viewport, scissor and the shaders' render scale)
+    static thread_local uint64_t s_cached_target_c0 = UINT64_MAX, s_cached_target_depth = UINT64_MAX;
+    static thread_local uint32_t s_cached_target_color_count = UINT32_MAX;
+    static thread_local bool s_cached_uw_wide = false;
+    static thread_local bool s_cached_hud_target = false;
+    static thread_local bool s_cached_shadow_target = false;
+    static thread_local bool s_cached_low_3d_target = false;
+
+    uint64_t cur_c0 = t.color_count ? t.colors[0] : 0;
+    if (cur_c0 != s_cached_target_c0 || t.depth != s_cached_target_depth || t.color_count != s_cached_target_color_count) {
+        s_cached_target_c0 = cur_c0;
+        s_cached_target_depth = t.depth;
+        s_cached_target_color_count = t.color_count;
+
+        s_cached_uw_wide = false;
+        if (uw_on()) {
+            GpuImage* wi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : (t.depth ? image_of(t.depth) : nullptr);
+            s_cached_uw_wide = wi && wi->uw;
+        }
         GpuImage* hi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : (t.depth ? image_of(t.depth) : nullptr);
-        g_hud_target = hi && hi->hud;
-        g_shadow_target = depth_only(t) && t.depth && image_of(t.depth) && image_of(t.depth)->shadow;
-        g_low_3d_target = hi && hi->low_3d;
+        s_cached_hud_target = hi && hi->hud;
+        s_cached_shadow_target = depth_only(t) && t.depth && image_of(t.depth) && image_of(t.depth)->shadow;
+        s_cached_low_3d_target = hi && hi->low_3d;
     }
+    g_uw_wide = s_cached_uw_wide;
+    g_hud_target = s_cached_hud_target;
+    g_shadow_target = s_cached_shadow_target;
+    g_low_3d_target = s_cached_low_3d_target;
     bool need_break = gathered & kNeedBreak;
     if (gathered & kSampledPending) clears_flush_reason(11), clears_flush(cb);  // cleared (and stored) before it is sampled
     static const bool bytes = std::getenv("NX_TARGETS_MEMCMP") != nullptr;  // bisecting
@@ -766,6 +819,15 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     static thread_local VkPipelineLayout s_last_layout = VK_NULL_HANDLE;
     static thread_local uint32_t s_last_mode = UINT32_MAX;
     static thread_local Targets s_last_targets{};
+
+    struct MruEntry {
+        PipelineKey key;
+        VkPipelineLayout layout;
+        VkPipeline pipeline;
+    };
+    static constexpr size_t kMruSize = 8;
+    static thread_local MruEntry s_mru_cache[kMruSize]{};
+    static thread_local size_t s_mru_count = 0;
 
     if (!g_state.pipeline_dirty && s_last_pipeline != VK_NULL_HANDLE &&
         s_last_layout == layout.layout && s_last_mode == mode &&
@@ -876,16 +938,32 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                     g_state.viewport[0], g_state.viewport[1], g_state.viewport[2], g_state.viewport[3]);
             }
         }
-        if (s_last_pipeline != VK_NULL_HANDLE &&
-            s_last_layout == layout.layout &&
-            std::memcmp(&s_last_key, &key, sizeof(PipelineKey)) == 0) {
-            pipeline = s_last_pipeline;
+        VkPipeline found = VK_NULL_HANDLE;
+        for (size_t i = 0; i < s_mru_count; i++) {
+            if (s_mru_cache[i].layout == layout.layout &&
+                std::memcmp(&s_mru_cache[i].key, &key, sizeof(PipelineKey)) == 0) {
+                found = s_mru_cache[i].pipeline;
+                if (i > 0) {
+                    MruEntry hit = s_mru_cache[i];
+                    for (size_t j = i; j > 0; j--) {
+                        s_mru_cache[j] = s_mru_cache[j - 1];
+                    }
+                    s_mru_cache[0] = hit;
+                }
+                break;
+            }
+        }
+        if (found != VK_NULL_HANDLE) {
+            pipeline = found;
         } else {
             pipeline = graphics_pipeline(key, layout);
             if (pipeline != VK_NULL_HANDLE) {
-                s_last_pipeline = pipeline;
-                s_last_key = key;
-                s_last_layout = layout.layout;
+                size_t shift_len = std::min(s_mru_count, kMruSize - 1);
+                for (size_t j = shift_len; j > 0; j--) {
+                    s_mru_cache[j] = s_mru_cache[j - 1];
+                }
+                s_mru_cache[0] = {key, layout.layout, pipeline};
+                if (s_mru_count < kMruSize) s_mru_count++;
             }
         }
         if (pipeline != VK_NULL_HANDLE) {

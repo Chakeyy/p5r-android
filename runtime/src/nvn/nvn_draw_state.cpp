@@ -198,6 +198,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                     std::memcpy(&s.depth, p, sizeof s.depth);
                     s.pipeline_dirty = true;
                     s.descriptors_dirty = true;
+                    s.raster_dirty = true;
                 }
             }
             break;

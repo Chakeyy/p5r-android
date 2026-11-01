@@ -93,10 +93,12 @@ bool raster_command(const Cmd& c) {
                                                        : s.stencil_compare_mask;
             for (int f = 0; f < 2; f++)
                 if (c.mask >> f & 1) v[f] = uint8_t(c.n);
+            s.raster_dirty = true;
             return true;
         }
         case Cmd::SetPolygonOffsetClamp:
             s.bias_factor = c.f[0], s.bias_units = c.f[1], s.bias_clamp = c.f[2];
+            s.raster_dirty = true;
             return true;
         case Cmd::SetDepthBounds: {
             // Recorded only: MoltenVK has no depthBounds feature (Metal has no depth bounds test), and Wonder keeps

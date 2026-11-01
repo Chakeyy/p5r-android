@@ -384,15 +384,16 @@ static void thread_main(void* p) {
     plat::set_thread_name(name);
 
     // On asymmetric big.LITTLE / DynamIQ mobile SoCs (e.g. 2 Big + 6 Little CPU cores),
-    // guest background worker threads (core >= 2, prio >= 44) should run at nice 0 (standard foreground priority)
-    // with perf_hint_thread() enabled.
+    // guest background worker threads (core >= 2, prio >= 44) should run at nice 0 (standard foreground priority).
     // Over-elevating worker threads can cause them to contend with the Main thread (nice -4)
     // and Vulkan Replay thread (nice -8) for Big cores, leading to excessive context switching.
     // At nice 0, Linux EAS schedules background tasks across energy-efficient Little cores
     // while keeping Big cores available for the Replay and Main render threads.
+    // NOTE: Background worker threads must NOT register with plat::perf_hint_thread() (ADPF),
+    // as ADPF has a maximum capacity of 8 thread IDs. Background workers saturated all 8 slots,
+    // starving the frame-critical Vulkan Replay and Present threads.
     if (t->core >= 2 || t->prio >= 44) {
         plat::set_thread_priority(0);
-        plat::perf_hint_thread();
     }
 
     call(t->ctx, t->entry);
