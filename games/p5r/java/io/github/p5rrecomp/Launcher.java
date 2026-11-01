@@ -30,6 +30,7 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -93,7 +94,7 @@ public class Launcher extends Activity {
     final Map<String, String> config = new LinkedHashMap<>();
     TextView status;
     Button play;
-    static final int PICK_ZIP = 1, PICK_FOLDER = 2, PICK_GAME = 3, PICK_KEYS = 4, PICK_ICON = 5, PREPARE = 6;
+    static final int PICK_ZIP = 1, PICK_FOLDER = 2, PICK_GAME = 3, PICK_KEYS = 4, PICK_ICON = 5, PREPARE = 6, PICK_CPK = 7;
 
     String t(String spanish, String english) { return Lang.t(spanish, english); }
 
@@ -108,7 +109,16 @@ public class Launcher extends Activity {
 
     static File dataDir() { return new File(Environment.getExternalStorageDirectory(), DATA); }
 
-    boolean hasAccess() { return Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager(); }
+    static final class Api30Helper {
+        static boolean isExternalStorageManager() {
+            return Environment.isExternalStorageManager();
+        }
+    }
+
+    boolean hasAccess() {
+        if (Build.VERSION.SDK_INT < 30) return true;
+        return Api30Helper.isExternalStorageManager();
+    }
 
     // ---- the game file, read in place at every start ----
 
@@ -268,9 +278,14 @@ public class Launcher extends Activity {
 
     // The build ID the port is made for (Persona 5 Royal 1.0.0, the base game): the start of exefs/main's module ID
     // (NSO header +0x40). The native build refuses another (runtime main.cpp); say so here instead of closing.
-    static final String BUILD_ID = "708BCACA873EA32B";
+    static final String[] KNOWN_BUILDS = {
+        "708BCACA873EA32B",  // US
+        "B78A03E489E5BD92",  // EU
+        "6E1F4CAE92A28C91",  // JP
+        "2F2253ACD6BE5D87"   // Asia
+    };
 
-    // Null when exefs/main is missing or the right version, else its build ID.
+    // Null when exefs/main is missing or a recognized base game version, else its build ID.
     String wrongBuild() {
         File main = new File(dataDir(), "exefs/main");
         if (!main.canRead()) return null;
@@ -283,7 +298,11 @@ public class Launcher extends Activity {
         }
         StringBuilder hex = new StringBuilder();
         for (byte b : id) hex.append(String.format("%02X", b & 0xFF));
-        return hex.toString().equals(BUILD_ID) ? null : hex.toString();
+        String have = hex.toString();
+        for (String k : KNOWN_BUILDS) {
+            if (have.equals(k)) return null;
+        }
+        return have;
     }
 
     @Override
@@ -332,6 +351,22 @@ public class Launcher extends Activity {
         options.add(new Option("NX_TOUCH_OPACITY", "Opacidad de los botones", "Button opacity",
                 new String[] {"50", "85", "100"}, new String[] {"Baja", "Normal", "Alta"},
                 new String[] {"Low", "Normal", "High"}, 1));
+        options.add(new Option("NX_NO_CROWD", "Gente / Multitudes de NPCs", "Crowd NPCs",
+                new String[] {"0", "1"},
+                new String[] {"Activada (normal)", "Desactivada (más FPS)"},
+                new String[] {"Enabled (normal)", "Disabled (more FPS)"}, 0));
+        options.add(new Option("NX_DISABLE_BLOOM", "Post-procesado (bloom/brillo)", "Post-processing (bloom)",
+                new String[] {"0", "1"},
+                new String[] {"Activado (normal)", "Desactivado (más FPS)"},
+                new String[] {"Enabled (normal)", "Disabled (more FPS)"}, 0));
+        options.add(new Option("NX_STICK_SENSITIVITY", "Sensibilidad palanca táctil", "Touch stick sensitivity",
+                new String[] {"50", "75", "100", "125", "150", "200"},
+                new String[] {"50%", "75%", "100%", "125%", "150%", "200%"},
+                new String[] {"50%", "75%", "100%", "125%", "150%", "200%"}, 2));
+        options.add(new Option("NX_CAMERA_SENSITIVITY", "Sensibilidad cámara táctil", "Touch camera sensitivity",
+                new String[] {"50", "75", "100", "125", "150", "200", "250"},
+                new String[] {"50%", "75%", "100%", "125%", "150%", "200%", "250%"},
+                new String[] {"50%", "75%", "100%", "125%", "150%", "200%", "250%"}, 2));
         build();
     }
 
@@ -476,6 +511,56 @@ public class Launcher extends Activity {
             }
         });
         root.addView(saves);
+
+        // Translation CPK import
+        LinearLayout transRow = new LinearLayout(this);
+        transRow.setOrientation(LinearLayout.HORIZONTAL);
+        transRow.setGravity(Gravity.CENTER_VERTICAL);
+        transRow.setPadding(0, dp(4), 0, dp(4));
+        TextView transName = new TextView(this);
+        transName.setText(t("Traducción / Paquete (.cpk)", "Translation / CPK mod"));
+        transName.setTextColor(Color.WHITE);
+        transName.setTextSize(17);
+        transRow.addView(transName, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        Button transButton = new Button(this);
+        transButton.setAllCaps(false);
+        transButton.setMinWidth(dp(180));
+        transButton.setText(t("Importar CPK", "Import CPK"));
+        transRow.addView(transButton);
+        transButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (!hasAccess()) {
+                    askAccess();
+                    return;
+                }
+                pick(PICK_CPK, "*/*", false);
+            }
+        });
+        root.addView(transRow);
+
+        // Debug logs export
+        LinearLayout logsRow = new LinearLayout(this);
+        logsRow.setOrientation(LinearLayout.HORIZONTAL);
+        logsRow.setGravity(Gravity.CENTER_VERTICAL);
+        logsRow.setPadding(0, dp(4), 0, dp(4));
+        TextView logsName = new TextView(this);
+        logsName.setText(t("Registros de depuración", "Debug logs"));
+        logsName.setTextColor(Color.WHITE);
+        logsName.setTextSize(17);
+        logsRow.addView(logsName, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        Button logsButton = new Button(this);
+        logsButton.setAllCaps(false);
+        logsButton.setMinWidth(dp(180));
+        logsButton.setText(t("Exportar registros", "Export logs"));
+        logsRow.addView(logsButton);
+        logsButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                exportLogs();
+            }
+        });
+        root.addView(logsRow);
 
         play = new Button(this);
         play.setTextSize(20);
@@ -653,6 +738,10 @@ public class Launcher extends Activity {
             onIconPicked(data.getData());
             return;
         }
+        if (request == PICK_CPK) {
+            importCpk(data.getData());
+            return;
+        }
         try {
             SaveFiles.Result r = request == PICK_ZIP ? SaveFiles.importZip(getContentResolver(), data.getData())
                     : request == PICK_FOLDER ? SaveFiles.importTree(getContentResolver(), data.getData()) : null;
@@ -773,6 +862,86 @@ public class Launcher extends Activity {
     }
 
     int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+    void importCpk(Uri uri) {
+        try {
+            File cpkDir = new File(dataDir(), "mods" + File.separator + "translation" + File.separator + "romfs" + File.separator + "CPK");
+            if (!cpkDir.exists()) cpkDir.mkdirs();
+            File dest = new File(cpkDir, "PATCH1.CPK");
+            try (InputStream in = getContentResolver().openInputStream(uri);
+                 OutputStream out = new FileOutputStream(dest)) {
+                if (in == null) throw new java.io.IOException("Cannot open selected file");
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            }
+            Toast.makeText(this, t("Traducción instalada en mods/translation/ (PATCH1.CPK)",
+                    "Translation installed to mods/translation/ (as PATCH1.CPK)"), Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, t("Error al importar CPK: " + e.getMessage(),
+                    "Error importing CPK: " + e.getMessage()), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    void exportLogs() {
+        try {
+            File dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            if (!dl.exists()) dl.mkdirs();
+            File out = new File(dl, "p5r-log.txt");
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== Persona 5 Royal Recomp Log Export ===\n");
+            sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
+            sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
+            sb.append("Date: ").append(new java.util.Date().toString()).append("\n\n");
+
+            try {
+                Process p = Runtime.getRuntime().exec(new String[] {"logcat", "-d", "-t", "500"});
+                try (BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append("\n");
+                }
+            } catch (Exception e) {
+                sb.append("logcat capture error: ").append(e.getMessage()).append("\n");
+            }
+
+            File nxLog = new File(dataDir(), "nx.log");
+            if (nxLog.exists()) {
+                sb.append("\n=== nx.log ===\n");
+                try (BufferedReader br = new BufferedReader(new FileReader(nxLog))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append("\n");
+                }
+            }
+
+            File nxLogPrev = new File(dataDir(), "nx.log.prev");
+            if (nxLogPrev.exists()) {
+                sb.append("\n=== nx.log.prev ===\n");
+                try (BufferedReader br = new BufferedReader(new FileReader(nxLogPrev))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append("\n");
+                }
+            }
+
+            try (FileWriter fw = new FileWriter(out)) {
+                fw.write(sb.toString());
+            }
+
+            Toast.makeText(this, t("Registros exportados a Download/p5r-log.txt",
+                    "Logs exported to Download/p5r-log.txt"), Toast.LENGTH_SHORT).show();
+
+            Uri logUri = Uri.parse("content://" + getPackageName() + ".logprovider" + out.getAbsolutePath());
+            Intent share = new Intent(Intent.ACTION_SEND);
+            share.setType("text/plain");
+            share.putExtra(Intent.EXTRA_STREAM, logUri);
+            share.putExtra(Intent.EXTRA_SUBJECT, "Persona 5 Royal Debug Log");
+            share.setClipData(android.content.ClipData.newRawUri("Log", logUri));
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(share, t("Compartir archivo de registros", "Share log file")));
+        } catch (Exception e) {
+            Toast.makeText(this, t("Error al exportar registros: " + e.getMessage(),
+                    "Error exporting logs: " + e.getMessage()), Toast.LENGTH_LONG).show();
+        }
+    }
 
     void addRow(LinearLayout root, String label, String button, View.OnClickListener click) {
         LinearLayout row = new LinearLayout(this);

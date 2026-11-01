@@ -140,12 +140,6 @@ void perf_hint_frame(int64_t ns) {
     }
     if (g_session) {
         a.report(g_session, ns);
-        static uint64_t s_frame_count = 0;
-        if (++s_frame_count % 120 == 0) {
-            __android_log_print(ANDROID_LOG_INFO, "P5R-ADPF", "Frame %llu: work duration %lld ns (target %lld ns, %0.1f%% load)",
-                                (unsigned long long)s_frame_count, (long long)ns, (long long)target,
-                                (double)ns / (double)target * 100.0);
-        }
     }
 }
 #else

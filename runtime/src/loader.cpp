@@ -50,6 +50,15 @@ thread_local const char* t_missing_name = nullptr;
 // ---- logging --------------------------------------------------------------------------------------------------
 
 void log(const char* fmt, ...) {
+#if defined(__ANDROID__)
+    // Low-end build: disable runtime logging to eliminate logcat IPC, formatting, and file I/O overhead.
+    // Set NX_ENABLE_LOG=1 to enable logging for debugging.
+    static const bool s_enabled = [] {
+        const char* e = std::getenv("NX_ENABLE_LOG");
+        return e && (e[0] == '1' || std::strcmp(e, "true") == 0);
+    }();
+    if (!s_enabled) return;
+#endif
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
