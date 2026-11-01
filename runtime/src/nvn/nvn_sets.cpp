@@ -813,13 +813,13 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
 
     if (!g_state.vertex_dirty && s_last_vs == vs) {
         in.used = s_last_used;
-        for (uint32_t s = 0; s < 15; s++) in.vertex[s] = s_last_vertex[s];
+        std::memcpy(in.vertex, s_last_vertex, sizeof(s_last_vertex));
     } else {
         if (!indexed || draw_slow(kSlowUploads) || vk_index_type(c.mask) == VK_INDEX_TYPE_UINT8_EXT) {
             bool ok = draw_inputs(cb, vs, indexed, c, in);
             if (ok) {
                 s_last_used = in.used;
-                for (uint32_t s = 0; s < 15; s++) s_last_vertex[s] = in.vertex[s];
+                std::memcpy(s_last_vertex, in.vertex, sizeof(s_last_vertex));
                 s_last_vs = vs;
                 g_state.vertex_dirty = false;
             }
@@ -827,7 +827,7 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
         }
         draw_inputs(cb, vs, false, c, in);  // the vertex streams
         s_last_used = in.used;
-        for (uint32_t s = 0; s < 15; s++) s_last_vertex[s] = in.vertex[s];
+        std::memcpy(s_last_vertex, in.vertex, sizeof(s_last_vertex));
         s_last_vs = vs;
         g_state.vertex_dirty = false;
     }

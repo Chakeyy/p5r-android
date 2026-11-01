@@ -689,12 +689,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r37";
+static constexpr const char* kPerfBuildTag = "lowend-r38";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (VkRenderPass stencil DONT_CARE, Android pipelined fences, host-cached upload ring)",
+    log("p5r perf build: %s (O(1) cmd hash map, NEON vertex staging, bulk AAudio memcpy)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
