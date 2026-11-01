@@ -154,9 +154,7 @@ void pin_current_thread_to_big_cores(const char* thread_name) {
     CPU_SET(7, &cpuset);
 
     int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-    if (rc == 0) {
-        __android_log_print(ANDROID_LOG_INFO, "p5r", "Thread '%s' pinned to Big Cores (6, 7)", thread_name);
-    } else {
+    if (rc != 0) {
         __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s': errno %d", thread_name, rc);
     }
 }
@@ -170,9 +168,7 @@ void pin_current_thread_to_core(int core_id, const char* thread_name) {
     CPU_SET(core_id, &cpuset);
 
     int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-    if (rc == 0) {
-        __android_log_print(ANDROID_LOG_INFO, "p5r", "Thread '%s' pinned to Core %d", thread_name, core_id);
-    } else {
+    if (rc != 0) {
         __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Core %d: errno %d", thread_name, core_id, rc);
     }
 }
@@ -189,9 +185,7 @@ void pin_current_thread_to_little_cores(const char* thread_name) {
     }
 
     int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-    if (rc == 0) {
-        __android_log_print(ANDROID_LOG_INFO, "p5r", "Thread '%s' pinned to Little Cores (0-5)", thread_name);
-    } else {
+    if (rc != 0) {
         __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Little Cores: errno %d", thread_name, rc);
     }
 }
@@ -207,18 +201,14 @@ void reset_current_thread_affinity(const char* thread_name) {
     }
 
     int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-    if (rc == 0) {
-        __android_log_print(ANDROID_LOG_INFO, "p5r", "Thread '%s' affinity reset to all cores (0-%ld)", thread_name, num_cores - 1);
-    } else {
+    if (rc != 0) {
         __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to reset affinity for thread '%s': errno %d", thread_name, rc);
     }
 }
 
 void set_thread_priority(int priority) {
     int rc = setpriority(PRIO_PROCESS, 0, priority);
-    if (rc == 0) {
-        __android_log_print(ANDROID_LOG_INFO, "p5r", "Thread priority set to %d", priority);
-    } else {
+    if (rc != 0) {
         __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to set thread priority %d: errno %d", priority, errno);
     }
 }
@@ -813,7 +803,16 @@ extern "C" void android_main(android_app* app) {
     // the system set it.
     if (const char* e = getenv("NX_MALLOC_TUNE"); !(e && e[0] == '0')) {
         int zero = mallopt(M_BIONIC_ZERO_INIT, 0), decay = mallopt(M_DECAY_TIME, 1);
-        nx::log("heap: zero-fill off (%d), page release delayed (%d)", zero, decay);
+#ifndef M_CACHE_COUNT_MAX
+#define M_CACHE_COUNT_MAX (-200)
+#endif
+#ifndef M_CACHE_SIZE_MAX
+#define M_CACHE_SIZE_MAX (-201)
+#endif
+        int cache_cnt = mallopt(M_CACHE_COUNT_MAX, 64);
+        int cache_sz = mallopt(M_CACHE_SIZE_MAX, 4 << 20);
+        nx::log("heap: zero-fill off (%d), page release delayed (%d), scudo cache (%d, %d)",
+                zero, decay, cache_cnt, cache_sz);
     }
     start_memory_guard();
     gpu_turbo();

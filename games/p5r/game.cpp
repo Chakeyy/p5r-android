@@ -434,10 +434,12 @@ struct Planes {
     float p[6][4] = {};  // normal, distance
 };
 
-Planes read_planes() {
+Planes read_planes(bool all = false) {
     Planes pl;
     pl.ptr = ld<uint64_t>(g_main_base + 0x22cd268);
-    for (int k = 0; k < 6 && pl.ptr; k++)
+    if (!pl.ptr) return pl;
+    const int max_k = all ? 6 : 1;
+    for (int k = 0; k < max_k; k++)
         for (int j = 0; j < 4; j++) {
             const uint32_t w = ld<uint32_t>(pl.ptr + 32 * k + (j < 3 ? 4 * j : 16));
             std::memcpy(&pl.p[k][j], &w, 4);
@@ -467,9 +469,9 @@ void cull_job_hook(CPU& c) {
     const uint64_t model = ld<uint64_t>(job), states = ld<uint64_t>(job + 8);
     const uint64_t sp = c.x[31];
     static const bool trace_cull = std::getenv("NX_P5R_CULL_CHECK") != nullptr;
-    const Planes before = trace_cull ? read_planes() : Planes{};
+    const Planes before = trace_cull ? read_planes(true) : Planes{};
     call(c, g_cull_job);
-    const Planes after = read_planes();
+    const Planes after = read_planes(trace_cull);
     const uint64_t list = model ? ld<uint64_t>(model + 0x38) : 0;
     if (!list || !states) return;
 
@@ -505,17 +507,19 @@ void cull_job_hook(CPU& c) {
                 last_matrix = matrix;
                 guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
 
-                float b[19];
-                for (int k = 0; k < 19; k++) {
-                    const uint32_t w = ld<uint32_t>(box + 4 * k);
-                    std::memcpy(&b[k], &w, 4);
-                }
+                // Direct load center coordinates (b[0..2])
+                const float b0 = ld<float>(box);
+                const float b1 = ld<float>(box + 4);
+                const float b2 = ld<float>(box + 8);
 
                 // Signed distance of box center from near plane along camera view axis
-                const float view_dist = p[0] * b[0] + p[1] * b[1] + p[2] * b[2] - p[3];
+                const float view_dist = p[0] * b0 + p[1] * b1 + p[2] * b2 - p[3];
                 if (!std::isfinite(view_dist) || view_dist <= 2.5f) continue;  // Protect immediate player interaction bubble
 
-                const float r16 = std::fabs(b[16]), r17 = std::fabs(b[17]), r18 = std::fabs(b[18]);
+                // Direct load half-extents (b[16..18])
+                const float r16 = std::fabs(ld<float>(box + 16 * 4));
+                const float r17 = std::fabs(ld<float>(box + 17 * 4));
+                const float r18 = std::fabs(ld<float>(box + 18 * 4));
                 if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
                 const float radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
 
@@ -689,12 +693,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r38";
+static constexpr const char* kPerfBuildTag = "lowend-r39";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (O(1) cmd hash map, NEON vertex staging, bulk AAudio memcpy)",
+    log("p5r perf build: %s (direct near-plane/mesh culling, renderpass MRU cache, scudo secondary cache)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:

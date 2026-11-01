@@ -261,6 +261,7 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
     (void)s_prio_set;
     plat::perf_hint_thread();  // this thread replays: part of every frame (perf_hint.cpp)
     std::vector<std::shared_ptr<CmdList>> lists;
+    lists.reserve(uint32_t(c.x[1]));
     static uint64_t submitted = 0, missing = 0;
     for (uint32_t k = 0; k < uint32_t(c.x[1]); k++) {
         submitted++;
