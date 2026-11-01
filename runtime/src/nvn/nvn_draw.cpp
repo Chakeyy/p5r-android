@@ -83,6 +83,8 @@ struct Bound {
     uint32_t raster[10] = {};  // raster_dynamic's inputs: stencil reference and masks per face, the depth bias
 } g_bound;
 uint64_t g_state_set = 0, g_state_kept = 0;  // state commands recorded and left out, for the log
+VkPipeline g_last_compute_pipeline = VK_NULL_HANDLE;
+bool g_compute_barrier_pending = false;
 
 template <typename T>
 bool same_bytes(const T& a, const T& b) { return std::memcmp(&a, &b, sizeof(T)) == 0; }
@@ -96,6 +98,44 @@ void bind_vertex(VkCommandBuffer cb, uint32_t binding, const Upload& u) {
     VkDeviceSize off = u.offset;
     p_vkCmdBindVertexBuffers(cb, binding, 1, &u.buffer, &off);
     now = u, g_bound.vertex_set |= 1u << binding, g_state_set++;
+}
+
+// Binds active vertex streams (plus binding 15 zero_stream) in contiguous batches.
+void bind_vertex_streams(VkCommandBuffer cb, uint32_t used_mask, const Upload* streams) {
+    bool need[16] = {};
+    const Upload zero = zero_stream();
+    for (uint32_t s = 0; s < 16; s++) {
+        const bool active = (s == 15) ? true : (used_mask >> s & 1);
+        if (!active) continue;
+        const Upload& u = (s == 15) ? zero : streams[s];
+        const Upload& now = g_bound.vertex[s];
+        if ((g_bound.vertex_set >> s & 1) && now.buffer == u.buffer && now.offset == u.offset) {
+            g_state_kept++;
+        } else {
+            need[s] = true;
+        }
+    }
+
+    for (uint32_t s = 0; s < 16;) {
+        if (!need[s]) {
+            s++;
+            continue;
+        }
+        uint32_t n = 1;
+        while (s + n < 16 && need[s + n]) n++;
+        VkBuffer bufs[16];
+        VkDeviceSize offs[16];
+        for (uint32_t i = 0; i < n; i++) {
+            const Upload& u = (s + i == 15) ? zero : streams[s + i];
+            bufs[i] = u.buffer;
+            offs[i] = u.offset;
+            g_bound.vertex[s + i] = u;
+            g_bound.vertex_set |= 1u << (s + i);
+            g_state_set++;
+        }
+        p_vkCmdBindVertexBuffers(cb, s, n, bufs, offs);
+        s += n;
+    }
 }
 
 // Viewport, scissor, blend constants and the rasterizer's dynamic state (every pipeline declares them dynamic).
@@ -322,7 +362,10 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     if (!cs) return;
     uint32_t x = uint32_t(c.i[0]), y = uint32_t(c.i[1]), z = uint32_t(c.i[2]);
     const uint8_t* args = c.n == 1 ? guest_bytes(c.a[0]) : nullptr;  // indirect: {x, y, z}
-    if (args) frame_guest_read(args, 12);  // deferred write-backs over the arguments land first (nvn_frames.cpp)
+    if (args) {
+        flush_compute_barrier(cb);
+        frame_guest_read(args, 12);  // deferred write-backs over the arguments land first (nvn_frames.cpp)
+    }
     if (c.n == 1 && !args) return;
     // Written by an earlier dispatch of this submit: only the GPU knows them (vkCmdDispatchIndirect, below).
     bool gpu_args = args && !written_separate() && written_overlaps(args, 12);
@@ -337,16 +380,17 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     draw_end_rendering(cb, 2);
     gather_textures(stages);
     build_sets(cb, stages, layout);
-    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    if (pipeline != g_last_compute_pipeline) {
+        p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        g_last_compute_pipeline = pipeline;
+    }
     bind_sets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout);
     if (gpu_profile_on()) gpu_profile_mark(cb, "compute " + cs->hash);
     if (!gpu_args || !written_indirect(cb, args)) p_vkCmdDispatch(cb, x, y, z);
     if (gpu_profile_on()) gpu_profile_mark(cb, "outside passes (clears, uploads, copies)");
-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
-                           nullptr, 0, nullptr);
+
+    // Defer compute barrier until vertex/graphics consumption, read-after-write, or transfer.
+    g_compute_barrier_pending = true;
     g_stats.dispatches++;
 }
 
@@ -435,7 +479,10 @@ uint32_t live_flags() {
 bool live_clears_why() { return live_flags() & kLiveClearsWhy; }
 
 bool exp_no_write_backs() {
-    static const bool env = std::getenv("NX_EXP_NO_WB") != nullptr;
+    static const bool env = [] {
+        const char* e = std::getenv("NX_EXP_NO_WB");
+        return e && e[0] != '0';
+    }();
     return env || (live_flags() & kLiveNoWb);
 }
 
@@ -529,6 +576,16 @@ bool live_ui_draw(const Targets& t) {
 bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
     g_stats.total++;
     if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
+    if (occlusion_object_skipped() && !g_state.depth.depth_write && !g_state.depth.stencil_test) {
+        bool writes_color = false;
+        for (uint32_t k = 0; k < t.color_count; k++) {
+            if (t.colors[k] && (g_state.mask.mask[k] & 0xF)) {
+                writes_color = true;
+                break;
+            }
+        }
+        if (!writes_color) return false;
+    }
     if (shadow_draw_skipped(t)) return false;
     if (bloom_draw_skipped(t)) return false;
     static thread_local std::vector<const ShaderInfo*> combined;
@@ -615,6 +672,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             }
         return t;
     }();
+    flush_compute_barrier(cb);
     vertex_read_barrier(cb, vs);  // G4
     g_uw_wide = false;  // NX_ULTRAWIDE: is this draw's target a widened one (viewport, scissor, clears, vs scale)
     if (uw_on()) {
@@ -762,7 +820,25 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 g_state.viewport[0], g_state.viewport[1], g_state.viewport[2], g_state.viewport[3]);
         }
     }
-    VkPipeline pipeline = graphics_pipeline(key, layout);
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    {
+        static thread_local VkPipeline s_last_pipeline = VK_NULL_HANDLE;
+        static thread_local PipelineKey s_last_key{};
+        static thread_local VkPipelineLayout s_last_layout = VK_NULL_HANDLE;
+
+        if (s_last_pipeline != VK_NULL_HANDLE &&
+            s_last_layout == layout.layout &&
+            std::memcmp(&s_last_key, &key, sizeof(PipelineKey)) == 0) {
+            pipeline = s_last_pipeline;
+        } else {
+            pipeline = graphics_pipeline(key, layout);
+            if (pipeline != VK_NULL_HANDLE) {
+                s_last_pipeline = pipeline;
+                s_last_key = key;
+                s_last_layout = layout.layout;
+            }
+        }
+    }
     if (!pipeline) {
         g_stats.no_pipeline++;
         return false;
@@ -772,16 +848,15 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     if (g_bound.pipeline != pipeline) {
         p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         g_bound.pipeline = pipeline, g_state_set++;
+        g_last_compute_pipeline = VK_NULL_HANDLE;
         if (gpu_profile_on()) gpu_profile_count(1);
     } else {
         g_state_kept++;
     }
     bind_sets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
 
-    // The vertex buffers resolved above, plus the zero stream (binding 15).
-    for (uint32_t s = 0; s < 15; s++)
-        if (in.used >> s & 1) bind_vertex(cb, s, in.vertex[s]);
-    bind_vertex(cb, 15, zero_stream());
+    // The vertex buffers resolved above, plus the zero stream (binding 15), batched in contiguous runs.
+    bind_vertex_streams(cb, in.used, in.vertex);
 
     VkViewport vp{0, 0, float(g_pass_extent.width), float(g_pass_extent.height), 0, 1};
     if (g_state.has_viewport)
@@ -999,13 +1074,15 @@ void draw_begin_submit() {
     g_linear_targets.clear(), g_late_write_backs.clear();
     g_vertex_pending = false, g_vertex_visible_at = g_pass_serial;  // each command buffer begins with a full barrier
     g_bound = Bound{};  // a new command buffer
+    g_last_compute_pipeline = VK_NULL_HANDLE;
+    g_compute_barrier_pending = false;
+    sets_invalidate_bound();
     submit_lists_reset();
     sets_begin_submit();
     clears_begin_submit();
     g_submit_ns = plat::monotonic_ns();
     dedup_reset();
     cache_begin_submit();
-    written_reset();
     pipeline_begin_submit();
 }
 
@@ -1040,6 +1117,8 @@ void draw_log_stats() {
 }
 
 void pass_end_only(VkCommandBuffer cb, int reason) {
+    if (reason != 2 /* Compute */) flush_compute_barrier(cb);
+    g_last_compute_pipeline = VK_NULL_HANDLE;
     if (!g_rendering) return;
     g_pass_ends[reason & 7]++, trace_pass("end: reason", g_pass, uint32_t(reason), 0);
     if (g_render_pass)
@@ -1086,7 +1165,24 @@ VkExtent2D pass_extent() { return g_pass_extent; }
 void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); }
 // After a clear inside the pass (nvn_clears.cpp). A masked one is a fullscreen draw with its own pipeline, viewport
 // and scissor (nvn_mask_clear.cpp): the next draw sets everything again.
-void pass_mark_written(uint32_t bits) { g_pass_written |= bits, g_bound = Bound{}; }
+void pass_mark_written(uint32_t bits) { g_pass_written |= bits, g_bound = Bound{}, sets_invalidate_bound(); }
+
+void replay::flush_compute_barrier(VkCommandBuffer cb) {
+    if (!g_compute_barrier_pending || cb == VK_NULL_HANDLE) return;
+    g_compute_barrier_pending = false;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                       VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    const VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
+                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT;
+    p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst_stages, 0, 1, &mb, 0,
+                           nullptr, 0, nullptr);
+}
 
 bool replay::pass_wrote(const GpuImage* img) {
     if (!g_rendering || !img) return false;

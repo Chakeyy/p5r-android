@@ -63,7 +63,7 @@ constexpr uint32_t kPathNotFound = 0x202;       // fs 1
 constexpr uint32_t kPathAlreadyExists = 0x402;  // fs 2
 constexpr uint32_t kTargetNotFound = 0x2EE202;  // fs 6001-ish: generic "not mounted"
 
-std::mutex g_fs;
+std::recursive_mutex g_fs;
 std::map<std::string, fs::path> g_mounts;
 // Open files: shared so a read in progress survives a close from another thread. Reads run outside g_fs (which
 // only guards the tables): one global lock made every streaming thread (Bink animations, FMOD banks) wait behind
@@ -247,9 +247,9 @@ void scan_mods() {
     if (const char* e = std::getenv("NX_NO_CROWD")) {
         if (e[0] == '1' || std::strcmp(e, "true") == 0) {
             log("fs: crowd removal active (NX_NO_CROWD=1): stubbing RESRCCROWDUNIT.BIN");
-            add_virtual_file("resource/resrccrowdunit.bin", "");
-            add_virtual_file("base/resource/resrccrowdunit.bin", "");
-            add_virtual_file("cpk/patch1/base/resource/resrccrowdunit.bin", "");
+            g_virtual[virtual_key(fs::u8path("resource/resrccrowdunit.bin"))] = "";
+            g_virtual[virtual_key(fs::u8path("base/resource/resrccrowdunit.bin"))] = "";
+            g_virtual[virtual_key(fs::u8path("cpk/patch1/base/resource/resrccrowdunit.bin"))] = "";
         }
     }
 }

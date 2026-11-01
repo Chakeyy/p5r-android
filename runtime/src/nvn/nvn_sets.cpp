@@ -155,9 +155,9 @@ struct HandleSlot {
     ViewInfo view;
     VkSampler vk_sampler[4] = {};  // sampler_for(sampler, shadow, biased) by shadow + 2 * biased, once a binding asked
 };
-constexpr uint32_t kHandleSlots = 2048;  // a course frame names a few hundred handles
+constexpr uint32_t kHandleSlots = 8192;  // keeps handle slots across submits when epoch/mark are unchanged
 HandleSlot g_handle_slots[kHandleSlots];
-uint64_t g_handle_generation = 1, g_handle_mark = 0;
+uint64_t g_handle_generation = 1, g_handle_mark = 0, g_handle_epoch = 0;
 uint32_t g_handle_used = 0;
 uint64_t g_handle_hits = 0, g_handle_misses = 0, g_sets_skipped = 0;
 
@@ -168,7 +168,11 @@ void handles_reset() { g_handle_generation++, g_handle_used = 0; }
 HandleSlot* handle_slot(uint64_t handle) {
     uint64_t mark = t_replay_mark;
     if (!mark || draw_slow(kSlowHandles)) return nullptr;
-    if (mark != g_handle_mark || g_handle_used > kHandleSlots / 2) handles_reset(), g_handle_mark = mark;
+    if (mark != g_handle_mark || g_handle_used > kHandleSlots / 2) {
+        handles_reset();
+        g_handle_mark = mark;
+        g_handle_epoch = current_epoch();
+    }
     handle &= 0xFFFFFFFFull;  // 20 bits of texture id, 12 of sampler id
     uint64_t tp = g_state.texture_pool, sp = g_state.sampler_pool;
     uint64_t h = (handle + 1) * 0x9E3779B97F4A7C15ull ^ tp * 0xC2B2AE3D27D4EB4Full ^ sp * 0x165667B19E3779F9ull;
@@ -463,7 +467,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
             uint64_t size;
             if (b.set < 2 && b.nvn.source == NvnSource::StorageBuffer && storage(s, b, api_stage(s->stage), p, size) &&
                 p && size && !written_separate())
-                written_bind(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, 0x10000));
+                written_bind(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, pad_min(0x10000)));
         }
     for (const ShaderInfo* s : shaders) {
         int st = api_stage(s->stage);
@@ -511,7 +515,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                     if (!written && s->stage != ShaderStage::Compute && written_overlaps(p, size)) written_count_bind();
                     // At least 64 KB: Metal does not bound-check, and a shader writing past a small or missing
                     // buffer overwrote the next data in the upload buffer (garbage everywhere after a compute).
-                    info = buffer_of(cb, p, size, written ? 0x10000 : pad_min(0x10000), written);
+                    info = buffer_of(cb, p, size, pad_min(0x10000), written);
                     break;
                 }
                 case NvnSource::DriverConstants: {
@@ -587,7 +591,22 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
 
 // A set with no binding in the layout is statically used by no shader, so nothing need be bound there: the runs of
 // sets build_sets allocated are bound, in ascending order (each bind leaves the lower sets, bound with this same
-// layout, undisturbed).
+// layout, undisturbed). Redundant binds of sets already in place under the same pipeline layout are skipped.
+struct BoundSets {
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet sets[4] = {};
+    uint32_t dynamic_offsets[64] = {};
+    uint32_t dynamic_count = 0;
+};
+BoundSets g_bound_sets[2] = {};  // [0] = graphics, [1] = compute
+uint64_t g_sets_bound = 0, g_sets_bind_skipped = 0;
+
+void sets_invalidate_bound() {
+    g_bound_sets[0] = BoundSets{};
+    g_bound_sets[1] = BoundSets{};
+}
+
 void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout) {
     Descriptors& d = g_sets;
     if (set_cache_on()) resolve_sets(layout);
@@ -603,15 +622,52 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
         p_vkCmdBindDescriptorSets(cb, point, layout.layout, 0, 4, d.sets, noff, offsets);
         return;
     }
-    for (uint32_t k = 0; k < 4;) {
+
+    const int pt = (point == VK_PIPELINE_BIND_POINT_COMPUTE ? 1 : 0);
+    BoundSets& b = g_bound_sets[pt];
+    if (b.cb != cb) {
+        b = BoundSets{};
+        b.cb = cb;
+    }
+    if (b.layout != layout.layout) {
+        b.layout = layout.layout;
+        for (int k = 0; k < 4; k++) b.sets[k] = VK_NULL_HANDLE;
+        b.dynamic_count = 0;
+    }
+
+    bool need[4] = {};
+    for (uint32_t k = 0; k < 4; k++) {
         if (!d.sets[k]) {
-            k++, g_sets_skipped++;
+            b.sets[k] = VK_NULL_HANDLE;
+            g_sets_skipped++;
+            continue;
+        }
+        if (k == 0) {
+            need[0] = (b.sets[0] != d.sets[0] || b.dynamic_count != noff ||
+                       std::memcmp(b.dynamic_offsets, offsets, noff * sizeof(uint32_t)) != 0);
+        } else {
+            need[k] = (b.sets[k] != d.sets[k]);
+        }
+        if (!need[k]) g_sets_bind_skipped++;
+    }
+
+    for (uint32_t k = 0; k < 4;) {
+        if (!need[k]) {
+            k++;
             continue;
         }
         uint32_t n = 1;
-        while (k + n < 4 && d.sets[k + n]) n++;
+        while (k + n < 4 && need[k + n]) n++;
         p_vkCmdBindDescriptorSets(cb, point, layout.layout, k, n, d.sets + k, k == 0 ? noff : 0, offsets);
         if (gpu_profile_on()) gpu_profile_count(2);
+        for (uint32_t i = 0; i < n; i++) {
+            b.sets[k + i] = d.sets[k + i];
+            g_sets_bound++;
+        }
+        if (k == 0) {
+            b.dynamic_count = noff;
+            std::memcpy(b.dynamic_offsets, offsets, noff * sizeof(uint32_t));
+        }
         k += n;
     }
 }
@@ -706,7 +762,13 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
 }
 
 void sets_begin_submit() {
-    handles_reset();
+    uint64_t mark = t_replay_mark, epoch = current_epoch();
+    if (!mark || mark != g_handle_mark || epoch != g_handle_epoch || g_handle_used > kHandleSlots / 2) {
+        handles_reset();
+        g_handle_mark = mark;
+        g_handle_epoch = epoch;
+    }
+    sets_invalidate_bound();
     g_set_generation++, g_set_used = 0, g_set_arena.clear();
     g_support_used = g_constants_used = 0;
 }
@@ -718,7 +780,11 @@ void sets_log() {
     if (g_set_hits + g_set_misses)
         log("nvn: descriptor sets: %llu reused from the submit's cache, %llu made", (unsigned long long)g_set_hits,
             (unsigned long long)g_set_misses);
+    if (g_sets_bound + g_sets_bind_skipped)
+        log("nvn: descriptor set binds: %llu sets bound, %llu redundant binds skipped",
+            (unsigned long long)g_sets_bound, (unsigned long long)g_sets_bind_skipped);
     g_handle_hits = g_handle_misses = g_sets_skipped = g_set_hits = g_set_misses = 0;
+    g_sets_bound = g_sets_bind_skipped = 0;
 }
 
 }  // namespace nx::nvn::replay
