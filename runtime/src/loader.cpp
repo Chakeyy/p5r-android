@@ -27,6 +27,7 @@ namespace {
 
 std::mutex g_log_lock;
 FILE* g_log_file = nullptr;
+std::vector<std::string> g_early_logs;
 
 std::vector<LoadedModule> g_modules;
 std::unordered_map<std::string, uint64_t> g_exports;
@@ -51,7 +52,7 @@ thread_local const char* t_missing_name = nullptr;
 
 void log(const char* fmt, ...) {
 #if defined(__ANDROID__)
-    // Low-end build: disable runtime logging to eliminate logcat IPC, formatting, and file I/O overhead.
+    // Low-end build: disable runtime logging by default to eliminate logcat IPC, formatting, and file I/O overhead.
     // Set NX_ENABLE_LOG=1 to enable logging for debugging.
     static const bool s_enabled = [] {
         const char* e = std::getenv("NX_ENABLE_LOG");
@@ -66,6 +67,14 @@ void log(const char* fmt, ...) {
     va_end(ap);
     plat::log_line(buf);
     const char* path = std::getenv("NX_LOG");
+    std::string default_path;
+    if (!path) {
+        std::string root = plat::data_root();
+        if (!root.empty()) {
+            default_path = root + "/nx.log";
+            path = default_path.c_str();
+        }
+    }
     if (path) {
         std::lock_guard lk(g_log_lock);
         if (!g_log_file) {
@@ -74,10 +83,22 @@ void log(const char* fmt, ...) {
             std::remove((file + ".prev").c_str());
             std::rename(file.c_str(), (file + ".prev").c_str());
             g_log_file = std::fopen(file.c_str(), "w");
+            if (g_log_file && !g_early_logs.empty()) {
+                for (const auto& line : g_early_logs) {
+                    std::fprintf(g_log_file, "%s\n", line.c_str());
+                }
+                g_early_logs.clear();
+                g_early_logs.shrink_to_fit();
+            }
         }
         if (g_log_file) {
             std::fprintf(g_log_file, "%s\n", buf);
             std::fflush(g_log_file);
+        }
+    } else {
+        std::lock_guard lk(g_log_lock);
+        if (!g_log_file && g_early_logs.size() < 256) {
+            g_early_logs.push_back(buf);
         }
     }
 }

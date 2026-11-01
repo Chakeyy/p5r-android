@@ -222,7 +222,7 @@ uint64_t game_clock() {
         longest = std::max(longest, r);
     }
     last_start = start;
-    if (real < 10 * uint64_t(kTicks)) return r;
+    if (real < 3 * uint64_t(kTicks)) return r;
     // Logged when the game is off real time or the device under the cap (the target then moves).
     const double fps = double(frames) * kTicks / double(real);
     if (game * 100 < real * 97 || std::abs(steps / double(real) - 1.0) > 0.02 || fps < cap_fps() * 0.95)
@@ -269,12 +269,16 @@ bool name_starts(uint64_t name, uint32_t len, const char* want) {
     return true;
 }
 
+static std::string g_current_field_task;
+
 void scan_tasks() {
     static int calls = 0;
     static bool trace = false;
     if (calls % 64 == 0) {
         bool now = false;
-        if (FILE* f = plat::kDiagnostics ? plat::fopen_utf8(plat::data_root() + "/trace_tasks", "rb") : nullptr)
+        if (const char* env = std::getenv("NX_P5R_TRACE_TASKS"); env && (env[0] == '1' || std::strcmp(env, "true") == 0))
+            now = true;
+        else if (FILE* f = plat::kDiagnostics ? plat::fopen_utf8(plat::data_root() + "/trace_tasks", "rb") : nullptr)
             now = true, std::fclose(f);
         if (now != trace) log("p5r: task trace %s", now ? "on" : "off");
         trace = now;
@@ -295,6 +299,15 @@ void scan_tasks() {
         skip = skip || name_is(name, len, "EventSkip") || scenario_event(name, len) || name_starts(name, len, "General_") ||
                name_starts(name, len, "bustupLipAnim");
         movie = movie || name_is(name, len, "MOVIE_DRAW");
+        if (name_starts(name, len, "General_") || scenario_event(name, len)) {
+            std::string s;
+            if (name && len && len < 64)
+                for (uint32_t k = 0; k < len; k++) s += char(ld<uint8_t>(name + k));
+            if (!s.empty() && s != g_current_field_task) {
+                g_current_field_task = s;
+                log("p5r: active field map script: %s", g_current_field_task.c_str());
+            }
+        }
         if (!trace) continue;
         std::string str;
         if (name && len && len < 64)
@@ -304,10 +317,9 @@ void scan_tasks() {
     }
     const bool scene = (title || event) && !battle;
     static const bool field_on = env_int("NX_P5R_FIELD_SCENES", 1) != 0;
-    // Allow discrete step pacing (cap, cap/2, cap/3 = 30, 15, 10) in all non-battle field gameplay
-    // (including free-roam school hallways where EventSkip/General_* are not active) so movement
-    // runs at 100% real-time speed instead of 50% slow-motion whenever FPS dips below 30.
-    const bool field = field_on && !event && !title && !battle && !movie;
+    // Restrict discrete step pacing (cap, cap/2, cap/3 = 30, 15, 10) strictly to scripted field scenes (with EventSkip/General_*)
+    // so free-roam palace exploration runs at full native 30 fps without artificial 15/10 fps clamping cliffs.
+    const bool field = field_on && skip && !event && !title && !battle && !movie;
     if (scene != g_scene)
         log("p5r: scene %s (%s%s%s): the target %s", scene ? "starts" : "ends", title ? "title " : "", event ? "event " : "",
             battle ? "battle" : "", scene ? "follows the device" : "stays at 30 or more");
@@ -348,6 +360,8 @@ void frame_origin() {
     frame_origin_ns(origin * 10000 / 192);  // ticks (19.2 MHz) -> monotonic ns (system_tick())
 }
 
+static std::atomic<uint64_t> g_cull_eval{0}, g_cull_hidden{0};
+
 void interval_setter_hook(CPU& c) {
     scan_tasks();
     const uint64_t period = game_clock();
@@ -357,8 +371,17 @@ void interval_setter_hook(CPU& c) {
     const int interval = fps ? std::clamp(60 / fps, 1, 4) : 60 / cap_fps();
     if (!fps) fps = !auto_fps() ? cap_fps() : period ? paced_target(period, now) : now;
     if (fps > 0 && now > 0 && now != fps) {
-        static int logged = 0;  // the automatic target moves every frame: only the first changes
-        if (logged++ < 3) log("p5r: target frame rate %d -> %d%s", now, fps, auto_fps() && !forced_fps() ? " (follows the device)" : "");
+        static int last_logged_fps = 0;
+        static uint64_t last_log_ns = 0;
+        uint64_t now_ns = plat::monotonic_ns();
+        if (fps != last_logged_fps || (now_ns - last_log_ns > 2'000'000'000ull)) {
+            log("p5r: target frame rate %d -> %d%s (field=%d scene=%d frame=%.1f ms task=%s)",
+                now, fps, auto_fps() && !forced_fps() ? " (paced)" : "",
+                g_field_scene, g_scene, double(period) * 1e3 / kTicks,
+                g_current_field_task.c_str());
+            last_logged_fps = fps;
+            last_log_ns = now_ns;
+        }
         set_target_fps(c, fps);
     }
     c.x[1] = uint32_t(interval);
@@ -366,6 +389,21 @@ void interval_setter_hook(CPU& c) {
     if (std::getenv("NX_P5R_TRACE_INTERVAL") && traced++ < 40)
         log("p5r: frame interval set to %u on %llx from %s", uint32_t(c.x[1]), (unsigned long long)c.x[0], describe(c.x[30]).c_str());
     call(c, g_interval_setter);
+
+    static uint64_t last_cull_eval = 0, last_cull_hidden = 0;
+    static uint64_t cull_log_frame = 0;
+    if (++cull_log_frame % 300 == 0) {
+        uint64_t ev = g_cull_eval.load(std::memory_order_relaxed);
+        uint64_t hd = g_cull_hidden.load(std::memory_order_relaxed);
+        uint64_t d_ev = ev - last_cull_eval;
+        uint64_t d_hd = hd - last_cull_hidden;
+        last_cull_eval = ev;
+        last_cull_hidden = hd;
+        if (d_ev > 0) {
+            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%) over 300 frames",
+                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev));
+        }
+    }
 }
 
 // NX_P5R_CULL_CHECK=1 (PROGRESO 72): P5R's per-model culling job (main+ab0f50(job), job = {model, states}, run by
@@ -424,13 +462,96 @@ int reject_plane(const Planes& pl, const float* b, float* dist = nullptr, float*
 }
 
 void cull_job_hook(CPU& c) {
-    const uint64_t job = c.x[0], model = ld<uint64_t>(job), states = ld<uint64_t>(job + 8);
+    const uint64_t job = c.x[0];
+    if (!job) return;
+    const uint64_t model = ld<uint64_t>(job), states = ld<uint64_t>(job + 8);
     const uint64_t sp = c.x[31];
-    const Planes before = read_planes();
+    static const bool trace_cull = std::getenv("NX_P5R_CULL_CHECK") != nullptr;
+    const Planes before = trace_cull ? read_planes() : Planes{};
     call(c, g_cull_job);
     const Planes after = read_planes();
     const uint64_t list = model ? ld<uint64_t>(model + 0x38) : 0;
     if (!list || !states) return;
+
+    static const bool dist_cull_on = [] {
+        const char* e = std::getenv("NX_P5R_DIST_CULL");
+        return !(e && e[0] == '0');
+    }();
+
+    if (dist_cull_on && after.ptr) {
+        const int n = int(ld<uint32_t>(list + 8));
+        const int64_t stride = int32_t(ld<uint32_t>(list + 4)), sstride = int32_t(ld<uint32_t>(states + 4));
+        const uint64_t arr = ld<uint64_t>(list + 0x10), sarr = ld<uint64_t>(states + 0x10);
+        if (arr && sarr && stride > 0 && sstride > 0) {
+            const float* p = after.p[0];  // Near plane normal (p[0], p[1], p[2]) and distance (p[3])
+            const uint64_t box = (sp - 0x200) & ~uint64_t(15);
+            for (int i = 0; i < n && i < 1024; i++) {
+                const uint64_t mesh = ld<uint64_t>(arr + stride * i);
+                if (!mesh) continue;
+                uint32_t flags = ld<uint32_t>(mesh + 0x20);
+                if ((flags >> 14) & 1) continue;  // Already hidden by engine frustum/occlusion culling
+
+                const uint64_t node = ld<uint64_t>(mesh + 8);
+                const uint64_t local_bounds = mesh + 0x90;
+                if (!node || !local_bounds) continue;
+
+                CPU scratch = c;
+                scratch.x[31] = sp;
+                const uint64_t matrix = guest_fn(scratch, 0xfa9460, node);
+                if (!matrix) continue;
+                guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
+
+                float b[19];
+                for (int k = 0; k < 19; k++) {
+                    const uint32_t w = ld<uint32_t>(box + 4 * k);
+                    std::memcpy(&b[k], &w, 4);
+                }
+
+                // Signed distance of box center from near plane along camera view axis
+                const float view_dist = p[0] * b[0] + p[1] * b[1] + p[2] * b[2] - p[3];
+                if (!std::isfinite(view_dist) || view_dist <= 2.5f) continue;  // Protect immediate player interaction bubble
+
+                const float r16 = std::fabs(b[16]), r17 = std::fabs(b[17]), r18 = std::fabs(b[18]);
+                if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
+                const float radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
+
+                g_cull_eval.fetch_add(1, std::memory_order_relaxed);
+
+                // Progressive tiered small-object / clutter distance culling:
+                // Money bundles & small clutter boxes on vault shelves have radius ~0.15m - 0.35m.
+                // Steel rack frames have radius > 2.5m, walls/floors > 8.0m, characters > 1.0m.
+                bool cull = false;
+                const float ratio = radius / view_dist;
+
+                if (view_dist < 5.0f) {
+                    // Very close (2.5m - 5m): Only cull tiny sub-decimeter clutter
+                    if (radius < 0.08f) cull = true;
+                } else if (view_dist < 10.0f) {
+                    // Close (5m - 10m): Cull small shelf boxes (e.g. money stacks on the next rack row)
+                    if (radius < 0.28f || ratio < 0.022f) cull = true;
+                } else if (view_dist < 20.0f) {
+                    // Medium (10m - 20m): Cull props and clutter on shelves 2-3 rows back
+                    if (radius < 0.45f || ratio < 0.025f) cull = true;
+                } else if (view_dist < 40.0f) {
+                    // Far (20m - 40m): Cull clutter on shelves across the room (e.g. from stairs)
+                    if (radius < 0.85f || ratio < 0.025f) cull = true;
+                } else {
+                    // Very far (> 40m): Cull anything under 2.0m across large vault halls
+                    if (radius < 2.0f || ratio < 0.030f) cull = true;
+                }
+
+                if (cull) {
+                    g_cull_hidden.fetch_add(1, std::memory_order_relaxed);
+                    flags |= (1u << 14);
+                    st<uint32_t>(mesh + 0x20, flags);
+                    st<uint8_t>(sarr + sstride * i + 0x10, 1);
+                }
+            }
+        }
+    }
+
+    if (!trace_cull) return;
+
     static std::mutex lock;
     static std::unordered_map<uint64_t, bool> hidden_before;
     static std::unordered_map<uint64_t, uint64_t> hidden_since;  // mesh -> frame it was hidden
@@ -558,18 +679,18 @@ void game::after_init() {
     const LoadedModule* m = module_at(find_symbol("nnMain"));
     if (m && (g_interval_setter = hook_function(m->base + 0x1048ee0, interval_setter_hook))) {
         g_main_base = m->base;
-        if (std::getenv("NX_P5R_CULL_CHECK") && !(g_cull_job = hook_function(m->base + 0xab0f50, cull_job_hook)))
-            log("p5r: the culling job could not be hooked: NX_P5R_CULL_CHECK off");
+        if (!(g_cull_job = hook_function(m->base + 0xab0f50, cull_job_hook)))
+            log("p5r: the culling job could not be hooked");
     } else {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend";
+static constexpr const char* kPerfBuildTag = "lowend-r35";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (redundancy filtering for pipelines/descriptors/vertex streams, 8K dedup cache, CmdList pool)",
+    log("p5r perf build: %s (progressive vault clutter culling, balanced worker scheduling, state redundancy filtering)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:

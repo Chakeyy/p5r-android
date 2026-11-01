@@ -383,12 +383,16 @@ static void thread_main(void* p) {
     std::snprintf(name, sizeof name, "g%llx", (unsigned long long)t->id);
     plat::set_thread_name(name);
 
-    // On 2-big-core + 6-little-core SoCs (e.g. Helio G99: 2x Cortex-A76 + 6x Cortex-A55),
-    // give lower-priority / core-2/3 background guest worker threads a positive nice
-    // value so the Linux CFS scheduler places them on the 6x Cortex-A55 cores and keeps
-    // the 2x Cortex-A76 big cores free for the Vulkan replay thread and main game thread.
-    if (t->prio > 44 || t->core >= 2) {
-        plat::set_thread_priority(4);
+    // On asymmetric big.LITTLE / DynamIQ mobile SoCs (e.g. 2 Big + 6 Little CPU cores),
+    // guest background worker threads (core >= 2, prio >= 44) should run at nice 0 (standard foreground priority)
+    // with perf_hint_thread() enabled.
+    // Over-elevating worker threads can cause them to contend with the Main thread (nice -4)
+    // and Vulkan Replay thread (nice -8) for Big cores, leading to excessive context switching.
+    // At nice 0, Linux EAS schedules background tasks across energy-efficient Little cores
+    // while keeping Big cores available for the Replay and Main render threads.
+    if (t->core >= 2 || t->prio >= 44) {
+        plat::set_thread_priority(0);
+        plat::perf_hint_thread();
     }
 
     call(t->ctx, t->entry);
