@@ -18,18 +18,28 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
     };
     switch (c.op) {
         case Cmd::SetViewport:
-            std::memcpy(s.viewport, c.i, sizeof s.viewport), s.has_viewport = true;
-            s.descriptors_dirty = true;
+            if (!s.has_viewport || std::memcmp(s.viewport, c.i, sizeof s.viewport) != 0) {
+                std::memcpy(s.viewport, c.i, sizeof s.viewport);
+                s.has_viewport = true;
+                s.descriptors_dirty = true;
+            }
             break;
         case Cmd::SetRasterizerDiscard: s.rasterizer_discard = c.n != 0; break;
-        case Cmd::SetPrimitiveRestart:
-            s.restart = c.n != 0, s.restart_index = uint32_t(c.a[0]);
-            s.pipeline_dirty = true;
+        case Cmd::SetPrimitiveRestart: {
+            bool rst = c.n != 0;
+            uint32_t idx = uint32_t(c.a[0]);
+            if (s.restart != rst || s.restart_index != idx) {
+                s.restart = rst, s.restart_index = idx;
+                s.pipeline_dirty = true;
+            }
             break;
+        }
         case Cmd::BindImage:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) {
-                s.images[c.i[0]][c.i[1]] = c.a[0];
-                s.descriptors_dirty = true;
+                if (s.images[c.i[0]][c.i[1]] != c.a[0]) {
+                    s.images[c.i[0]][c.i[1]] = c.a[0];
+                    s.descriptors_dirty = true;
+                }
             }
             break;
         case Cmd::DispatchCompute:
@@ -42,32 +52,50 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             occlusion_render_enable();
             break;
         case Cmd::SetScissor:
-            std::memcpy(s.scissor, c.i, sizeof s.scissor), s.has_scissor = true;
+            if (!s.has_scissor || std::memcmp(s.scissor, c.i, sizeof s.scissor) != 0) {
+                std::memcpy(s.scissor, c.i, sizeof s.scissor);
+                s.has_scissor = true;
+            }
             break;
         case Cmd::SetDepthRange:
-            s.depth_near = c.f[0], s.depth_far = c.f[1];
-            s.descriptors_dirty = true;
+            if (s.depth_near != c.f[0] || s.depth_far != c.f[1]) {
+                s.depth_near = c.f[0], s.depth_far = c.f[1];
+                s.descriptors_dirty = true;
+            }
             break;
         case Cmd::BindProgram: {
-            s.program = c.a[0];
             const uint32_t bits = c.mask ? c.mask : (1u << kStages) - 1;  // NVN_SHADER_STAGE_*_BIT, 1 << stage
-            for (int k = 0; k < kStages; k++)
-                if (bits & (1u << k)) s.stage_programs[k] = c.a[0];
-            s.pipeline_dirty = true;
-            s.descriptors_dirty = true;
-            s.vertex_dirty = true;
+            bool prog_changed = (s.program != c.a[0]);
+            s.program = c.a[0];
+            for (int k = 0; k < kStages; k++) {
+                if (bits & (1u << k)) {
+                    if (s.stage_programs[k] != c.a[0]) {
+                        s.stage_programs[k] = c.a[0];
+                        prog_changed = true;
+                    }
+                }
+            }
+            if (prog_changed) {
+                s.pipeline_dirty = true;
+                s.descriptors_dirty = true;
+                s.vertex_dirty = true;
+            }
             break;
         }
         case Cmd::BindUniformBuffer:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 18) {
-                s.uniforms[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
-                s.descriptors_dirty = true;
+                if (s.uniforms[c.i[0]][c.i[1]].address != c.a[0] || s.uniforms[c.i[0]][c.i[1]].size != c.a[1]) {
+                    s.uniforms[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
+                    s.descriptors_dirty = true;
+                }
             }
             break;
         case Cmd::BindStorageBuffer:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) {
-                s.storage[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
-                s.descriptors_dirty = true;
+                if (s.storage[c.i[0]][c.i[1]].address != c.a[0] || s.storage[c.i[0]][c.i[1]].size != c.a[1]) {
+                    s.storage[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
+                    s.descriptors_dirty = true;
+                }
             }
             break;
         case Cmd::BindDeferred: {
@@ -93,67 +121,99 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         }
         case Cmd::BindTexture:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 32) {
-                s.textures[c.i[0]][c.i[1]] = c.a[0];
-                s.descriptors_dirty = true;
+                if (s.textures[c.i[0]][c.i[1]] != c.a[0]) {
+                    s.textures[c.i[0]][c.i[1]] = c.a[0];
+                    s.descriptors_dirty = true;
+                }
             }
             break;
         case Cmd::BindVertexBuffer:
             if (c.i[0] >= 0 && c.i[0] < 16) {
-                s.vertex_buffers[c.i[0]] = {c.a[0], c.a[1]};
-                s.vertex_dirty = true;
+                if (s.vertex_buffers[c.i[0]].address != c.a[0] || s.vertex_buffers[c.i[0]].size != c.a[1]) {
+                    s.vertex_buffers[c.i[0]] = {c.a[0], c.a[1]};
+                    s.vertex_dirty = true;
+                }
             }
             break;
-        case Cmd::SetTexturePool: s.texture_pool = c.a[0]; s.descriptors_dirty = true; break;
-        case Cmd::SetSamplerPool: s.sampler_pool = c.a[0]; s.descriptors_dirty = true; break;
+        case Cmd::SetTexturePool:
+            if (s.texture_pool != c.a[0]) {
+                s.texture_pool = c.a[0];
+                s.descriptors_dirty = true;
+            }
+            break;
+        case Cmd::SetSamplerPool:
+            if (s.sampler_pool != c.a[0]) {
+                s.sampler_pool = c.a[0];
+                s.descriptors_dirty = true;
+            }
+            break;
         case Cmd::BindVertexAttribs:
             if (auto* p = blob(c.n * sizeof(VertexAttrib))) {
-                s.attribs.assign(reinterpret_cast<const VertexAttrib*>(p), reinterpret_cast<const VertexAttrib*>(p) + c.n);
-                s.pipeline_dirty = true;
-                s.vertex_dirty = true;
+                if (s.attribs.size() != c.n || std::memcmp(s.attribs.data(), p, c.n * sizeof(VertexAttrib)) != 0) {
+                    s.attribs.assign(reinterpret_cast<const VertexAttrib*>(p), reinterpret_cast<const VertexAttrib*>(p) + c.n);
+                    s.pipeline_dirty = true;
+                    s.vertex_dirty = true;
+                }
             }
             break;
         case Cmd::BindVertexStreams:
             if (auto* p = blob(c.n * sizeof(VertexStream))) {
-                s.streams.assign(reinterpret_cast<const VertexStream*>(p), reinterpret_cast<const VertexStream*>(p) + c.n);
-                s.pipeline_dirty = true;
+                if (s.streams.size() != c.n || std::memcmp(s.streams.data(), p, c.n * sizeof(VertexStream)) != 0) {
+                    s.streams.assign(reinterpret_cast<const VertexStream*>(p), reinterpret_cast<const VertexStream*>(p) + c.n);
+                    s.pipeline_dirty = true;
+                }
             }
             break;
         case Cmd::BindBlendState:
             if (auto* p = blob(sizeof(BlendTarget))) {
                 BlendTarget b;
                 std::memcpy(&b, p, sizeof b);
-                if (b.target < 8) s.blend[b.target] = b;
-                s.pipeline_dirty = true;
+                if (b.target < 8) {
+                    if (std::memcmp(&s.blend[b.target], &b, sizeof b) != 0) {
+                        s.blend[b.target] = b;
+                        s.pipeline_dirty = true;
+                    }
+                }
             }
             break;
         case Cmd::BindColorState:
             if (auto* p = blob(sizeof(ColorStateInfo))) {
-                std::memcpy(&s.color, p, sizeof s.color);
-                s.pipeline_dirty = true;
+                if (std::memcmp(&s.color, p, sizeof s.color) != 0) {
+                    std::memcpy(&s.color, p, sizeof s.color);
+                    s.pipeline_dirty = true;
+                }
             }
             break;
         case Cmd::BindChannelMaskState:
             if (auto* p = blob(sizeof(ChannelMaskInfo))) {
-                std::memcpy(&s.mask, p, sizeof s.mask);
-                s.pipeline_dirty = true;
+                if (std::memcmp(&s.mask, p, sizeof s.mask) != 0) {
+                    std::memcpy(&s.mask, p, sizeof s.mask);
+                    s.pipeline_dirty = true;
+                }
             }
             break;
         case Cmd::BindDepthStencilState:
             if (auto* p = blob(sizeof(DepthStencilInfo))) {
-                std::memcpy(&s.depth, p, sizeof s.depth);
-                s.pipeline_dirty = true;
-                s.descriptors_dirty = true;
+                if (std::memcmp(&s.depth, p, sizeof s.depth) != 0) {
+                    std::memcpy(&s.depth, p, sizeof s.depth);
+                    s.pipeline_dirty = true;
+                    s.descriptors_dirty = true;
+                }
             }
             break;
         case Cmd::BindPolygonState:
             if (auto* p = blob(sizeof(PolygonInfo))) {
-                std::memcpy(&s.polygon, p, sizeof s.polygon);
-                s.pipeline_dirty = true;
+                if (std::memcmp(&s.polygon, p, sizeof s.polygon) != 0) {
+                    std::memcpy(&s.polygon, p, sizeof s.polygon);
+                    s.pipeline_dirty = true;
+                }
             }
             break;
         case Cmd::BindMultisampleState:
-            s.alpha_to_coverage = c.n != 0;
-            s.pipeline_dirty = true;
+            if (s.alpha_to_coverage != (c.n != 0)) {
+                s.alpha_to_coverage = c.n != 0;
+                s.pipeline_dirty = true;
+            }
             break;
         case Cmd::SetBlendColor: std::memcpy(s.blend_color, c.f, sizeof s.blend_color); break;
         case Cmd::UpdateUniformBuffer: {  // (buffer address, size, offset, data): written in order, like the GPU

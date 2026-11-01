@@ -707,21 +707,44 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
 
 // Texture bindings of a program's stages and their handles, into g_textures. kNeedBreak: one needs a transfer or a
 // layout change (so no render pass may be open while the sets are built); kSampledPending: one has a pending clear.
+static thread_local const ShaderInfo* s_cached_sh0 = nullptr;
+static thread_local const ShaderInfo* s_cached_sh1 = nullptr;
+static thread_local size_t s_cached_sh_count = 0;
+static thread_local uint32_t s_cached_need_break = 0;
+static thread_local bool s_cached_biased = false;
+
 uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
     DrawTextures& t = g_textures;
     if (draw_slow(kSlowScratch))
         t = DrawTextures{};
-    else
+
+    const size_t n_sh = shaders.size();
+    const ShaderInfo* sh0 = n_sh > 0 ? shaders[0] : nullptr;
+    const ShaderInfo* sh1 = n_sh > 1 ? shaders[1] : nullptr;
+    const bool biased = g_state.depth.depth_test;
+
+    const bool shaders_same = (n_sh == s_cached_sh_count && sh0 == s_cached_sh0 && sh1 == s_cached_sh1 && s_cached_sh_count > 0);
+
+    if (!shaders_same || draw_slow(kSlowScratch)) {
         t.bindings.clear();
-    uint32_t out = 0;
-    for (const ShaderInfo* s : shaders)
-        for (const DescriptorBinding& b : s->refl.bindings) {
-            if (b.set == 2) t.bindings.push_back({s, &b});
-            if (b.set == 3) out |= kNeedBreak;  // storage images change layout
-        }
-    t.handles.assign(t.bindings.size(), 0);
-    t.resolved.assign(t.bindings.size(), ResolvedTexture{});
+        s_cached_need_break = 0;
+        for (const ShaderInfo* s : shaders)
+            for (const DescriptorBinding& b : s->refl.bindings) {
+                if (b.set == 2) t.bindings.push_back({s, &b});
+                if (b.set == 3) s_cached_need_break |= kNeedBreak;  // storage images change layout
+            }
+        s_cached_sh0 = sh0;
+        s_cached_sh1 = sh1;
+        s_cached_sh_count = n_sh;
+        t.handles.assign(t.bindings.size(), 0);
+        t.resolved.assign(t.bindings.size(), ResolvedTexture{});
+    }
+
+    uint32_t out = s_cached_need_break;
     const uint64_t submit_ns = submit_start_ns();
+    const bool biased_changed = (biased != s_cached_biased);
+    s_cached_biased = biased;
+
     for (size_t k = 0; k < t.bindings.size(); k++) {
         auto [s, b] = t.bindings[k];
         int st = api_stage(s->stage);
@@ -733,31 +756,34 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
             const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
             if (p && uint64_t(b->nvn.word) * 4 + 4 <= r.size) handle = *reinterpret_cast<const uint32_t*>(p + b->nvn.word * 4);
         }
-        t.handles[k] = handle;
+
         ResolvedTexture& r = t.resolved[k];
-        uint64_t texture = 0;
-        // A pool entry naming a texture that no longer exists samples the dummy, like no texture: it ended the
-        // render pass at every draw (~1.4M times in a run, docs/nvn/DEBUG.md #34).
-        if (HandleSlot* slot = handle_slot(handle)) {
-            if (slot->object) texture = slot->texture, slot->object->last_sampled = submit_ns;
-            r.sampler = slot->sampler, r.view = slot->view;
-            // The same for every draw (a cache key built per binding otherwise, nvn_sampler.cpp). NX_LOD_BIAS applies
-            // to the 3D draws only: those that test depth.
-            const bool biased = g_state.depth.depth_test;
-            VkSampler& vk = slot->vk_sampler[(b->image.depth ? 1 : 0) + (biased ? 2 : 0)];
-            if (!vk) vk = sampler_for(slot->sampler, b->image.depth, biased);
-            r.vk_sampler = vk;
-        } else {
-            lookup_handle(handle, texture, r.sampler, &r.view);
-            if (Texture* sampled = texture ? get<Texture>(texture) : nullptr)
-                sampled->last_sampled = submit_ns;
-            else
-                texture = 0;
+        if (handle != t.handles[k] || !shaders_same || biased_changed) {
+            t.handles[k] = handle;
+            uint64_t texture = 0;
+            // A pool entry naming a texture that no longer exists samples the dummy, like no texture: it ended the
+            // render pass at every draw (~1.4M times in a run, docs/nvn/DEBUG.md #34).
+            if (HandleSlot* slot = handle_slot(handle)) {
+                if (slot->object) texture = slot->texture, slot->object->last_sampled = submit_ns;
+                r.sampler = slot->sampler, r.view = slot->view;
+                // The same for every draw (a cache key built per binding otherwise, nvn_sampler.cpp). NX_LOD_BIAS applies
+                // to the 3D draws only: those that test depth.
+                VkSampler& vk = slot->vk_sampler[(b->image.depth ? 1 : 0) + (biased ? 2 : 0)];
+                if (!vk) vk = sampler_for(slot->sampler, b->image.depth, biased);
+                r.vk_sampler = vk;
+            } else {
+                lookup_handle(handle, texture, r.sampler, &r.view);
+                if (Texture* sampled = texture ? get<Texture>(texture) : nullptr)
+                    sampled->last_sampled = submit_ns;
+                else
+                    texture = 0;
+            }
+            r.texture = texture;
         }
-        r.texture = texture;
-        if (texture ? !sampled_ready(texture) : !dummy_ready(b->image)) out |= kNeedBreak;
-        if (!texture) continue;
-        GpuImage* img = image_of(texture);
+
+        if (r.texture ? !sampled_ready(r.texture) : !dummy_ready(b->image)) out |= kNeedBreak;
+        if (!r.texture) continue;
+        GpuImage* img = image_of(r.texture);
         // Sampling one of the open pass's targets (a depth buffer read back by the character lighting) needs what
         // was rendered stored first: a fresh pass. SetRenderTargets used to end every pass, which did this by chance
         // (docs/nvn/DEBUG.md #35). Only when a draw of this pass wrote it (pass_wrote, nvn_draw.cpp).
@@ -816,6 +842,10 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
 }
 
 void sets_begin_submit() {
+    s_cached_sh_count = 0;
+    s_cached_sh0 = nullptr;
+    s_cached_sh1 = nullptr;
+    s_cached_need_break = 0;
     uint64_t mark = t_replay_mark, epoch = current_epoch();
     if (!mark || mark != g_handle_mark || epoch != g_handle_epoch || g_handle_used > kHandleSlots / 2) {
         handles_reset();
