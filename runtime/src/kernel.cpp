@@ -28,6 +28,7 @@ namespace kstate {  // kernel_state.h
 
 std::recursive_mutex g_k;
 std::vector<KThread*> g_sync_waiters;
+std::atomic<uint32_t> g_sync_waiter_count{0};
 std::unordered_map<uint32_t, std::shared_ptr<KObject>> g_handles;
 uint32_t g_next_handle = 0x10000;
 std::atomic<uint64_t> g_next_thread_id{0x50};
@@ -69,6 +70,7 @@ void handle_close(uint32_t h) {
 // Mutex, condition variable and address waiters are woken one by one (wake()): one global condition variable woke
 // every waiting thread of the process on each signal (the engine's job system broadcasts all the time).
 void notify_all() {
+    if (g_sync_waiter_count.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard lk(g_k);
     for (KThread* t : g_sync_waiters) t->cv.notify_one();
 }
@@ -350,9 +352,13 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
     // between its own check and this svc was lost (P5R's video decoder thread never saw its exit event; the game
     // waited for that thread for ever).
     g_sync_waiters.push_back(self);
+    g_sync_waiter_count.fetch_add(1, std::memory_order_release);
     struct Leave {
         KThread* t;
-        ~Leave() { remove(g_sync_waiters, t); }
+        ~Leave() {
+            remove(g_sync_waiters, t);
+            g_sync_waiter_count.fetch_sub(1, std::memory_order_release);
+        }
     } leave{self};
     for (;;) {
         if (self->cancel) {

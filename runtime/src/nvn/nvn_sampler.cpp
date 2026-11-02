@@ -38,12 +38,23 @@ VkSampler sampler_for(const SamplerInfo& s, bool shadow, bool biased) {
     // of before held, compared the same way), hashed; no allocation on a hit.
     using Key = ByteKey<sizeof(SamplerInfo) + 2>;
     static std::unordered_map<Key, VkSampler, ByteKeyHash> cache;
+    static thread_local Key s_last_key{};
+    static thread_local VkSampler s_last_sampler = VK_NULL_HANDLE;
+
     Key key;
     std::memcpy(key.b, &s, sizeof s);
     key.b[sizeof s] = shadow ? '1' : '0';
     key.b[sizeof s + 1] = biased ? '1' : '0';
-    auto& v = cache[key];
-    if (v) return v;
+
+    if (s_last_sampler && std::memcmp(s_last_key.b, key.b, sizeof(key.b)) == 0)
+        return s_last_sampler;
+
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        s_last_key = key;
+        s_last_sampler = it->second;
+        return it->second;
+    }
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     // NVN min filter: 0 nearest, 1 linear, 2 nearest mip nearest, 3 linear mip nearest, 4 nearest mip linear,
     // 5 linear mip linear; mag: 0 nearest, 1 linear.
@@ -85,8 +96,12 @@ VkSampler sampler_for(const SamplerInfo& s, bool shadow, bool biased) {
     ci.borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
                      : s.border[3] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
                                           : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    p_vkCreateSampler(vk_device(), &ci, nullptr, &v);
-    return v;
+    VkSampler sm = VK_NULL_HANDLE;
+    p_vkCreateSampler(vk_device(), &ci, nullptr, &sm);
+    cache[key] = sm;
+    s_last_key = key;
+    s_last_sampler = sm;
+    return sm;
 }
 
 // ---- pitch-linear texture contents (moved from nvn_pipeline.cpp) ------------------------------------------------

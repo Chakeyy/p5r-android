@@ -362,8 +362,20 @@ uint64_t handle_bits(H h) {
 // d.sets from the cache or newly made, the writes of the cached ones dropped and the rest pointed at their new sets.
 void resolve_sets(const ProgramLayout& layout) {
     Descriptors& d = g_sets;
+    if (d.writes.empty()) {
+        for (uint32_t k = 0; k < 4; k++) d.sets[k] = VK_NULL_HANDLE;
+        return;
+    }
+    uint32_t set_counts[4] = {};
+    for (size_t i = 0; i < d.writes.size(); i++) {
+        uint8_t s = d.set_index[i];
+        if (s < 4) set_counts[s]++;
+    }
     for (uint32_t k = 0; k < 4; k++) {
+        d.sets[k] = VK_NULL_HANDLE;
+        if (!set_counts[k]) continue;
         d.key.clear();
+        d.key.reserve(set_counts[k]);
         uint64_t h = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
         for (size_t i = 0; i < d.writes.size(); i++) {
             if (d.set_index[i] != k) continue;
@@ -379,7 +391,6 @@ void resolve_sets(const ProgramLayout& layout) {
                 h = hash_step(h, v);
             d.key.push_back(e);
         }
-        d.sets[k] = VK_NULL_HANDLE;
         if (d.key.empty()) continue;
         CachedSet* slot = nullptr;
         for (uint32_t probe = uint32_t(h >> 32);; probe++) {

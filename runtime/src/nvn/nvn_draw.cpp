@@ -1129,13 +1129,15 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 void linear_write_back_pause(bool paused) { g_linear_paused.store(paused, std::memory_order_relaxed); }
 
 void linear_targets_write_back(VkCommandBuffer cb) {  // before the submit ends, outside any pass
+    if (g_linear_targets.empty()) return;
     static uint64_t copies = 0, bytes = 0, next_log = 0;
     struct Copy {
         GpuImage* img;
         const Texture* tx;
         uint32_t texel;
     };
-    std::vector<Copy> todo;
+    static thread_local std::vector<Copy> todo;
+    todo.clear();
     for (uint64_t texture : g_linear_targets) {
         const Texture* tx = get<Texture>(texture);
         GpuImage* img = tx ? image_of(texture) : nullptr;
@@ -1150,9 +1152,19 @@ void linear_targets_write_back(VkCommandBuffer cb) {  // before the submit ends,
     }
     g_linear_targets.clear();
     if (todo.empty()) return;
-    // One barrier into the copies and one out of them (the runtime's transition() is a full barrier per image: twelve
-    // of them for P5R's six levels cost ~2 ms of the Adreno 610's frame), waiting only for colour writes and copies.
-    std::vector<VkImageMemoryBarrier> to(todo.size()), back(todo.size());
+    // One barrier into the copies and one out of them. Stack buffers avoid per-submit heap allocations.
+    constexpr size_t kStackBarriers = 16;
+    VkImageMemoryBarrier to_stack[kStackBarriers];
+    VkImageMemoryBarrier back_stack[kStackBarriers];
+    std::vector<VkImageMemoryBarrier> to_heap, back_heap;
+    VkImageMemoryBarrier* to = to_stack;
+    VkImageMemoryBarrier* back = back_stack;
+    if (todo.size() > kStackBarriers) {
+        to_heap.resize(todo.size());
+        back_heap.resize(todo.size());
+        to = to_heap.data();
+        back = back_heap.data();
+    }
     for (size_t k = 0; k < todo.size(); k++) {
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1168,7 +1180,7 @@ void linear_targets_write_back(VkCommandBuffer cb) {  // before the submit ends,
     }
     p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, uint32_t(to.size()), to.data());
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, uint32_t(todo.size()), to);
     for (const Copy& c : todo) {
         const uint64_t size = uint64_t(c.tx->stride) * (c.tx->height - 1) + uint64_t(c.tx->width) * c.texel;
         Upload up = upload_alloc(size, 16);

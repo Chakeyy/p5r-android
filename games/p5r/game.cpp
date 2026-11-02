@@ -693,12 +693,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r39";
+static constexpr const char* kPerfBuildTag = "lowend-r40";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (direct near-plane/mesh culling, renderpass MRU cache, scudo secondary cache)",
+    log("p5r perf build: %s (lockless notify_all, 1-pass descriptor sets, sampler MRU, zero-alloc barriers)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
