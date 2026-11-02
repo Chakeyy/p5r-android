@@ -23,6 +23,8 @@
 
 namespace nx::nvn {
 
+bool g_occl_object = false;
+
 using namespace replay;
 using namespace vk;
 
@@ -34,7 +36,6 @@ bool g_pool_reset = false;  // every query reset once (the pool's first submit)
 uint32_t g_used = 0;        // this submit's queries (begun and ended around one draw each)
 uint32_t g_copied = 0;      // [0, g_copied): their results are in the upload ring, at g_result
 std::vector<Upload> g_result;
-bool g_object = false;           // between a ResetCounter of samples passed and its ReportCounter
 int32_t g_object_query = -1;     // its draw's query (-1: none yet)
 uint32_t g_object_draws = 0;     // draws since the ResetCounter
 std::unordered_map<uint64_t, int32_t> g_reports;  // report address -> query (-1: unknown)
@@ -92,7 +93,7 @@ void copy_results(VkCommandBuffer cb) {
 }  // namespace
 
 void occlusion_begin_submit(VkCommandBuffer cb) {
-    g_object = false, g_object_query = -1, g_object_draws = 0, g_conditional = -1;
+    g_occl_object = false, g_object_query = -1, g_object_draws = 0, g_conditional = -1;
     if (!on()) return;
     if (!g_pool) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -119,24 +120,24 @@ void occlusion_begin_submit(VkCommandBuffer cb) {
 
 void occlusion_reset(VkCommandBuffer, const Cmd& c, const Targets& t) {
     trace("reset", c, t);
-    if (c.n == 1) g_object = true, g_object_query = -1, g_object_draws = 0;  // samples passed
+    if (c.n == 1) g_occl_object = true, g_object_query = -1, g_object_draws = 0;  // samples passed
 }
 
 void occlusion_report(VkCommandBuffer, const Cmd& c, const Targets& t) {
     if (c.n != 1) return;
     trace("report", c, t);
     if (!on()) {
-        g_object = false;
+        g_occl_object = false;
         return;
     }
     // One draw since the ResetCounter: its query. Otherwise unknown (drawn).
-    const bool one = g_object && g_object_draws == 1 && g_object_query >= 0;
-    if (g_object && g_object_draws > 1) g_stats_occl.several++;
+    const bool one = g_occl_object && g_object_draws == 1 && g_object_query >= 0;
+    if (g_occl_object && g_object_draws > 1) g_stats_occl.several++;
     g_reports[c.a[0]] = one ? g_object_query : -1;
-    g_object = false;
+    g_occl_object = false;
 }
 
-bool occlusion_object_skipped() { return g_object && !on() && !zero_draws_on(); }
+bool occlusion_object_skipped() { return g_occl_object && !on() && !zero_draws_on(); }
 
 void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t) {
     trace("conditional", c, t);
@@ -161,8 +162,8 @@ void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t) {
 
 void occlusion_render_enable() { g_conditional = -1; }  // SetRenderEnable ends the conditional draws
 
-int32_t occlusion_query_begin(VkCommandBuffer cb) {
-    if (!g_object || !g_pool) return -1;
+int32_t occlusion_query_begin_slow(VkCommandBuffer cb) {
+    if (!g_occl_object || !g_pool) return -1;
     g_object_draws++;
     if (g_used >= kQueries) {
         g_stats_occl.used_up++;
@@ -175,7 +176,7 @@ int32_t occlusion_query_begin(VkCommandBuffer cb) {
     return q;
 }
 
-void occlusion_query_end(VkCommandBuffer cb, int32_t q) {
+void occlusion_query_end_slow(VkCommandBuffer cb, int32_t q) {
     if (q >= 0) p_vkCmdEndQuery(cb, g_pool, uint32_t(q));
 }
 

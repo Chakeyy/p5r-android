@@ -174,6 +174,7 @@ static void unlock_mutex(uint64_t addr) {
 // ---- svc implementations --------------------------------------------------------------------------------------
 
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
+    if (load32(addr) != (owner | kHandleWaitMask)) return 0;
     std::unique_lock lk(g_k);
     KThread* self = t_self;
     if (load32(addr) != (owner | kHandleWaitMask)) return 0;
@@ -333,12 +334,25 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
 }
 
 static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count, int64_t timeout) {
+    if (count <= 0 || count > 64) return 0xF001;
     std::unique_lock lk(g_k);
-    std::vector<std::shared_ptr<KObject>> objs;
+    constexpr int kStackObjs = 8;
+    std::shared_ptr<KObject> stack_objs[kStackObjs];
+    std::vector<std::shared_ptr<KObject>> heap_objs;
+    std::shared_ptr<KObject>* objs = stack_objs;
+    if (count > kStackObjs) {
+        heap_objs.resize(count);
+        objs = heap_objs.data();
+    }
     for (int i = 0; i < count; i++) {
-        auto o = handle_get(ld<uint32_t>(handles + 4 * i));
-        if (!o) return 0xE401;  // invalid handle
-        objs.push_back(o);
+        uint32_t h = ld<uint32_t>(handles + 4 * i);
+        if (h == kPseudoCurrentThread && t_self) {
+            objs[i] = t_self->self.lock();
+        } else {
+            auto it = g_handles.find(h);
+            objs[i] = (it == g_handles.end()) ? nullptr : it->second;
+        }
+        if (!objs[i]) return 0xE401;  // invalid handle
     }
     auto ready = [&]() -> int {
         for (int i = 0; i < count; i++)

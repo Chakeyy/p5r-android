@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 #include "nvn_draw_state.h"
 #include "platform.h"
 
@@ -400,6 +404,58 @@ void apply_write_back(const WriteBack& w) {
         from = copy.data();
     }
     uint64_t k = 0, changed = 0;
+    auto apply8 = [&](uint64_t diff, size_t off) {
+        if (!diff) return;
+        changed++;
+        uint32_t lo = static_cast<uint32_t>(diff);
+        uint32_t hi = static_cast<uint32_t>(diff >> 32);
+        if (lo && hi) {
+            std::memcpy(w.to + off, from + off, 8);
+        } else if (lo) {
+            std::memcpy(w.to + off, from + off, 4);
+        } else {
+            std::memcpy(w.to + off + 4, from + off + 4, 4);
+        }
+    };
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    for (; k + 64 <= w.size; k += 64) {
+        uint8x16_t f0 = vld1q_u8(from + k);
+        uint8x16_t w0 = vld1q_u8(was + k);
+        uint8x16_t f1 = vld1q_u8(from + k + 16);
+        uint8x16_t w1 = vld1q_u8(was + k + 16);
+        uint8x16_t f2 = vld1q_u8(from + k + 32);
+        uint8x16_t w2 = vld1q_u8(was + k + 32);
+        uint8x16_t f3 = vld1q_u8(from + k + 48);
+        uint8x16_t w3 = vld1q_u8(was + k + 48);
+
+        uint8x16_t diff0 = veorq_u8(f0, w0);
+        uint8x16_t diff1 = veorq_u8(f1, w1);
+        uint8x16_t diff2 = veorq_u8(f2, w2);
+        uint8x16_t diff3 = veorq_u8(f3, w3);
+
+        uint8x16_t or01 = vorrq_u8(diff0, diff1);
+        uint8x16_t or23 = vorrq_u8(diff2, diff3);
+        uint8x16_t or_all = vorrq_u8(or01, or23);
+
+        uint64x2_t d64 = vreinterpretq_u64_u8(or_all);
+        if ((vgetq_lane_u64(d64, 0) | vgetq_lane_u64(d64, 1)) == 0) continue;
+
+        uint64x2_t diff0_64 = vreinterpretq_u64_u8(diff0);
+        uint64x2_t diff1_64 = vreinterpretq_u64_u8(diff1);
+        uint64x2_t diff2_64 = vreinterpretq_u64_u8(diff2);
+        uint64x2_t diff3_64 = vreinterpretq_u64_u8(diff3);
+
+        apply8(vgetq_lane_u64(diff0_64, 0), k);
+        apply8(vgetq_lane_u64(diff0_64, 1), k + 8);
+        apply8(vgetq_lane_u64(diff1_64, 0), k + 16);
+        apply8(vgetq_lane_u64(diff1_64, 1), k + 24);
+        apply8(vgetq_lane_u64(diff2_64, 0), k + 32);
+        apply8(vgetq_lane_u64(diff2_64, 1), k + 40);
+        apply8(vgetq_lane_u64(diff3_64, 0), k + 48);
+        apply8(vgetq_lane_u64(diff3_64, 1), k + 56);
+    }
+#endif
     for (; k + 32 <= w.size; k += 32) {
         uint64_t f0, f1, f2, f3;
         uint64_t w0, w1, w2, w3;
@@ -418,20 +474,6 @@ void apply_write_back(const WriteBack& w) {
         uint64_t d3 = f3 ^ w3;
 
         if ((d0 | d1 | d2 | d3) == 0) continue;
-
-        auto apply8 = [&](uint64_t diff, size_t off) {
-            if (!diff) return;
-            changed++;
-            uint32_t lo = static_cast<uint32_t>(diff);
-            uint32_t hi = static_cast<uint32_t>(diff >> 32);
-            if (lo && hi) {
-                std::memcpy(w.to + off, from + off, 8);
-            } else if (lo) {
-                std::memcpy(w.to + off, from + off, 4);
-            } else {
-                std::memcpy(w.to + off + 4, from + off + 4, 4);
-            }
-        };
 
         apply8(d0, k);
         apply8(d1, k + 8);

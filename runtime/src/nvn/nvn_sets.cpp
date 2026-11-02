@@ -806,9 +806,17 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
 
 // The zero stream (vertex binding 15): one per submit instead of 64 bytes per draw. Host bytes that never change, so
 // dedup may share them.
+static thread_local Upload s_cached_zero_stream{};
+static thread_local bool s_cached_zero_valid = false;
+
 Upload zero_stream() {
+    if (__builtin_expect(s_cached_zero_valid, 1)) return s_cached_zero_stream;
     static const uint8_t zeros[64] = {};
-    if (!draw_slow(kSlowUploads)) return dedup_upload(zeros, sizeof zeros, sizeof zeros, 16);
+    if (!draw_slow(kSlowUploads)) {
+        s_cached_zero_stream = dedup_upload(zeros, sizeof zeros, sizeof zeros, 16);
+        s_cached_zero_valid = true;
+        return s_cached_zero_stream;
+    }
     Upload z = upload_alloc(64, 16);
     std::memset(z.ptr, 0, 64);
     return z;
@@ -853,6 +861,7 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
 }
 
 void sets_begin_submit() {
+    s_cached_zero_valid = false;
     s_cached_sh_count = 0;
     s_cached_sh0 = nullptr;
     s_cached_sh1 = nullptr;

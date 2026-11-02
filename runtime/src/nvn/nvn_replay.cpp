@@ -18,9 +18,16 @@ namespace {
 // of a handle in a submit is kept for the rest of it: a list re-recorded meanwhile on the game's recording thread
 // is not mixed into a submit already being replayed. NX_CALL_TABLE=0: every call looks up.
 std::unordered_map<uint64_t, std::shared_ptr<CmdList>> g_called;
+thread_local uint64_t s_mru_handle[2] = {0, 0};
+thread_local std::shared_ptr<CmdList> s_mru_list[2] = {};
 }  // namespace
 
-void submit_lists_reset() { g_called.clear(); }
+void submit_lists_reset() {
+    g_called.clear();
+    s_mru_handle[0] = s_mru_handle[1] = 0;
+    s_mru_list[0].reset();
+    s_mru_list[1].reset();
+}
 
 std::shared_ptr<CmdList> submit_command_list(uint64_t handle) {
     static const bool off = [] {
@@ -28,10 +35,26 @@ std::shared_ptr<CmdList> submit_command_list(uint64_t handle) {
         return e && e[0] == '0';
     }();
     if (off) return command_list(handle);
+    if (handle == s_mru_handle[0] && s_mru_list[0]) return s_mru_list[0];
+    if (handle == s_mru_handle[1] && s_mru_list[1]) {
+        std::swap(s_mru_handle[0], s_mru_handle[1]);
+        std::swap(s_mru_list[0], s_mru_list[1]);
+        return s_mru_list[0];
+    }
     auto it = g_called.find(handle);
-    if (it != g_called.end()) return it->second;
-    auto l = command_list(handle);
-    if (l) g_called.emplace(handle, l);
+    std::shared_ptr<CmdList> l;
+    if (it != g_called.end()) {
+        l = it->second;
+    } else {
+        l = command_list(handle);
+        if (l) g_called.emplace(handle, l);
+    }
+    if (l) {
+        s_mru_handle[1] = s_mru_handle[0];
+        s_mru_list[1] = std::move(s_mru_list[0]);
+        s_mru_handle[0] = handle;
+        s_mru_list[0] = l;
+    }
     return l;
 }
 

@@ -2,6 +2,7 @@
 // resources, draws). Everything here runs under the GPU lock taken by gpu_submit / gpu_present.
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -300,15 +301,28 @@ void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t);
 void occlusion_render_enable();  // SetRenderEnable: the conditional draws end
 bool occlusion_object_skipped();  // inside ResetCounter(1)..ReportCounter(1) while occlusion queries are off
 // Around a draw call inside the pass: its query when it is a query pass draw (-1: none).
-int32_t occlusion_query_begin(VkCommandBuffer cb);
-void occlusion_query_end(VkCommandBuffer cb, int32_t q);
+extern bool g_occl_object;
+int32_t occlusion_query_begin_slow(VkCommandBuffer cb);
+void occlusion_query_end_slow(VkCommandBuffer cb, int32_t q);
+
+inline int32_t occlusion_query_begin(VkCommandBuffer cb) {
+    if (!g_occl_object) return -1;
+    return occlusion_query_begin_slow(cb);
+}
+
+inline void occlusion_query_end(VkCommandBuffer cb, int32_t q) {
+    if (q >= 0) occlusion_query_end_slow(cb, q);
+}
 // A conditional draw as an indirect draw counted by its object's query; false: not conditional, draw it as it is.
 bool occlusion_draw(VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t instances, uint32_t first,
                     int32_t vertex_offset, uint32_t first_instance);
 void occlusion_log();
 
 // nvn_debug.cpp: NX_ZERO_DRAWS, shader pairs whose draws produce no pixel.
-bool zero_draws_on();
+inline bool zero_draws_on() {
+    static const bool on = std::getenv("NX_ZERO_DRAWS") != nullptr;
+    return on;
+}
 void zero_draws_begin_submit(VkCommandBuffer cb);
 bool zero_draws_begin(VkCommandBuffer cb, const std::string& label);
 void zero_draws_end(VkCommandBuffer cb);
@@ -320,7 +334,10 @@ extern uint32_t g_snap_layer, g_snap_level;  // the layer and level debug_snapsh
 void debug_snapshots_write();  // nvn_pipeline.cpp: before an image is freed
 
 // nvn_debug.cpp: GPU time per render pass (NX_GPU_PROFILE=1).
-bool gpu_profile_on();  // NX_GPU_PROFILE=1: per-pass labels, every submit waited for (nvn_debug.cpp)
+inline bool gpu_profile_on() {
+    static const bool on = std::getenv("NX_GPU_PROFILE") && std::atoi(std::getenv("NX_GPU_PROFILE")) == 1;
+    return on;
+}
 // NX_GPU_PROFILE=3: the GPU's busy time per frame without waits, from per-part timestamps (nvn_gpu_busy.cpp).
 // The janitor thread (nvn_janitor.cpp, NX_JANITOR): pool resets of retired slots, off the replay thread.
 bool janitor_on();
