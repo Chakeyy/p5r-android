@@ -153,8 +153,7 @@ void tl(const char* what, uint64_t arg = 0) {
 }
 std::mutex g_sub_lock;
 std::condition_variable g_sub_cv;
-std::atomic<uint64_t> g_sub_called{0}, g_sub_done{0};
-std::atomic<uint32_t> g_sub_waiters{0};
+uint64_t g_sub_called = 0, g_sub_done = 0;
 std::atomic<uint64_t> g_sub_blocked{0};
 
 bool sync_loose() {
@@ -163,11 +162,11 @@ bool sync_loose() {
 }
 
 void submit_done() {
-    g_sub_done.fetch_add(1, std::memory_order_release);
-    if (g_sub_waiters.load(std::memory_order_relaxed) > 0) {
+    {
         std::lock_guard lk(g_sub_lock);
-        g_sub_cv.notify_all();
+        g_sub_done++;
     }
+    g_sub_cv.notify_all();
 }
 
 // Where the game waits for the replay (docs/nvn/android-perf/PHASE3.md I1): calls, the ones that blocked and for how
@@ -183,17 +182,14 @@ void wait_submits(uint64_t seq, int site) {
     if (sync_loose() || !seq) return;
     WaitSite& w = g_wait_sites[site];
     w.calls++;
-    if (g_sub_done.load(std::memory_order_acquire) >= seq) return;
     std::unique_lock lk(g_sub_lock);
-    if (g_sub_done.load(std::memory_order_acquire) >= seq) return;
+    if (g_sub_done >= seq) return;
     uint64_t n = ++g_sub_blocked;
     if (n == 1 || n % 1000 == 0) log("nvn: %llu CPU waits blocked on a submit still being replayed", (unsigned long long)n);
     uint64_t t0 = plat::monotonic_ns();
-    g_sub_waiters.fetch_add(1, std::memory_order_relaxed);
-    if (!g_sub_cv.wait_for(lk, std::chrono::seconds(2), [seq] { return g_sub_done.load(std::memory_order_acquire) >= seq; }))
+    if (!g_sub_cv.wait_for(lk, std::chrono::seconds(2), [seq] { return g_sub_done >= seq; }))
         log("nvn: a CPU wait gave up after 2 s on submit %llu (%llu done)", (unsigned long long)seq,
-            (unsigned long long)g_sub_done.load(std::memory_order_relaxed));
-    g_sub_waiters.fetch_sub(1, std::memory_order_relaxed);
+            (unsigned long long)g_sub_done);
     uint64_t dt = plat::monotonic_ns() - t0;
     w.blocked++, w.ns += dt, w.frame_ns += dt;
 }
@@ -210,7 +206,8 @@ void log_wait_sites() {
 }
 
 uint64_t submits_called() {
-    return g_sub_called.load(std::memory_order_relaxed);
+    std::lock_guard lk(g_sub_lock);
+    return g_sub_called;
 }
 }  // namespace
 
@@ -284,7 +281,10 @@ void QueueSubmitCommands(CPU& c) {  // (NVNqueue*, int count, const NVNcommandHa
     // NX_DEFERRED_SNAPSHOT=1: read the Deferred arrays here; by default they are read when the submit is replayed.
     static const bool snap = std::getenv("NX_DEFERRED_SNAPSHOT") != nullptr;
     auto deferred = snap ? std::make_shared<const DeferredValues>(deferred_snapshot(lists)) : nullptr;
-    g_sub_called.fetch_add(1, std::memory_order_release);
+    {
+        std::lock_guard lk(g_sub_lock);
+        g_sub_called++;
+    }
     tl("submit-call");
     worker_run([lists = std::move(lists), deferred] {
         tl("replay>");
