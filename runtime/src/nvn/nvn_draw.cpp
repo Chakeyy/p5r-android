@@ -1197,7 +1197,7 @@ void linear_targets_write_back(VkCommandBuffer cb) {  // before the submit ends,
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                           0, 1, &mb, 0, nullptr, uint32_t(back.size()), back.data());
+                           0, 1, &mb, 0, nullptr, uint32_t(todo.size()), back);
     if (g_frame >= next_log) {
         next_log = g_frame + 600;
         log("nvn: linear render targets written back: %llu copies, %.2f MB so far", (unsigned long long)copies,
