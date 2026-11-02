@@ -1003,7 +1003,7 @@ VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFor
     // A 3D image's slice is a layer of its 2D-array-compatible views, counted at this level.
     layer = std::min(layer, img.view_type == VK_IMAGE_VIEW_TYPE_3D ? std::max(1u, img.depth >> level) - 1 : img.layers - 1);
     if (level == 0 && layer == 0 && img.levels == 1 && img.layers == 1 && img.view_type == VK_IMAGE_VIEW_TYPE_2D &&
-        format == img.format)
+        format == img.format && !(img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
         return img.view;
     auto& cache = g_attachment_views;
     auto& v = cache[{img.image, level, layer, format}];
@@ -1013,7 +1013,15 @@ VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFor
         ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         ci.format = format;
         ci.subresourceRange = {img.aspect, level, 1, layer, 1};
-        if (p_vkCreateImageView(vk_device(), &ci, nullptr, &v) != VK_SUCCESS) v = img.view;
+        VkResult res = p_vkCreateImageView(vk_device(), &ci, nullptr, &v);
+        if (res != VK_SUCCESS) {
+            log("nvn/vk: attachment_view failed to create view for image %p, format %d, aspect %#x: %d",
+                img.image, int(format), unsigned(img.aspect), int(res));
+            v = img.view;
+        } else if (img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+            log("nvn/vk: created depth-stencil attachment view for image %p format %d aspect %#x",
+                img.image, int(format), unsigned(img.aspect));
+        }
     }
     return v;
 }
