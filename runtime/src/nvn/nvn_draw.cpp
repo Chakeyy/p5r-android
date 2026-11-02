@@ -954,6 +954,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         g_bound.pipeline = pipeline, g_state_set++;
         g_last_compute_pipeline = VK_NULL_HANDLE;
+        std::memset(g_bound.raster, 0xFF, sizeof g_bound.raster);  // Force dynamic raster/stencil rebind on pipeline switch
         if (gpu_profile_on()) gpu_profile_count(1);
     } else {
         g_state_kept++;
@@ -1029,6 +1030,20 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
     vp.y += vp.height, vp.height = -vp.height;
     set_dynamic(cb, vp, sc);
+
+    if (key.depth.stencil_test) {
+        static uint32_t s_stencil_draw_count = 0;
+        if (s_stencil_draw_count++ < 60) {
+            log("nvn/stencil: draw %llu vs %s fs %s func [%u,%u] ref [%u,%u] mask [%#x,%#x] write [%#x,%#x] d_func %u d_test %u d_write %u",
+                (unsigned long long)g_stats.total,
+                vs ? vs->hash.c_str() : "-", fs ? fs->hash.c_str() : "-",
+                key.depth.stencil_func[0], key.depth.stencil_func[1],
+                g_state.stencil_ref[0], g_state.stencil_ref[1],
+                g_state.stencil_compare_mask[0], g_state.stencil_compare_mask[1],
+                g_state.stencil_write_mask[0], g_state.stencil_write_mask[1],
+                key.depth.depth_func, key.depth.depth_test, key.depth.depth_write);
+        }
+    }
 
     trace_skin(indexed, c, vs, fs);
     if (indexed) {
