@@ -944,7 +944,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 if (s_mru_count < kMruSize) s_mru_count++;
             }
         }
-    }
     if (!pipeline) {
         g_stats.no_pipeline++;
         return false;
