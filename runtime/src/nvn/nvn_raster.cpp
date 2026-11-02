@@ -28,9 +28,30 @@ void stencil(CPU& c, Cmd::Op op) {
     record(c.x[0], cmd);
 }
 
-void SetStencilRef(CPU& c) { stencil(c, Cmd::SetStencilRef); }
-void SetStencilMask(CPU& c) { stencil(c, Cmd::SetStencilMask); }
-void SetStencilValueMask(CPU& c) { stencil(c, Cmd::SetStencilValueMask); }
+void SetStencilRef(CPU& c) {
+    static uint64_t s_last_val = ~0ull;
+    if (s_last_val != c.x[2]) {
+        s_last_val = c.x[2];
+        log("nvn/stencil: SetStencilRef face %llu val %llu", (unsigned long long)c.x[1], (unsigned long long)c.x[2]);
+    }
+    stencil(c, Cmd::SetStencilRef);
+}
+void SetStencilMask(CPU& c) {
+    static uint64_t s_last_mask = ~0ull;
+    if (s_last_mask != c.x[2]) {
+        s_last_mask = c.x[2];
+        log("nvn/stencil: SetStencilMask face %llu val %#llx", (unsigned long long)c.x[1], (unsigned long long)c.x[2]);
+    }
+    stencil(c, Cmd::SetStencilMask);
+}
+void SetStencilValueMask(CPU& c) {
+    static uint64_t s_last_valmask = ~0ull;
+    if (s_last_valmask != c.x[2]) {
+        s_last_valmask = c.x[2];
+        log("nvn/stencil: SetStencilValueMask face %llu val %#llx", (unsigned long long)c.x[1], (unsigned long long)c.x[2]);
+    }
+    stencil(c, Cmd::SetStencilValueMask);
+}
 
 void SetPolygonOffsetClamp(CPU& c) {
     Cmd cmd{Cmd::SetPolygonOffsetClamp};

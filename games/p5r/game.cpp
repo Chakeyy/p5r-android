@@ -693,12 +693,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r46";
+static constexpr const char* kPerfBuildTag = "lowend-r47";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (front/back stencil face unification, dynamic raster invalidation on pipeline switch)",
+    log("p5r perf build: %s (targeted UI probe for choice text, live flags env hook, stencil trace)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:

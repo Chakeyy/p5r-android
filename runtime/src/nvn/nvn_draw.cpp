@@ -479,6 +479,16 @@ uint32_t live_flags() {
         if (std::strstr(words, "no_wb")) now |= kLiveNoWb;
         if (std::strstr(words, "clears_why")) now |= kLiveClearsWhy;
     }
+    static const uint32_t env_flags = [] {
+        uint32_t ef = 0;
+        if (const char* e = std::getenv("NX_UI_ALWAYS"); e && e[0] == '1') ef |= kLiveUiAlways;
+        if (const char* e = std::getenv("NX_UI_NOWRITE"); e && e[0] == '1') ef |= kLiveUiNoWrite;
+        if (const char* e = std::getenv("NX_UI_RGB"); e && e[0] == '1') ef |= kLiveUiRgb;
+        if (const char* e = std::getenv("NX_UI_AMAX"); e && e[0] == '1') ef |= kLiveUiAmax;
+        if (const char* e = std::getenv("NX_UI_AONE"); e && e[0] == '1') ef |= kLiveUiAone;
+        return ef;
+    }();
+    now |= env_flags;
     if (now != flags) log("live_flags: %x (was %x) at frame %llu", now, flags, (unsigned long long)f);
     flags = now;
     return flags;
@@ -1031,7 +1041,30 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     vp.y += vp.height, vp.height = -vp.height;
     set_dynamic(cb, vp, sc);
 
-    if (key.depth.stencil_test) {
+    bool is_ui_font = fs && fs->hash == "d586c22f9c5bc8cd";
+    bool is_ui_banner = fs && fs->hash == "6103f5f6cb2c2247";
+    if (is_ui_font || is_ui_banner) {
+        static uint32_t s_ui_draw_count = 0;
+        uint64_t f = g_frame.load();
+        if (s_ui_draw_count < 60 || (f % 180 == 0)) {
+            if (s_ui_draw_count < 60) s_ui_draw_count++;
+            const BlendTarget& b = key.blend[0];
+            log("nvn/ui_probe: f %llu draw %llu [%s] vs %s pipe %p d_test %u d_write %u d_func %u s_test %u s_func [%u,%u] ref [%u,%u] mask [%#x,%#x] wmask [%#x,%#x] blend %u eq [%u,%u] src [%u,%u] dst [%u,%u] colormask %#x",
+                (unsigned long long)f,
+                (unsigned long long)g_stats.total,
+                is_ui_font ? "FONT" : "BANNER",
+                vs ? vs->hash.c_str() : "-",
+                pipeline,
+                key.depth.depth_test, key.depth.depth_write, key.depth.depth_func,
+                key.depth.stencil_test, key.depth.stencil_func[0], key.depth.stencil_func[1],
+                g_state.stencil_ref[0], g_state.stencil_ref[1],
+                g_state.stencil_compare_mask[0], g_state.stencil_compare_mask[1],
+                g_state.stencil_write_mask[0], g_state.stencil_write_mask[1],
+                key.color.blend_enable[0], b.eq_rgb, b.eq_a,
+                b.src_rgb, b.src_a, b.dst_rgb, b.dst_a,
+                key.mask.mask[0]);
+        }
+    } else if (key.depth.stencil_test && g_state.stencil_ref[0] != 10) {
         static uint32_t s_stencil_draw_count = 0;
         if (s_stencil_draw_count++ < 60) {
             log("nvn/stencil: draw %llu vs %s fs %s func [%u,%u] ref [%u,%u] mask [%#x,%#x] write [%#x,%#x] d_func %u d_test %u d_write %u",
