@@ -879,7 +879,6 @@ void sets_begin_submit() {
     g_state.descriptors_dirty = true;
     g_state.pipeline_dirty = true;
     g_state.vertex_dirty = true;
-    g_state.raster_dirty = true;
 }
 
 void sets_log() {

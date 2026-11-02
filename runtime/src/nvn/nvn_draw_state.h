@@ -51,7 +51,6 @@ struct State {
     bool descriptors_dirty = true;
     bool pipeline_dirty = true;
     bool vertex_dirty = true;
-    bool raster_dirty = true;
 };
 
 struct Stats {

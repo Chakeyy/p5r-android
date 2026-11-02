@@ -157,24 +157,14 @@ void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
     if (differs(!same_bytes(b.scissor, sc))) p_vkCmdSetScissor(cb, 0, 1, &sc), b.scissor = sc;
     if (differs(std::memcmp(b.blend, s.blend_color, sizeof b.blend) != 0))
         p_vkCmdSetBlendConstants(cb, s.blend_color), std::memcpy(b.blend, s.blend_color, sizeof b.blend);
-    if (all || s.raster_dirty) {
-        uint32_t raster[10] = {s.stencil_ref[0],        s.stencil_ref[1],        s.stencil_compare_mask[0],
-                              s.stencil_compare_mask[1], s.stencil_write_mask[0], s.stencil_write_mask[1]};
-        std::memcpy(raster + 6, &s.bias_factor, 4), std::memcpy(raster + 7, &s.bias_units, 4);
-        std::memcpy(raster + 8, &s.bias_clamp, 4);
-        bool slack = s.depth.depth_test && equal_slack_pass(s.depth);
-        raster[9] = slack;
-        if (all || std::memcmp(b.raster, raster, sizeof raster) != 0) {
-            raster_dynamic(cb, slack);
-            std::memcpy(b.raster, raster, sizeof raster);
-            g_state_set++;
-        } else {
-            g_state_kept++;
-        }
-        const_cast<State&>(s).raster_dirty = false;
-    } else {
-        g_state_kept++;
-    }
+    uint32_t raster[10] = {s.stencil_ref[0],        s.stencil_ref[1],        s.stencil_compare_mask[0],
+                          s.stencil_compare_mask[1], s.stencil_write_mask[0], s.stencil_write_mask[1]};
+    std::memcpy(raster + 6, &s.bias_factor, 4), std::memcpy(raster + 7, &s.bias_units, 4);
+    std::memcpy(raster + 8, &s.bias_clamp, 4);
+    bool slack = s.depth.depth_test && equal_slack_pass(s.depth);
+    raster[9] = slack;
+    if (differs(std::memcmp(b.raster, raster, sizeof raster) != 0))  // stencil reference and masks, depth bias
+        raster_dynamic(cb, slack), std::memcpy(b.raster, raster, sizeof raster);  // (nvn_raster.cpp)
 }
 
 // No colour image behind any of the targets' colour slots: P5R binds its shadow maps with two empty colour slots.
@@ -309,9 +299,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     }
     if (extent.width == UINT32_MAX) extent = {1, 1};
     VkRenderingAttachmentInfo stencil = depth;  // same view, its own loadOp
-    // Persona 5 Royal never samples stencil buffers in later passes; discarding stencil stores avoids
-    // writing 8-bit stencil per pixel out to system DRAM across every render pass on Mali TBDR GPUs.
-    stencil.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    stencil.storeOp = g_shadow_target ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
     uint32_t cleared = clears_apply(t, colors, depth, stencil);  // pending clears of these targets: loadOp CLEAR
     if (exp_render_pass() & 1) {  // NX_EXP_RP=noload: what loading the targets costs (the picture breaks)
         for (uint32_t k = 0; k < t.color_count; k++)
