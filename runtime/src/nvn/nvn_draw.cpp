@@ -802,11 +802,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    static thread_local VkPipeline s_last_pipeline = VK_NULL_HANDLE;
-    static thread_local PipelineKey s_last_key{};
-    static thread_local VkPipelineLayout s_last_layout = VK_NULL_HANDLE;
-    static thread_local uint32_t s_last_mode = UINT32_MAX;
-    static thread_local Targets s_last_targets{};
 
     struct MruEntry {
         PipelineKey key;
@@ -817,13 +812,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     static thread_local MruEntry s_mru_cache[kMruSize]{};
     static thread_local size_t s_mru_count = 0;
 
-    if (!g_state.pipeline_dirty && s_last_pipeline != VK_NULL_HANDLE &&
-        s_last_layout == layout.layout && s_last_mode == mode &&
-        targets_same(s_last_targets, tt)) {
-        pipeline = s_last_pipeline;
-    } else {
-        // Pipeline.
-        PipelineKey key;
+    // Pipeline.
+    PipelineKey key;
         std::memset(&key, 0, sizeof key);  // the key is compared byte for byte
         key.vs = vs, key.fs = fs;
         key.topology = mode;
@@ -953,11 +943,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 s_mru_cache[0] = {key, layout.layout, pipeline};
                 if (s_mru_count < kMruSize) s_mru_count++;
             }
-        }
-        if (pipeline != VK_NULL_HANDLE) {
-            s_last_mode = mode;
-            s_last_targets = tt;
-            g_state.pipeline_dirty = false;
         }
     }
     if (!pipeline) {

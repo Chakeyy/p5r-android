@@ -437,9 +437,6 @@ void texture_for(uint64_t handle, uint64_t& texture, SamplerInfo& sampler, ViewI
 // passes when textures or images need them. A set is allocated when its first binding is written: the sets no stage
 // declares anything in (usually two of the four) are neither allocated nor bound.
 void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shaders, const ProgramLayout& layout) {
-    if (!g_state.descriptors_dirty && !draw_slow(kSlowScratch) && !draw_slow(kSlowEmptySets)) {
-        return;
-    }
     Descriptors& d = g_sets;
     if (draw_slow(kSlowScratch))
         d = Descriptors{};
@@ -646,13 +643,10 @@ void sets_invalidate_bound() {
 
 void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout) {
     Descriptors& d = g_sets;
-    if (g_state.descriptors_dirty) {
-        if (set_cache_on()) resolve_sets(layout);
-        if (!d.writes.empty()) {
-            p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
-            d.writes.clear();
-        }
-        g_state.descriptors_dirty = false;
+    if (set_cache_on()) resolve_sets(layout);
+    if (!d.writes.empty()) {
+        p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
+        d.writes.clear();
     }
     // Set 0's dynamic offsets, in binding order (every dynamic binding of the layout; one no stage wrote: 0).
     uint32_t offsets[64];
@@ -826,30 +820,9 @@ Upload zero_stream() {
 // colour) had its index buffer copied each time. Guest bytes, like the vertex streams, so dedup's rule holds; 8-bit
 // indices are widened per draw as before.
 bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in) {
-    static thread_local uint32_t s_last_used = 0;
-    static thread_local Upload s_last_vertex[15] = {};
-    static thread_local const ShaderInfo* s_last_vs = nullptr;
-
-    if (!g_state.vertex_dirty && s_last_vs == vs) {
-        in.used = s_last_used;
-        std::memcpy(in.vertex, s_last_vertex, sizeof(s_last_vertex));
-    } else {
-        if (!indexed || draw_slow(kSlowUploads) || vk_index_type(c.mask) == VK_INDEX_TYPE_UINT8_EXT) {
-            bool ok = draw_inputs(cb, vs, indexed, c, in);
-            if (ok) {
-                s_last_used = in.used;
-                std::memcpy(s_last_vertex, in.vertex, sizeof(s_last_vertex));
-                s_last_vs = vs;
-                g_state.vertex_dirty = false;
-            }
-            return ok;
-        }
-        draw_inputs(cb, vs, false, c, in);  // the vertex streams
-        s_last_used = in.used;
-        std::memcpy(s_last_vertex, in.vertex, sizeof(s_last_vertex));
-        s_last_vs = vs;
-        g_state.vertex_dirty = false;
-    }
+    if (!indexed || draw_slow(kSlowUploads) || vk_index_type(c.mask) == VK_INDEX_TYPE_UINT8_EXT)
+        return draw_inputs(cb, vs, indexed, c, in);
+    draw_inputs(cb, vs, false, c, in);  // the vertex streams
     const uint8_t* p = guest_bytes(c.a[0]);
     if (!p) return false;
     in.index_type = vk_index_type(c.mask);
@@ -876,9 +849,6 @@ void sets_begin_submit() {
     if (g_set_arena.capacity() < 65536) g_set_arena.reserve(65536);
     g_set_generation++, g_set_used = 0, g_set_arena.clear();
     g_support_used = g_constants_used = 0;
-    g_state.descriptors_dirty = true;
-    g_state.pipeline_dirty = true;
-    g_state.vertex_dirty = true;
 }
 
 void sets_log() {
