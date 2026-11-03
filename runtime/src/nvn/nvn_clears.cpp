@@ -329,6 +329,19 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     GpuImage* img = guest ? image_of(guest) : nullptr;
     if (!img || color != (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT)) return;
     if (color && !(c.mask & 0xF)) return;  // no channel enabled
+
+    // NX_SHADOWS=0: shadow draws are skipped, so the shadow depth map needs to be cleared
+    // to 1.0 (all lit) only once on initial allocation; skipping redundant re-clears in subsequent
+    // frames saves ~20 MB/frame of GPU bandwidth on Mali TBDR.
+    static const bool s_shadows_off = [] {
+        const char* e = std::getenv("NX_SHADOWS");
+        return e && e[0] == '0';
+    }();
+    if (!color && s_shadows_off && img->width == img->height &&
+        (img->width >= 256 || img->shadow) && !(img->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        if (img->shadow_cleared) return;
+        img->shadow_cleared = true;
+    }
     VkClearAttachment a{};
     if (color) {
         a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = c.n;

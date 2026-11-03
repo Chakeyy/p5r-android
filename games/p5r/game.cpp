@@ -693,17 +693,19 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r50";
+static constexpr const char* kPerfBuildTag = "renderopt-r51";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (hoisted draw statics, stencil dedup, optimized MRU pipeline cache)",
+    log("p5r perf build: %s (shadow clear-once, crowd unit stubbing, sampler lod bias 1.0)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
     // - Force bilinear (1x) sampling instead of 16x anisotropic filtering on mobile TBDR GPUs.
     setenv("NX_MAX_ANISO", "1", 0);
+    // - Default LOD bias to 1.0 (one mip lower for 3D depth-tested meshes) to reduce L2 cache pressure on Mali-G57.
+    setenv("NX_LOD_BIAS", "1.0", 0);
     // - Enable per-image deferred clears (PROGRESO 77) so P5R's depth-only clears and dual
     //   shadow-map clears fold into VK_ATTACHMENT_LOAD_OP_CLEAR instead of 12,000+ standalone
     //   vkCmdClear*Image transfer clears.
