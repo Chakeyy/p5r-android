@@ -84,6 +84,9 @@ struct CommandBuffer : Object {
     uint64_t command_base = 0, control_base = 0;  // usage before this recording
     uint64_t command_memory = 0;                  // the memory added last: its GPU address (see AddCommandMemory)
     uint64_t command_pool = 0;                    // its NVNmemoryPool*
+    uint32_t last_stencil_ref = ~0u;
+    uint32_t last_stencil_mask = ~0u;
+    uint32_t last_stencil_value_mask = ~0u;
 };
 
 constexpr uint64_t kCommandBytes = 16, kControlBytes = 4;  // per recorded command
@@ -197,6 +200,9 @@ void CommandBufferBeginRecording(CPU& c) {
         } else {
             cb->recording = alloc_cmdlist();
         }
+        cb->last_stencil_ref = ~0u;
+        cb->last_stencil_mask = ~0u;
+        cb->last_stencil_value_mask = ~0u;
     }
 }
 
@@ -428,6 +434,20 @@ void record(uint64_t guest, Cmd cmd, const void* blob, size_t size) {
         return;
     }
     std::lock_guard lk(cb->lock);
+    if (cmd.op == Cmd::SetStencilRef) {
+        if (cb->last_stencil_ref == cmd.n) return;
+        cb->last_stencil_ref = cmd.n;
+    } else if (cmd.op == Cmd::SetStencilMask) {
+        if (cb->last_stencil_mask == cmd.n) return;
+        cb->last_stencil_mask = cmd.n;
+    } else if (cmd.op == Cmd::SetStencilValueMask) {
+        if (cb->last_stencil_value_mask == cmd.n) return;
+        cb->last_stencil_value_mask = cmd.n;
+    } else if (cmd.op == Cmd::CallList) {
+        cb->last_stencil_ref = ~0u;
+        cb->last_stencil_mask = ~0u;
+        cb->last_stencil_value_mask = ~0u;
+    }
     if (blob) {
         cmd.blob = uint32_t(cb->recording->blobs.size());
         auto* p = static_cast<const uint8_t*>(blob);

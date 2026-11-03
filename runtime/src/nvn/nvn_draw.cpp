@@ -49,16 +49,16 @@ uint64_t g_pass_serial = 0, g_vertex_visible_at = 0;  // pass ends so far; the s
 uint64_t g_vertex_barriers = 0;
 
 // Narrow pass barrier: allows Mali Valhall GPUs to overlap next pass vertex binning with previous pass fragment shading.
-bool narrow_pass_barrier() {
 #if defined(__ANDROID__)
-    static const bool on = [] {
-        const char* e = std::getenv("NX_PASS_BARRIER_NARROW");
-        return !(e && e[0] == '0');
-    }();
+static const bool s_narrow_pass_barrier = [] {
+    const char* e = std::getenv("NX_PASS_BARRIER_NARROW");
+    return !(e && e[0] == '0');
+}();
 #else
-    static const bool on = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
+static const bool s_narrow_pass_barrier = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
 #endif
-    return on;
+bool narrow_pass_barrier() {
+    return s_narrow_pass_barrier;
 }
 
 // A vertex shader sampling a rendered image after a narrow pass-end barrier: the pass ends (it cannot take a barrier
@@ -422,25 +422,27 @@ void vertex_read_barrier(VkCommandBuffer cb, const ShaderInfo* vs) {
     g_vertex_pending = false, g_vertex_barriers++, g_vertex_visible_at = g_pass_serial;
 }
 
+static const bool s_shadows_off = [] {
+    const char* e = std::getenv("NX_SHADOWS");
+    return e && e[0] == '0';
+}();
+
 // NX_SHADOWS=0 (the launcher's "Sombras: desactivadas"): no draws into shadow maps, the square depth-only targets of
 // 512 or more (P5R: 2048 and 1024, D32). Their clears stay: the maps say "lit" everywhere.
 bool shadow_draw_skipped(const Targets& t) {
-    static const bool off = [] {
-        const char* e = std::getenv("NX_SHADOWS");
-        return e && e[0] == '0';
-    }();
-    if (!off || !depth_only(t)) return false;
+    if (!s_shadows_off || !depth_only(t)) return false;
     const GpuImage* d = image_of(t.depth);
     return d && d->width == d->height && (d->width >= 256 || d->shadow) && !(d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
 }
 
+static const bool s_bloom_disabled = [] {
+    const char* e = std::getenv("NX_DISABLE_BLOOM");
+    return e && (e[0] == '1' || std::strcmp(e, "true") == 0);
+}();
+
 // NX_DISABLE_BLOOM=1 (the launcher's "Post-procesado: desactivado"): no draws into bloom/blur mip chains.
 bool bloom_draw_skipped(const Targets& t) {
-    static const bool off = [] {
-        const char* e = std::getenv("NX_DISABLE_BLOOM");
-        return e && (e[0] == '1' || std::strcmp(e, "true") == 0);
-    }();
-    if (!off) return false;
+    if (!s_bloom_disabled) return false;
     if (t.color_count > 0 && t.views.level[0] > 0) return true;
     return false;
 }
@@ -457,6 +459,17 @@ enum : uint32_t {
     kLiveNoWb = 512,  // exp_no_write_backs
     kLiveClearsWhy = 128,  // clears_why: the targets of a pending clear and of what flushed it (nvn_clears.cpp)
 };
+
+static const uint32_t s_live_env_flags = [] {
+    uint32_t ef = 0;
+    if (const char* e = std::getenv("NX_UI_ALWAYS"); e && e[0] == '1') ef |= kLiveUiAlways;
+    if (const char* e = std::getenv("NX_UI_NOWRITE"); e && e[0] == '1') ef |= kLiveUiNoWrite;
+    if (const char* e = std::getenv("NX_UI_RGB"); e && e[0] == '1') ef |= kLiveUiRgb;
+    if (const char* e = std::getenv("NX_UI_AMAX"); e && e[0] == '1') ef |= kLiveUiAmax;
+    if (const char* e = std::getenv("NX_UI_AONE"); e && e[0] == '1') ef |= kLiveUiAone;
+    return ef;
+}();
+
 uint32_t live_flags() {
     static uint64_t next_check = 0;
     static uint32_t flags = 0;
@@ -479,16 +492,7 @@ uint32_t live_flags() {
         if (std::strstr(words, "no_wb")) now |= kLiveNoWb;
         if (std::strstr(words, "clears_why")) now |= kLiveClearsWhy;
     }
-    static const uint32_t env_flags = [] {
-        uint32_t ef = 0;
-        if (const char* e = std::getenv("NX_UI_ALWAYS"); e && e[0] == '1') ef |= kLiveUiAlways;
-        if (const char* e = std::getenv("NX_UI_NOWRITE"); e && e[0] == '1') ef |= kLiveUiNoWrite;
-        if (const char* e = std::getenv("NX_UI_RGB"); e && e[0] == '1') ef |= kLiveUiRgb;
-        if (const char* e = std::getenv("NX_UI_AMAX"); e && e[0] == '1') ef |= kLiveUiAmax;
-        if (const char* e = std::getenv("NX_UI_AONE"); e && e[0] == '1') ef |= kLiveUiAone;
-        return ef;
-    }();
-    now |= env_flags;
+    now |= s_live_env_flags;
     if (now != flags) log("live_flags: %x (was %x) at frame %llu", now, flags, (unsigned long long)f);
     flags = now;
     return flags;
@@ -498,25 +502,29 @@ uint32_t live_flags() {
 
 bool live_clears_why() { return live_flags() & kLiveClearsWhy; }
 
+static const bool s_exp_no_wb_env = [] {
+    const char* e = std::getenv("NX_EXP_NO_WB");
+    return e && e[0] != '0';
+}();
+
 bool exp_no_write_backs() {
-    static const bool env = [] {
-        const char* e = std::getenv("NX_EXP_NO_WB");
-        return e && e[0] != '0';
-    }();
-    return env || (live_flags() & kLiveNoWb);
+    return s_exp_no_wb_env || (live_flags() & kLiveNoWb);
 }
 
+static const int s_exp_rp_env = [] {
+    const char* e = std::getenv("NX_EXP_RP");
+    if (!e) return 0;
+    return (std::strstr(e, "noload") ? 1 : 0) | (std::strstr(e, "nostore") ? 2 : 0) | (std::strstr(e, "split") ? 4 : 0);
+}();
+
 int exp_render_pass() {
-    static const int env = [] {
-        const char* e = std::getenv("NX_EXP_RP");
-        if (!e) return 0;
-        return (std::strstr(e, "noload") ? 1 : 0) | (std::strstr(e, "nostore") ? 2 : 0) | (std::strstr(e, "split") ? 4 : 0);
-    }();
     const uint32_t live = live_flags();
-    return env | (live & kLiveRpNoLoad ? 1 : 0) | (live & kLiveRpNoStore ? 2 : 0) | (live & kLiveRpSplit ? 4 : 0);
+    return s_exp_rp_env | (live & kLiveRpNoLoad ? 1 : 0) | (live & kLiveRpNoStore ? 2 : 0) | (live & kLiveRpSplit ? 4 : 0);
 }
 
 namespace {
+
+static const bool s_frame_draws_on = std::getenv("NX_FRAME_DRAWS") != nullptr;
 
 // NX_RESTART_STATS=1: per NVN primitive mode, the indexed draws made while restart is on, how many hold the restart
 // index, and of those how many have 32-bit indices (Vulkan would not restart at NVN's 0xFFFF there). Every 600 frames.
@@ -524,8 +532,7 @@ namespace {
 // sum, with the monotonic time (logcat's clock on Android), to line a screen recording up with what the game
 // submitted: the Yongen-Jaya pop-ins are ~80 draws the game stops sending (PROGRESO 68).
 void frame_draws(const ShaderInfo* vs, uint64_t count) {
-    static const bool on = std::getenv("NX_FRAME_DRAWS") != nullptr;
-    if (!on) return;
+    if (!s_frame_draws_on) return;
     static uint64_t frame = 0, draws = 0, verts = 0, sum = 0;
     const uint64_t f = g_frame.load();
     if (f != frame) {
@@ -539,9 +546,10 @@ void frame_draws(const ShaderInfo* vs, uint64_t count) {
     sum += std::strtoull(vs->hash.substr(0, 16).c_str(), nullptr, 16);
 }
 
+static const bool s_restart_stats_on = std::getenv("NX_RESTART_STATS") != nullptr;
+
 void restart_stats(uint32_t mode, const Cmd& c) {
-    static const bool on = std::getenv("NX_RESTART_STATS") != nullptr;
-    if (!on) return;
+    if (!s_restart_stats_on) return;
     static uint64_t draws[16] = {}, with[16] = {}, wide[16] = {}, logged = 0;
     const uint32_t m = mode & 15, count = uint32_t(c.i[0]), size = index_size(c.mask);
     draws[m]++;
@@ -573,9 +581,10 @@ void restart_stats(uint32_t mode, const Cmd& c) {
 std::vector<uint64_t> g_linear_targets;  // this submit's (NVNtexture*), drawn into
 std::vector<WriteBack> g_late_write_backs;  // their copies: applied when the submit retires, never waited for
 
+static const bool s_linear_write_back_on = !(std::getenv("NX_LINEAR_WRITE_BACK") && std::getenv("NX_LINEAR_WRITE_BACK")[0] == '0');
+
 bool linear_write_back_on() {
-    static const bool on = !(std::getenv("NX_LINEAR_WRITE_BACK") && std::getenv("NX_LINEAR_WRITE_BACK")[0] == '0');
-    return on;
+    return s_linear_write_back_on;
 }
 
 std::atomic<bool> g_linear_paused{false};  // linear_write_back_pause: the game says nobody reads them now
@@ -587,6 +596,136 @@ void note_linear_target(uint64_t texture) {
     if (std::find(g_linear_targets.begin(), g_linear_targets.end(), texture) == g_linear_targets.end())
         g_linear_targets.push_back(texture);
 }
+
+// Static configurations hoisted out of draw() hot loop
+struct SnapFsBeforeConfig {
+    std::string str;
+    uint64_t from = 0;
+    bool active = false;
+};
+static const SnapFsBeforeConfig s_snap_fs_before = [] {
+    SnapFsBeforeConfig cfg;
+    const char* e = std::getenv("NX_SNAP_FS_BEFORE");
+    if (e && e[0]) {
+        cfg.str = e;
+        size_t at = cfg.str.find('@');
+        cfg.from = (at != std::string::npos) ? std::strtoull(cfg.str.c_str() + at + 1, nullptr, 10) : 0;
+        cfg.active = true;
+    }
+    return cfg;
+}();
+static int s_snap_fs_before_taken = 0;
+
+static const char* const s_dump_draw_textures_env = std::getenv("NX_DUMP_DRAW_TEXTURES");
+static int s_dump_draw_textures_done = 0;
+static bool s_dump_draw_textures_said = false;
+
+static const bool s_targets_memcmp = std::getenv("NX_TARGETS_MEMCMP") != nullptr;
+
+static const int s_keep_hud_alpha = [] {
+    const char* keep_env = std::getenv("NX_HUD_KEEP_ALPHA");
+    return !keep_env ? 0 : keep_env[0] == '1' ? 1 : keep_env[0] == 'a' ? 2 : 0;
+}();
+
+static const bool s_prim_restart_on = !(std::getenv("NX_PRIM_RESTART") && std::getenv("NX_PRIM_RESTART")[0] == '0');
+
+static const bool s_uw_cam_patch = !(std::getenv("NX_UW_CAMERA") && std::getenv("NX_UW_CAMERA")[0] == '0');
+
+static const bool s_uw_ui_learn = [] {
+    const char* e = std::getenv("NX_UW_UI");
+    return e && std::strcmp(e, "learn") == 0;
+}();
+
+struct UwTraceConfig {
+    const char* env = nullptr;
+    uint64_t from = 0;
+    uint64_t count = 0;
+    bool active = false;
+};
+static const UwTraceConfig s_uw_trace = [] {
+    UwTraceConfig cfg;
+    cfg.env = std::getenv("NX_UW_TRACE");
+    if (cfg.env) {
+        if (std::sscanf(cfg.env, "%lu:%lu", &cfg.from, &cfg.count) == 2) {
+            cfg.active = true;
+        }
+    }
+    return cfg;
+}();
+
+static const int s_exp3d = [] {
+    const char* e = std::getenv("NX_EXP_3D");
+    return !e ? 0 : std::strcmp(e, "scissor") == 0 ? 1 : std::strcmp(e, "tri") == 0 ? 2 : std::strcmp(e, "small") == 0 ? 3 : 0;
+}();
+
+struct SnapFsConfig {
+    std::string str;
+    uint64_t from = 0;
+    int max = 8;
+    bool active = false;
+};
+static const SnapFsConfig s_snap_fs = [] {
+    SnapFsConfig cfg;
+    const char* e = std::getenv("NX_SNAP_FS");
+    if (e && e[0]) {
+        cfg.str = e;
+        size_t at = cfg.str.find('@');
+        cfg.from = (at != std::string::npos) ? std::strtoull(cfg.str.c_str() + at + 1, nullptr, 10) : 0;
+        const char* me = std::getenv("NX_SNAP_FS_MAX");
+        cfg.max = me ? std::atoi(me) : 8;
+        cfg.active = true;
+    }
+    return cfg;
+}();
+static int s_snap_fs_count = 0;
+
+static const uint64_t s_dump_target = std::getenv("NX_DUMP_ON_TARGET") ? std::strtoull(std::getenv("NX_DUMP_ON_TARGET"), nullptr, 16) : 0;
+
+struct DumpFsConfig {
+    std::string str;
+    uint64_t from = 0;
+    bool any = false;
+    bool active = false;
+};
+static const DumpFsConfig s_dump_fs = [] {
+    DumpFsConfig cfg;
+    const char* e = std::getenv("NX_DUMP_ON_FS");
+    if (e && e[0]) {
+        cfg.str = e;
+        const char* fe = std::getenv("NX_DUMP_FROM");
+        cfg.from = fe ? std::strtoull(fe, nullptr, 10) : 0;
+        cfg.any = std::getenv("NX_DUMP_ANY") != nullptr;
+        cfg.active = true;
+    }
+    return cfg;
+}();
+
+// Thread-local state cached for draw()
+static thread_local uint64_t s_cached_pv = UINT64_MAX, s_cached_pf = UINT64_MAX;
+static thread_local std::vector<const ShaderInfo*> s_combined_shaders;
+static thread_local const std::vector<const ShaderInfo*>* s_cached_shaders = nullptr;
+static thread_local const ShaderInfo* s_cached_vs = nullptr;
+static thread_local const ShaderInfo* s_cached_fs = nullptr;
+static thread_local const ProgramLayout* s_cached_layout = nullptr;
+static thread_local std::vector<const ShaderInfo*> s_swapped_shaders;
+
+static thread_local uint64_t s_cached_target_c0 = UINT64_MAX, s_cached_target_depth = UINT64_MAX;
+static thread_local uint32_t s_cached_target_color_count = UINT32_MAX;
+static thread_local bool s_cached_uw_wide = false;
+static thread_local bool s_cached_hud_target = false;
+static thread_local bool s_cached_shadow_target = false;
+static thread_local bool s_cached_low_3d_target = false;
+
+// MRU Pipeline Cache
+struct MruEntry {
+    PipelineKey key;
+    VkPipelineLayout layout;
+    VkPipeline pipeline;
+};
+static constexpr size_t kMruSize = 8;
+static thread_local MruEntry s_mru_cache[kMruSize]{};
+static thread_local uint8_t s_mru_order[kMruSize] = {0, 1, 2, 3, 4, 5, 6, 7};
+static thread_local size_t s_mru_count = 0;
 
 bool live_ui_draw(const Targets& t) {
     const Texture* t0 = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
@@ -608,12 +747,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     }
     if (shadow_draw_skipped(t)) return false;
     if (bloom_draw_skipped(t)) return false;
-    static thread_local uint64_t s_cached_pv = UINT64_MAX, s_cached_pf = UINT64_MAX;
-    static thread_local std::vector<const ShaderInfo*> combined;
-    static thread_local const std::vector<const ShaderInfo*>* s_cached_shaders = nullptr;
-    static thread_local const ShaderInfo* s_cached_vs = nullptr;
-    static thread_local const ShaderInfo* s_cached_fs = nullptr;
-    static thread_local const ProgramLayout* s_cached_layout = nullptr;
 
     const uint64_t cur_pv = g_state.stage_programs[0];
     const uint64_t cur_pf = g_state.stage_programs[1];
@@ -628,7 +761,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         fs = s_cached_fs;
         layout_ptr = s_cached_layout;
     } else {
-        shaders = bound_graphics_shaders(combined);
+        shaders = bound_graphics_shaders(s_combined_shaders);
         if (!shaders || shaders->empty()) {
             g_stats.no_program++;
             return false;
@@ -649,36 +782,38 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         s_cached_fs = fs;
         s_cached_layout = layout_ptr;
     }
-    std::vector<const ShaderInfo*> swapped;  // NX_SWAP_FS / NX_SKIP_FS (nvn_draw_trace.cpp)
-    if (!debug_shader_overrides(shaders, fs, swapped)) return false;
+    if (__builtin_expect(debug_shader_overrides_active(), 0)) {
+        if (!debug_shader_overrides(shaders, fs, s_swapped_shaders)) return false;
+    }
     const ProgramLayout& layout = (shaders == s_cached_shaders) ? *layout_ptr : program_layout(*shaders);
 
     // NX_SNAP_FS_BEFORE=<hash>[@<first draw>]: snapshot colour target 0 before draws with that fragment shader
     // (what a feedback pass like a tonemap reads), 8 at most.
-    {
-        static const std::string before = std::getenv("NX_SNAP_FS_BEFORE") ? std::getenv("NX_SNAP_FS_BEFORE") : "";
-        static const uint64_t from = before.find('@') != std::string::npos
-                                         ? std::strtoull(before.c_str() + before.find('@') + 1, nullptr, 10) : 0;
-        static int taken = 0;
-        bool match = (fs && before.compare(0, 16, fs->hash) == 0) || before.compare(0, 16, vs->hash) == 0;
-        if (!before.empty() && match && g_stats.total >= from && taken < 8 &&
-            t.color_count && t.colors[0])
+    if (__builtin_expect(s_snap_fs_before.active, 0)) {
+        bool match = (fs && s_snap_fs_before.str.compare(0, 16, fs->hash) == 0) ||
+                     s_snap_fs_before.str.compare(0, 16, vs->hash) == 0;
+        if (match && g_stats.total >= s_snap_fs_before.from && s_snap_fs_before_taken < 8 &&
+            t.color_count && t.colors[0]) {
             if (GpuImage* img = image_of(t.colors[0])) {
-                taken++;
+                s_snap_fs_before_taken++;
                 draw_end_rendering(cb, 6);
                 debug_snapshot(cb, *img, 0xB0000000ull + g_stats.total);
             }
+        }
     }
     // Textures first: an upload or a layout change cannot happen inside the render pass.
     uint32_t gathered = gather_textures(*shaders);
-    {   // NX_DUMP_DRAW_TEXTURES=<fs hash>@<draw>: the images the first such draw samples, snapshotted (frames/00000_c00000NN)
-        static const char* env = std::getenv("NX_DUMP_DRAW_TEXTURES");
-        static int done_count = 0;
-        static bool said = false;
-        if (env && !said && fs) said = true, log("nvn: draw-textures watch %s, first fs %s total %llu", env, fs->hash.c_str(), (unsigned long long)g_stats.total);
-        if (env && done_count < 6 && fs && std::strncmp(env, fs->hash.c_str(), 16) == 0 && env[16] == '@' &&
-            g_stats.total >= std::strtoull(env + 17, nullptr, 10)) {
-            const uint64_t tag = uint64_t(done_count++) << 8;
+    if (__builtin_expect(s_dump_draw_textures_env != nullptr, 0)) {   // NX_DUMP_DRAW_TEXTURES=<fs hash>@<draw>: the images the first such draw samples, snapshotted (frames/00000_c00000NN)
+        if (!s_dump_draw_textures_said && fs) {
+            s_dump_draw_textures_said = true;
+            log("nvn: draw-textures watch %s, first fs %s total %llu", s_dump_draw_textures_env, fs->hash.c_str(),
+                (unsigned long long)g_stats.total);
+        }
+        if (s_dump_draw_textures_done < 6 && fs &&
+            std::strncmp(s_dump_draw_textures_env, fs->hash.c_str(), 16) == 0 &&
+            s_dump_draw_textures_env[16] == '@' &&
+            g_stats.total >= std::strtoull(s_dump_draw_textures_env + 17, nullptr, 10)) {
+            const uint64_t tag = uint64_t(s_dump_draw_textures_done++) << 8;
             draw_end_rendering(cb, 6);
             for (size_t k = 0; k < g_textures.resolved.size(); k++) {
                 const ResolvedTexture& r = g_textures.resolved[k];
@@ -751,12 +886,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     const Targets& tt = *tp;
     flush_compute_barrier(cb);
     vertex_read_barrier(cb, vs);  // G4
-    static thread_local uint64_t s_cached_target_c0 = UINT64_MAX, s_cached_target_depth = UINT64_MAX;
-    static thread_local uint32_t s_cached_target_color_count = UINT32_MAX;
-    static thread_local bool s_cached_uw_wide = false;
-    static thread_local bool s_cached_hud_target = false;
-    static thread_local bool s_cached_shadow_target = false;
-    static thread_local bool s_cached_low_3d_target = false;
 
     uint64_t cur_c0 = t.color_count ? t.colors[0] : 0;
     if (cur_c0 != s_cached_target_c0 || t.depth != s_cached_target_depth || t.color_count != s_cached_target_color_count) {
@@ -780,8 +909,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     g_low_3d_target = s_cached_low_3d_target;
     bool need_break = gathered & kNeedBreak;
     if (gathered & kSampledPending) clears_flush_reason(11), clears_flush(cb);  // cleared (and stored) before it is sampled
-    static const bool bytes = std::getenv("NX_TARGETS_MEMCMP") != nullptr;  // bisecting
-    bool targets_changed = !g_rendering || (bytes ? std::memcmp(&g_pass, &tt, sizeof tt) != 0 : !targets_same(g_pass, tt));
+    bool targets_changed = !g_rendering || (s_targets_memcmp ? std::memcmp(&g_pass, &tt, sizeof tt) != 0 : !targets_same(g_pass, tt));
     if (g_rendering && (need_break || targets_changed)) {
         (targets_changed ? g_stats.breaks_targets : g_stats.breaks_textures)++;
         // NX_CLEARS_V2: pending clears wait for the pass that takes them, or for one on their images (begin_rendering).
@@ -813,15 +941,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
     VkPipeline pipeline = VK_NULL_HANDLE;
 
-    struct MruEntry {
-        PipelineKey key;
-        VkPipelineLayout layout;
-        VkPipeline pipeline;
-    };
-    static constexpr size_t kMruSize = 8;
-    static thread_local MruEntry s_mru_cache[kMruSize]{};
-    static thread_local size_t s_mru_count = 0;
-
     // Pipeline.
     PipelineKey key;
         std::memset(&key, 0, sizeof key);  // the key is compared byte for byte
@@ -842,10 +961,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         // (live flag ui_rgb, PROGRESO 70). Only textured draws (the art): the untextured shapes with the same blending
         // build alpha that a later DST_ALPHA fill reads, as in the voice-language notice, whose black panel came out
         // grey when they kept it too (PROGRESO 71). NX_HUD_KEEP_ALPHA=all: untextured ones too; 0: as the game asks.
-        static const char* keep_env = std::getenv("NX_HUD_KEEP_ALPHA");
-        static const int keep_hud_alpha = !keep_env ? 0 : keep_env[0] == '1' ? 1 : keep_env[0] == 'a' ? 2 : 0;
-        if (keep_hud_alpha && key.color.blend_enable[0] && live_ui_draw(t) &&
-            (keep_hud_alpha == 2 || !g_textures.bindings.empty())) {
+        if (s_keep_hud_alpha && key.color.blend_enable[0] && live_ui_draw(t) &&
+            (s_keep_hud_alpha == 2 || !g_textures.bindings.empty())) {
             const BlendTarget& b = key.blend[0];
             if (b.src_rgb == 5 && b.dst_rgb == 6 && b.src_a == 5 && b.dst_a == 6 && b.eq_rgb <= 1 && b.eq_a <= 1)
                 key.mask.mask[0] &= 7;
@@ -864,9 +981,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         // 0xFFFF, the same for 16-bit indices), and point, line and triangle lists where the device has
         // VK_EXT_primitive_topology_list_restart (the Adreno 610 has it); NVN's 0xFFFF in 32-bit indices would need a
         // rewrite (counted by restart_stats). NX_PRIM_RESTART=0: off, as before.
-        static const bool restart_on = !(std::getenv("NX_PRIM_RESTART") && std::getenv("NX_PRIM_RESTART")[0] == '0');
         const bool strip = mode == 3 || mode == 5 || mode == 6, list = mode == 0 || mode == 1 || mode == 4;
-        key.restart = restart_on && indexed && g_state.restart && (strip || (list && vk_list_restart())) ? 1 : 0;
+        key.restart = s_prim_restart_on && indexed && g_state.restart && (strip || (list && vk_list_restart())) ? 1 : 0;
         if (indexed && g_state.restart) restart_stats(mode, c);
         frame_draws(vs, indexed ? uint64_t(c.i[0]) : uint64_t(c.i[1]));
         key.color_count = t.color_count, key.depth_clamp = g_state.depth_clamp;
@@ -883,14 +999,12 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         // widened) and composited into the scene target by a quad: the vertex shaders seen drawing into such layer targets
         // are the "UI" ones, and a UI quad into a widened target that does not sample a widened texture is squeezed.
         // NX_UW_CAMERA=0 (no camera patch): every geometry draw is squeezed, a world-and-UI shrink.
-        static const bool cam_patch = !(std::getenv("NX_UW_CAMERA") && std::getenv("NX_UW_CAMERA")[0] == '0');
-        if (uw_on() && cam_patch && !g_uw_wide && t.color_count && t.colors[0]) {
+        if (uw_on() && s_uw_cam_patch && !g_uw_wide && t.color_count && t.colors[0]) {
             const Texture* lt = get<Texture>(t.colors[0]);
             if (lt && lt->format == 0x25 && (lt->flags & 8)) uw_ui_vertex_shader(vs);
         }
         // NX_UW_UI=learn: only the vertex shaders learned above; default: every draw without depth test (screen-space UI).
-        static const bool ui_learn = std::getenv("NX_UW_UI") && std::string(std::getenv("NX_UW_UI")) == "learn";
-        const bool ui_pick = !cam_patch || (ui_learn ? uw_is_ui_vertex_shader(vs) : !g_state.depth.depth_test);
+        const bool ui_pick = !s_uw_cam_patch || (s_uw_ui_learn ? uw_is_ui_vertex_shader(vs) : !g_state.depth.depth_test);
         if (g_uw_wide && uw_vs_scaled(vs) && ui_pick) {
             // A short draw (a triangle or a quad) that samples a widened render target is a screen-space pass (post
             // chain, composite): it already covers the widened target.
@@ -902,12 +1016,8 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                         if (GpuImage* si = image_of(r.texture); si && si->uw) samples_wide = true;
             if (!samples_wide) key.uw_x = 1.0f / uw_factor();
         }
-        if (uw_on()) {  // NX_UW_TRACE=<first draw>:<count>: draws (wide = a widened target)
-            static const char* e = std::getenv("NX_UW_TRACE");
-            static uint64_t from = 0, n = 0;
-            static bool init = [&] { if (e) std::sscanf(e, "%lu:%lu", &from, &n); return true; }();
-            (void)init;
-            if (e && g_stats.total >= from && g_stats.total < from + n) {
+        if (uw_on() && __builtin_expect(s_uw_trace.active, 0)) {  // NX_UW_TRACE=<first draw>:<count>: draws (wide = a widened target)
+            if (g_stats.total >= s_uw_trace.from && g_stats.total < s_uw_trace.from + s_uw_trace.count) {
                 GpuImage* wi = t.color_count && t.colors[0] ? image_of(t.colors[0]) : nullptr;
                 const Texture* tx = t.color_count && t.colors[0] ? get<Texture>(t.colors[0]) : nullptr;
                 std::string smp;
@@ -928,15 +1038,18 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         }
         VkPipeline found = VK_NULL_HANDLE;
         for (size_t i = 0; i < s_mru_count; i++) {
-            if (s_mru_cache[i].layout == layout.layout &&
-                std::memcmp(&s_mru_cache[i].key, &key, sizeof(PipelineKey)) == 0) {
-                found = s_mru_cache[i].pipeline;
+            uint8_t idx = s_mru_order[i];
+            const MruEntry& entry = s_mru_cache[idx];
+            if (entry.layout == layout.layout &&
+                entry.key.fs == key.fs &&
+                entry.key.vs == key.vs &&
+                entry.key.topology == key.topology &&
+                std::memcmp(&entry.key, &key, sizeof(PipelineKey)) == 0) {
+                found = entry.pipeline;
                 if (i > 0) {
-                    MruEntry hit = s_mru_cache[i];
-                    for (size_t j = i; j > 0; j--) {
-                        s_mru_cache[j] = s_mru_cache[j - 1];
-                    }
-                    s_mru_cache[0] = hit;
+                    uint8_t hit = s_mru_order[i];
+                    std::memmove(&s_mru_order[1], &s_mru_order[0], i);
+                    s_mru_order[0] = hit;
                 }
                 break;
             }
@@ -946,12 +1059,18 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         } else {
             pipeline = graphics_pipeline(key, layout);
             if (pipeline != VK_NULL_HANDLE) {
-                size_t shift_len = std::min(s_mru_count, kMruSize - 1);
-                for (size_t j = shift_len; j > 0; j--) {
-                    s_mru_cache[j] = s_mru_cache[j - 1];
+                uint8_t insert_idx;
+                if (s_mru_count < kMruSize) {
+                    insert_idx = uint8_t(s_mru_count++);
+                } else {
+                    insert_idx = s_mru_order[kMruSize - 1];
                 }
-                s_mru_cache[0] = {key, layout.layout, pipeline};
-                if (s_mru_count < kMruSize) s_mru_count++;
+                s_mru_cache[insert_idx] = {key, layout.layout, pipeline};
+                size_t shift_len = std::min(s_mru_count - 1, kMruSize - 1);
+                if (shift_len > 0) {
+                    std::memmove(&s_mru_order[1], &s_mru_order[0], shift_len);
+                }
+                s_mru_order[0] = insert_idx;
             }
         }
     if (!pipeline) {
@@ -1028,13 +1147,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     // NX_EXP_3D (an experiment, the picture breaks): on the 3D draws (depth test, a 960-wide pass) "scissor" keeps
     // one pixel (what is left is the vertex and per-draw cost), "tri" draws one triangle (per-draw cost alone),
     // "small" draws into the top-left 3/4 x 3/4 (the GPU work of a 720x405 3D picture).
-    static const int exp3d = [] {
-        const char* e = std::getenv("NX_EXP_3D");
-        return !e ? 0 : std::strcmp(e, "scissor") == 0 ? 1 : std::strcmp(e, "tri") == 0 ? 2 : std::strcmp(e, "small") == 0 ? 3 : 0;
-    }();
-    const bool exp_draw = exp3d && g_state.depth.depth_test && g_pass_extent.width == 960;
-    if (exp_draw && exp3d == 1) sc = {{0, 0}, {1, 1}};
-    if (exp_draw && exp3d == 3) {
+    const bool exp_draw = s_exp3d && g_state.depth.depth_test && g_pass_extent.width == 960;
+    if (exp_draw && s_exp3d == 1) sc = {{0, 0}, {1, 1}};
+    if (exp_draw && s_exp3d == 3) {
         vp.x *= 0.75f, vp.y *= 0.75f, vp.width *= 0.75f, vp.height *= 0.75f;
         sc = {{sc.offset.x * 3 / 4, sc.offset.y * 3 / 4}, {sc.extent.width * 3 / 4, sc.extent.height * 3 / 4}};
     }
@@ -1044,7 +1159,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     trace_skin(indexed, c, vs, fs);
     if (indexed) {
         uint32_t count = uint32_t(c.i[0]);
-        if (exp_draw && exp3d == 2) count = std::min(count, 3u);
+        if (exp_draw && s_exp3d == 2) count = std::min(count, 3u);
         if (g_bound.has_index && g_bound.index.buffer == in.index.buffer && g_bound.index.offset == in.index.offset &&
             g_bound.index_type == in.index_type) {
             g_state_kept++;
@@ -1061,7 +1176,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     } else {
         bool q = zero_draws_on() && zero_draws_begin(cb, vs->hash + " " + (fs ? fs->hash : std::string("-")));
         const int32_t oq = occlusion_query_begin(cb);
-        const uint32_t vcount = exp_draw && exp3d == 2 ? std::min(uint32_t(c.i[1]), 3u) : uint32_t(c.i[1]);
+        const uint32_t vcount = exp_draw && s_exp3d == 2 ? std::min(uint32_t(c.i[1]), 3u) : uint32_t(c.i[1]);
         if (!occlusion_draw(cb, false, vcount, uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), 0, uint32_t(c.i[2])))
             p_vkCmdDraw(cb, vcount, uint32_t(std::max(1, c.i[3])), uint32_t(c.i[0]), uint32_t(c.i[2]));
         occlusion_query_end(cb, oq);
@@ -1075,27 +1190,18 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     for (uint32_t k = 0; k < t.color_count && k < 8; k++) note_linear_target(t.colors[k]);
     // NX_SNAP_FS=<hash>,<hash>[@<first draw>]: also snapshot after draws with those fragment shaders (8 at most, or
     // NX_SNAP_FS_MAX).
-    static const std::string snap_fs = std::getenv("NX_SNAP_FS") ? std::getenv("NX_SNAP_FS") : "";
-    static const uint64_t snap_from = snap_fs.find('@') != std::string::npos
-                                          ? std::strtoull(snap_fs.c_str() + snap_fs.find('@') + 1, nullptr, 10) : 0;
-    static int snap_count = 0;
-    static const int snap_max = std::getenv("NX_SNAP_FS_MAX") ? std::atoi(std::getenv("NX_SNAP_FS_MAX")) : 8;
-    bool snap_by_fs = !snap_fs.empty() && g_stats.done >= snap_from && snap_count < snap_max &&
-                      ((fs && snap_fs.find(fs->hash) != std::string::npos) ||
-                       snap_fs.find(vs->hash) != std::string::npos) &&
-                      ++snap_count;  // the vertex shader's hash matches too
+    bool snap_by_fs = s_snap_fs.active && g_stats.done >= s_snap_fs.from && s_snap_fs_count < s_snap_fs.max &&
+                      ((fs && s_snap_fs.str.find(fs->hash) != std::string::npos) ||
+                       s_snap_fs.str.find(vs->hash) != std::string::npos) &&
+                      ++s_snap_fs_count;  // the vertex shader's hash matches too
     if ((snap_by_fs || snap_follow(t, vs, fs, g_textures.handles) || debug_snap_wanted(g_stats.done)) && t.color_count && t.colors[0])
         if (GpuImage* snap = image_of(t.colors[0])) draw_end_rendering(cb, 6), debug_snapshot(cb, *snap, g_stats.done);
     // NX_DUMP_ON_TARGET=<hex NVNtexture*>: every NX_DUMP_FRAMES-th draw into it asks for NX_DUMP_TEXTURES to be read
     // back right after this submit (before later frames change them).
-    static const char* dump_env = std::getenv("NX_DUMP_ON_TARGET");
-    static const uint64_t dump_target = dump_env ? std::strtoull(dump_env, nullptr, 16) : 0;
-    if (dump_target && t.colors[0] == dump_target) g_dump_request = ++g_dump_draws;
+    if (s_dump_target && t.colors[0] == s_dump_target) g_dump_request = ++g_dump_draws;
     // NX_DUMP_ON_FS=<fs hash>[,...]: a draw with one of these fragment shaders dumps its target 0 and what it samples.
-    static const std::string dump_fs = [] { const char* e = std::getenv("NX_DUMP_ON_FS"); return std::string(e ? e : ""); }();
-    static const uint64_t dump_from = [] { const char* e = std::getenv("NX_DUMP_FROM"); return e ? std::strtoull(e, nullptr, 10) : 0; }();
-    if (!dump_fs.empty() && fs && g_frame >= dump_from && dump_fs.find(fs->hash) != std::string::npos && g_dump_draws < 400 &&
-        t.colors[0] && image_of(t.colors[0]) && (std::getenv("NX_DUMP_ANY") || image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+    if (s_dump_fs.active && fs && g_frame >= s_dump_fs.from && s_dump_fs.str.find(fs->hash) != std::string::npos && g_dump_draws < 400 &&
+        t.colors[0] && image_of(t.colors[0]) && (s_dump_fs.any || image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
                                                            image_of(t.colors[0])->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) {
         debug_dump_add(t.colors[0]);
         for (const ResolvedTexture& r : g_textures.resolved) debug_dump_add(r.texture);

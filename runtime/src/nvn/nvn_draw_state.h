@@ -166,6 +166,7 @@ void written_log();
 // c[0], the NVN driver constants of a stage (nvn_dedup.cpp).
 std::array<uint8_t, 0x1000> driver_constants(ShaderStage stage, int st);
 
+bool debug_shader_overrides_active();
 bool debug_shader_overrides(const std::vector<const ShaderInfo*>*& shaders, const ShaderInfo*& fs,
                             std::vector<const ShaderInfo*>& swapped);
 // nvn_raster.cpp: the stencil, polygon offset, depth bounds and depth clamp commands into g_state (false for other

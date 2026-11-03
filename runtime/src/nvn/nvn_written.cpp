@@ -382,11 +382,14 @@ void write_back_log(uint64_t frames) {
             double(ns) / 1e6 / double(frames));
 }
 
+static const bool s_wb_whole = std::getenv("NX_WRITE_BACK_WHOLE") != nullptr;
+static const bool s_wb_bulk = !(std::getenv("NX_WB_BULK") && std::getenv("NX_WB_BULK")[0] == '0');
+static thread_local std::vector<uint8_t> s_wb_copy;
+
 void apply_write_back(const WriteBack& w) {
-    static const bool whole = std::getenv("NX_WRITE_BACK_WHOLE") != nullptr;
     const uint64_t t0 = plat::monotonic_ns();
     g_wb_count++, g_wb_bytes += w.size;
-    if (whole || !w.before || w.before->size() < w.size) {
+    if (s_wb_whole || !w.before || w.before->size() < w.size) {
         plat::fast_memcpy(w.to, w.from, w.size);
         g_wb_ns += plat::monotonic_ns() - t0;
         return;
@@ -395,13 +398,11 @@ void apply_write_back(const WriteBack& w) {
     // The GPU's bytes copied out of the upload ring in one memcpy first: compared word by word in place, they were
     // read at ~34 MB/s on the Adreno 610 (55 ms a frame on the 3D title, 7.7 fps; with the copy 6 ms, 13.9 fps;
     // a host-cached ring alone changed nothing). NX_WB_BULK=0: in place, as before.
-    static const bool bulk = !(std::getenv("NX_WB_BULK") && std::getenv("NX_WB_BULK")[0] == '0');
-    static thread_local std::vector<uint8_t> copy;
     const uint8_t* from = w.from;
-    if (bulk) {
-        if (copy.size() < w.size) copy.resize(w.size);
-        plat::fast_memcpy(copy.data(), w.from, w.size);
-        from = copy.data();
+    if (s_wb_bulk) {
+        if (s_wb_copy.size() < w.size) s_wb_copy.resize(w.size);
+        plat::fast_memcpy(s_wb_copy.data(), w.from, w.size);
+        from = s_wb_copy.data();
     }
     uint64_t k = 0, changed = 0;
     auto apply8 = [&](uint64_t diff, size_t off) {
