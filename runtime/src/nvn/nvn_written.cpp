@@ -57,18 +57,30 @@ bool g_read = false;  // a copy was bound for reading since the last write_after
 uint64_t g_binds = 0;  // written_bind calls, ever (nvn_frames.cpp: did a dispatch write storage after the split)
 uint64_t g_shared = 0, g_merged = 0, g_composed = 0, g_indirect = 0;  // for written_log
 
+static size_t s_before_pool_hint = 0;
+
 // Reusable snapshot buffer pool: prevents 365,000+ mmap/munmap minor page faults
 // caused by allocating and freeing 112 std::vector<uint8_t> buffers every frame.
 std::shared_ptr<std::vector<uint8_t>> alloc_before(uint64_t n) {
-    for (auto& v : g_before_pool) {
-        if (v.use_count() == 1) {
-            v->resize(n);
-            return v;
+    const size_t sz = g_before_pool.size();
+    for (size_t i = s_before_pool_hint; i < sz; ++i) {
+        if (g_before_pool[i].use_count() == 1) {
+            s_before_pool_hint = i + 1;
+            g_before_pool[i]->resize(n);
+            return g_before_pool[i];
+        }
+    }
+    for (size_t i = 0; i < s_before_pool_hint && i < sz; ++i) {
+        if (g_before_pool[i].use_count() == 1) {
+            s_before_pool_hint = i + 1;
+            g_before_pool[i]->resize(n);
+            return g_before_pool[i];
         }
     }
     auto v = std::make_shared<std::vector<uint8_t>>(n);
-    if (g_before_pool.size() < 512) {
+    if (sz < 512) {
         g_before_pool.push_back(v);
+        s_before_pool_hint = g_before_pool.size();
     }
     return v;
 }
@@ -403,6 +415,13 @@ void apply_write_back(const WriteBack& w) {
         if (s_wb_copy.size() < w.size) s_wb_copy.resize(w.size);
         plat::fast_memcpy(s_wb_copy.data(), w.from, w.size);
         from = s_wb_copy.data();
+    }
+
+    // Fast-path early exit: if the GPU output is bit-for-bit identical to the pre-dispatch snapshot,
+    // skip the entire NEON / word-by-word diff loop and all memory stores to guest memory.
+    if (std::memcmp(from, was, w.size) == 0) {
+        g_wb_ns += plat::monotonic_ns() - t0;
+        return;
     }
     uint64_t k = 0, changed = 0;
     auto apply8 = [&](uint64_t diff, size_t off) {

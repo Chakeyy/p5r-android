@@ -366,31 +366,61 @@ void resolve_sets(const ProgramLayout& layout) {
         for (uint32_t k = 0; k < 4; k++) d.sets[k] = VK_NULL_HANDLE;
         return;
     }
-    uint32_t set_counts[4] = {};
+    uint16_t set_indices[4][64];
+    uint8_t set_counts[4] = {};
+    bool overflow = false;
     for (size_t i = 0; i < d.writes.size(); i++) {
         uint8_t s = d.set_index[i];
-        if (s < 4) set_counts[s]++;
+        if (s < 4) {
+            if (set_counts[s] < 64) {
+                set_indices[s][set_counts[s]++] = static_cast<uint16_t>(i);
+            } else {
+                overflow = true;
+                break;
+            }
+        }
     }
     for (uint32_t k = 0; k < 4; k++) {
         d.sets[k] = VK_NULL_HANDLE;
-        if (!set_counts[k]) continue;
+        if (!overflow && !set_counts[k]) continue;
+
         d.key.clear();
-        d.key.reserve(set_counts[k]);
+        if (!overflow) d.key.reserve(set_counts[k]);
+
         uint64_t h = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
-        for (size_t i = 0; i < d.writes.size(); i++) {
-            if (d.set_index[i] != k) continue;
-            const VkWriteDescriptorSet& w = d.writes[i];
-            SetWrite e;
-            e.binding = w.dstBinding, e.type = uint32_t(w.descriptorType);
-            if (w.pBufferInfo)
-                e.a = handle_bits(w.pBufferInfo->buffer), e.b = w.pBufferInfo->offset, e.c = w.pBufferInfo->range;
-            else if (w.pImageInfo)
-                e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
-                e.c = uint64_t(w.pImageInfo->imageLayout);
-            for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
-                h = hash_step(h, v);
-            d.key.push_back(e);
+
+        if (!overflow) {
+            for (uint8_t j = 0; j < set_counts[k]; j++) {
+                size_t i = set_indices[k][j];
+                const VkWriteDescriptorSet& w = d.writes[i];
+                SetWrite e;
+                e.binding = w.dstBinding, e.type = uint32_t(w.descriptorType);
+                if (w.pBufferInfo)
+                    e.a = handle_bits(w.pBufferInfo->buffer), e.b = w.pBufferInfo->offset, e.c = w.pBufferInfo->range;
+                else if (w.pImageInfo)
+                    e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
+                    e.c = uint64_t(w.pImageInfo->imageLayout);
+                for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
+                    h = hash_step(h, v);
+                d.key.push_back(e);
+            }
+        } else {
+            for (size_t i = 0; i < d.writes.size(); i++) {
+                if (d.set_index[i] != k) continue;
+                const VkWriteDescriptorSet& w = d.writes[i];
+                SetWrite e;
+                e.binding = w.dstBinding, e.type = uint32_t(w.descriptorType);
+                if (w.pBufferInfo)
+                    e.a = handle_bits(w.pBufferInfo->buffer), e.b = w.pBufferInfo->offset, e.c = w.pBufferInfo->range;
+                else if (w.pImageInfo)
+                    e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
+                    e.c = uint64_t(w.pImageInfo->imageLayout);
+                for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
+                    h = hash_step(h, v);
+                d.key.push_back(e);
+            }
         }
+
         if (d.key.empty()) continue;
         CachedSet* slot = nullptr;
         for (uint32_t probe = uint32_t(h >> 32);; probe++) {
@@ -407,8 +437,15 @@ void resolve_sets(const ProgramLayout& layout) {
         }
         if (d.sets[k]) continue;
         d.sets[k] = descriptor_set(layout.sets[k]), g_set_misses++;
-        for (size_t i = 0; i < d.writes.size(); i++)
-            if (d.set_index[i] == k) d.writes[i].dstSet = d.sets[k];
+
+        if (!overflow) {
+            for (uint8_t j = 0; j < set_counts[k]; j++)
+                d.writes[set_indices[k][j]].dstSet = d.sets[k];
+        } else {
+            for (size_t i = 0; i < d.writes.size(); i++)
+                if (d.set_index[i] == k) d.writes[i].dstSet = d.sets[k];
+        }
+
         if (!d.sets[k] || g_set_used >= kSetSlots / 2) continue;
         *slot = {g_set_generation, h, layout.sets[k], uint32_t(g_set_arena.size()), uint32_t(d.key.size()), d.sets[k]};
         g_set_arena.insert(g_set_arena.end(), d.key.begin(), d.key.end());

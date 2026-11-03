@@ -7,7 +7,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.p5rrecomp.opt"
     android:versionCode="19"
-    android:versionName="0.5.2-lowend-r49">
+    android:versionName="0.5.2-lowend-r50">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />

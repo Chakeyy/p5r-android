@@ -693,7 +693,7 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r49";
+static constexpr const char* kPerfBuildTag = "lowend-r50";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
