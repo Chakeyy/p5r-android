@@ -680,9 +680,9 @@ void game::after_init() {
     // The HUD pass that darkens partly transparent HUD pixels takes alpha >= 0.9 as opaque: the BC3 art's alphas of
     // 246..254 inside the shapes made dark specks on the battle portraits (runtime nvn_spirv_patch.cpp, PROGRESO 70).
     setenv("NX_OPAQUE_FS", "21835d19dd86fcec:0.9", 0);
-    // Its plain alpha-blended HUD art (textured draws only) leaves the HUD target's alpha alone (runtime nvn_draw.cpp,
-    // PROGRESO 70-71): the faces' translucent layers came out grey with the threshold alone.
-    setenv("NX_HUD_KEEP_ALPHA", "1", 0);
+    // Retain native HUD destination alpha writing (NX_HUD_KEEP_ALPHA=0) so DST_ALPHA text masking
+    // for dialogue choices and phone IM selections functions properly.
+    setenv("NX_HUD_KEEP_ALPHA", "0", 0);
 #endif
     const LoadedModule* m = module_at(find_symbol("nnMain"));
     if (m && (g_interval_setter = hook_function(m->base + 0x1048ee0, interval_setter_hook))) {
@@ -693,12 +693,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r47";
+static constexpr const char* kPerfBuildTag = "lowend-r48";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (targeted UI probe for choice text, live flags env hook, stencil trace)",
+    log("p5r perf build: %s (default HUD alpha preservation for choice text, stencil aspect for cut-ins)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:

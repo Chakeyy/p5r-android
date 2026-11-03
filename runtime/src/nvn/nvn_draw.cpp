@@ -1041,43 +1041,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
     vp.y += vp.height, vp.height = -vp.height;
     set_dynamic(cb, vp, sc);
 
-    bool is_ui_font = fs && fs->hash == "d586c22f9c5bc8cd";
-    bool is_ui_banner = fs && fs->hash == "6103f5f6cb2c2247";
-    if (is_ui_font || is_ui_banner) {
-        static uint32_t s_ui_draw_count = 0;
-        uint64_t f = g_frame.load();
-        if (s_ui_draw_count < 60 || (f % 180 == 0)) {
-            if (s_ui_draw_count < 60) s_ui_draw_count++;
-            const BlendTarget& b = key.blend[0];
-            log("nvn/ui_probe: f %llu draw %llu [%s] vs %s pipe %p d_test %u d_write %u d_func %u s_test %u s_func [%u,%u] ref [%u,%u] mask [%#x,%#x] wmask [%#x,%#x] blend %u eq [%u,%u] src [%u,%u] dst [%u,%u] colormask %#x",
-                (unsigned long long)f,
-                (unsigned long long)g_stats.total,
-                is_ui_font ? "FONT" : "BANNER",
-                vs ? vs->hash.c_str() : "-",
-                pipeline,
-                key.depth.depth_test, key.depth.depth_write, key.depth.depth_func,
-                key.depth.stencil_test, key.depth.stencil_func[0], key.depth.stencil_func[1],
-                g_state.stencil_ref[0], g_state.stencil_ref[1],
-                g_state.stencil_compare_mask[0], g_state.stencil_compare_mask[1],
-                g_state.stencil_write_mask[0], g_state.stencil_write_mask[1],
-                key.color.blend_enable[0], b.eq_rgb, b.eq_a,
-                b.src_rgb, b.src_a, b.dst_rgb, b.dst_a,
-                key.mask.mask[0]);
-        }
-    } else if (key.depth.stencil_test && g_state.stencil_ref[0] != 10) {
-        static uint32_t s_stencil_draw_count = 0;
-        if (s_stencil_draw_count++ < 60) {
-            log("nvn/stencil: draw %llu vs %s fs %s func [%u,%u] ref [%u,%u] mask [%#x,%#x] write [%#x,%#x] d_func %u d_test %u d_write %u",
-                (unsigned long long)g_stats.total,
-                vs ? vs->hash.c_str() : "-", fs ? fs->hash.c_str() : "-",
-                key.depth.stencil_func[0], key.depth.stencil_func[1],
-                g_state.stencil_ref[0], g_state.stencil_ref[1],
-                g_state.stencil_compare_mask[0], g_state.stencil_compare_mask[1],
-                g_state.stencil_write_mask[0], g_state.stencil_write_mask[1],
-                key.depth.depth_func, key.depth.depth_test, key.depth.depth_write);
-        }
-    }
-
     trace_skin(indexed, c, vs, fs);
     if (indexed) {
         uint32_t count = uint32_t(c.i[0]);
