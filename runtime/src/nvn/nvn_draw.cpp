@@ -941,8 +941,35 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
     VkPipeline pipeline = VK_NULL_HANDLE;
 
-    // Pipeline.
-    PipelineKey key;
+    // Fast-path bypass: if consecutive draws share the same shader programs, topology,
+    // pipeline state generation, layout, and render targets, reuse the bound graphics pipeline directly.
+    // This avoids a 704-byte memset, array copies, target format lookups, and 704-byte memcmp MRU searches.
+    static const ShaderInfo* s_cached_pipe_vs = nullptr;
+    static const ShaderInfo* s_cached_pipe_fs = nullptr;
+    static uint32_t s_cached_pipe_mode = 0;
+    static bool s_cached_pipe_indexed = false;
+    static VkPipelineLayout s_cached_pipe_layout = VK_NULL_HANDLE;
+    static uint32_t s_cached_pipe_state_version = 0;
+    static bool s_cached_pipe_textures_empty = false;
+    static VkPipeline s_cached_fast_pipeline = VK_NULL_HANDLE;
+
+    if (g_bound.pipeline != VK_NULL_HANDLE &&
+        g_bound.cb == cb &&
+        s_cached_fast_pipeline == g_bound.pipeline &&
+        vs == s_cached_pipe_vs &&
+        fs == s_cached_pipe_fs &&
+        mode == s_cached_pipe_mode &&
+        indexed == s_cached_pipe_indexed &&
+        layout.layout == s_cached_pipe_layout &&
+        replay::g_pipeline_state_version == s_cached_pipe_state_version &&
+        !targets_changed &&
+        g_textures.bindings.empty() == s_cached_pipe_textures_empty &&
+        !uw_on() &&
+        !live_flags()) {
+        pipeline = s_cached_fast_pipeline;
+    } else {
+        // Pipeline.
+        PipelineKey key;
         std::memset(&key, 0, sizeof key);  // the key is compared byte for byte
         key.vs = vs, key.fs = fs;
         key.topology = mode;
@@ -1073,6 +1100,17 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 s_mru_order[0] = insert_idx;
             }
         }
+        if (pipeline != VK_NULL_HANDLE) {
+            s_cached_pipe_vs = vs;
+            s_cached_pipe_fs = fs;
+            s_cached_pipe_mode = mode;
+            s_cached_pipe_indexed = indexed;
+            s_cached_pipe_layout = layout.layout;
+            s_cached_pipe_state_version = replay::g_pipeline_state_version;
+            s_cached_pipe_textures_empty = g_textures.bindings.empty();
+            s_cached_fast_pipeline = pipeline;
+        }
+    }
     if (!pipeline) {
         g_stats.no_pipeline++;
         return false;

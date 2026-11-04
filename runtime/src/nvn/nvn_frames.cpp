@@ -449,7 +449,7 @@ void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* rin
         g_chunk_draws = 0;  // Adreno 8xx driver bug: chunked submissions hang the GPU during battle passes
         log("nvn/vk: Adreno 8xx GPU detected: chunk submits disabled to prevent GPU hang");
     } else {
-        g_chunk_draws = 500;
+        g_chunk_draws = 150;
     }
 #else
     g_chunk_draws = uint64_t(env_int("NX_SUBMIT_CHUNK_DRAWS"));

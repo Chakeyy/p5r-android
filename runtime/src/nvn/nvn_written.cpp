@@ -261,9 +261,22 @@ bool written_indirect(VkCommandBuffer cb, const uint8_t* p) {
 
 bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in) {
     // Vertex buffers: the bound ranges of the streams the vertex shader reads (the pipeline declares no others).
-    for (const ShaderIo& io : vs->refl.inputs)
-        if (io.location < g_state.attribs.size() && g_state.attribs[io.location].stream < 15)
-            in.used |= 1u << g_state.attribs[io.location].stream;
+    static const ShaderInfo* s_cached_stream_vs = nullptr;
+    static uint32_t s_cached_stream_attrib_ver = 0;
+    static uint32_t s_cached_used_mask = 0;
+
+    if (vs == s_cached_stream_vs && g_attrib_state_version == s_cached_stream_attrib_ver) {
+        in.used = s_cached_used_mask;
+    } else {
+        uint32_t used = 0;
+        for (const ShaderIo& io : vs->refl.inputs)
+            if (io.location < g_state.attribs.size() && g_state.attribs[io.location].stream < 15)
+                used |= 1u << g_state.attribs[io.location].stream;
+        s_cached_stream_vs = vs;
+        s_cached_stream_attrib_ver = g_attrib_state_version;
+        s_cached_used_mask = used;
+        in.used = used;
+    }
     for (uint32_t s = 0; s < 15; s++) {
         if (!(in.used >> s & 1)) continue;
         const Range& r = g_state.vertex_buffers[s];

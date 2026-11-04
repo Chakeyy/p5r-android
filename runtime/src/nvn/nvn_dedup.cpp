@@ -70,6 +70,12 @@ void count_copy(const uint8_t* p, uint64_t size) {
 
 UploadKind g_upload_kind = kUploadOther;
 
+namespace {
+static const uint8_t* s_last_dedup_p = nullptr;
+static uint64_t s_last_dedup_gen = 0;
+static Entry s_last_dedup_entry{};
+}  // namespace
+
 Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align) {
     if (!p || !size) {
         Upload u = upload_alloc(padded, align);
@@ -77,6 +83,12 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
         return u;
     }
     static const bool off = std::getenv("NX_NO_DEDUP") != nullptr;  // bisecting: a fresh copy every time
+    if (!off && p == s_last_dedup_p && g_generation == s_last_dedup_gen) {
+        if (s_last_dedup_entry.size == size && s_last_dedup_entry.padded == padded && s_last_dedup_entry.upload.offset % align == 0) {
+            g_saved += padded;
+            return s_last_dedup_entry.upload;
+        }
+    }
     Front& f = front_of(p);
     const Entry* e = nullptr;
     if (!off && f.generation == g_generation && f.p == p) {
@@ -87,6 +99,9 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     }
     if (e && e->size == size && e->padded == padded && e->upload.offset % align == 0) {
         g_saved += padded;
+        s_last_dedup_p = p;
+        s_last_dedup_gen = g_generation;
+        s_last_dedup_entry = *e;
         return e->upload;
     }
     frame_guest_read(p, size);  // deferred write-backs over these bytes land first (nvn_frames.cpp)
@@ -94,6 +109,9 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     if (g_upload_kind != kUploadOther && cache_upload(p, size, padded, align, u)) {  // nvn_buffer_cache.cpp
         g_copies[p] = {size, padded, u};
         f = {p, g_generation, {size, padded, u}};
+        s_last_dedup_p = p;
+        s_last_dedup_gen = g_generation;
+        s_last_dedup_entry = {size, padded, u};
         return u;
     }
     u = upload_alloc(padded, align);
@@ -102,13 +120,20 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     if (upload_stats_on()) count_copy(p, size);
     g_copies[p] = {size, padded, u};
     f = {p, g_generation, {size, padded, u}};
+    s_last_dedup_p = p;
+    s_last_dedup_gen = g_generation;
+    s_last_dedup_entry = {size, padded, u};
     g_copied += padded;
     return u;
 }
 
-void dedup_reset() { g_copies.clear(), g_generation++; }
+void dedup_reset() {
+    g_copies.clear(), g_generation++;
+    s_last_dedup_p = nullptr;
+}
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
+    if (s_last_dedup_p >= p && s_last_dedup_p < p + size) s_last_dedup_p = nullptr;
     // Entries starting before p may still reach into it: look back over the few that can.
     auto it = g_copies.lower_bound(p + size);
     while (it != g_copies.begin()) {

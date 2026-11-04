@@ -103,6 +103,7 @@ void gpu_turbo();  // NX_GPU_TURBO=1: the Adreno GPU at its highest clock (perf_
 // role 0: the thread that replays and presents (frame_presented ticks it); 1: the game's main thread.
 void frame_thread_tick(int role);
 void frame_presented();  // after each present to the display
+void place_fast_cores();  // Pin current thread to performance/big cores (frame_stats.cpp; Android)
 // Linux: asks power-profiles-daemon for its performance profile for as long as this process lives (frame_stats.cpp).
 void request_performance_profile();
 // Write watches (write_watch.cpp; page protection, POSIX): add fails when unsupported or full; take re-arms and
@@ -151,6 +152,7 @@ namespace nx::platform {
 using nx::plat::pin_current_thread_to_big_cores;
 using nx::plat::pin_current_thread_to_core;
 using nx::plat::pin_current_thread_to_little_cores;
+using nx::plat::place_fast_cores;
 using nx::plat::reset_current_thread_affinity;
 using nx::plat::set_thread_priority;
 }

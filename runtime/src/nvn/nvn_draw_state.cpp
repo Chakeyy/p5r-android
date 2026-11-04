@@ -11,6 +11,11 @@ namespace nx::nvn {
 
 using namespace replay;
 
+namespace replay {
+uint32_t g_pipeline_state_version = 1;
+uint32_t g_attrib_state_version = 1;
+}
+
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets) {
     State& s = g_state;
     auto blob = [&](size_t size) -> const uint8_t* {
@@ -29,6 +34,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             uint32_t idx = uint32_t(c.a[0]);
             if (s.restart != rst || s.restart_index != idx) {
                 s.restart = rst, s.restart_index = idx;
+                g_pipeline_state_version++;
             }
             break;
         }
@@ -108,45 +114,66 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         case Cmd::BindVertexAttribs:
             if (auto* p = blob(c.n * sizeof(VertexAttrib))) {
                 s.attribs.assign(reinterpret_cast<const VertexAttrib*>(p), reinterpret_cast<const VertexAttrib*>(p) + c.n);
+                g_attrib_state_version++;
+                g_pipeline_state_version++;
             }
             break;
         case Cmd::BindVertexStreams:
             if (auto* p = blob(c.n * sizeof(VertexStream))) {
                 s.streams.assign(reinterpret_cast<const VertexStream*>(p), reinterpret_cast<const VertexStream*>(p) + c.n);
+                g_pipeline_state_version++;
             }
             break;
         case Cmd::BindBlendState:
             if (auto* p = blob(sizeof(BlendTarget))) {
                 BlendTarget b;
                 std::memcpy(&b, p, sizeof b);
-                if (b.target < 8) {
+                if (b.target < 8 && std::memcmp(&s.blend[b.target], &b, sizeof b) != 0) {
                     s.blend[b.target] = b;
+                    g_pipeline_state_version++;
                 }
             }
             break;
         case Cmd::BindColorState:
             if (auto* p = blob(sizeof(ColorStateInfo))) {
-                std::memcpy(&s.color, p, sizeof s.color);
+                if (std::memcmp(&s.color, p, sizeof s.color) != 0) {
+                    std::memcpy(&s.color, p, sizeof s.color);
+                    g_pipeline_state_version++;
+                }
             }
             break;
         case Cmd::BindChannelMaskState:
             if (auto* p = blob(sizeof(ChannelMaskInfo))) {
-                std::memcpy(&s.mask, p, sizeof s.mask);
+                if (std::memcmp(&s.mask, p, sizeof s.mask) != 0) {
+                    std::memcpy(&s.mask, p, sizeof s.mask);
+                    g_pipeline_state_version++;
+                }
             }
             break;
         case Cmd::BindDepthStencilState:
             if (auto* p = blob(sizeof(DepthStencilInfo))) {
-                std::memcpy(&s.depth, p, sizeof s.depth);
+                if (std::memcmp(&s.depth, p, sizeof s.depth) != 0) {
+                    std::memcpy(&s.depth, p, sizeof s.depth);
+                    g_pipeline_state_version++;
+                }
             }
             break;
         case Cmd::BindPolygonState:
             if (auto* p = blob(sizeof(PolygonInfo))) {
-                std::memcpy(&s.polygon, p, sizeof s.polygon);
+                if (std::memcmp(&s.polygon, p, sizeof s.polygon) != 0) {
+                    std::memcpy(&s.polygon, p, sizeof s.polygon);
+                    g_pipeline_state_version++;
+                }
             }
             break;
-        case Cmd::BindMultisampleState:
-            s.alpha_to_coverage = c.n != 0;
+        case Cmd::BindMultisampleState: {
+            bool a2c = c.n != 0;
+            if (s.alpha_to_coverage != a2c) {
+                s.alpha_to_coverage = a2c;
+                g_pipeline_state_version++;
+            }
             break;
+        }
         case Cmd::SetBlendColor: std::memcpy(s.blend_color, c.f, sizeof s.blend_color); break;
         case Cmd::UpdateUniformBuffer: {  // (buffer address, size, offset, data): written in order, like the GPU
             uint64_t off = c.a[2];
