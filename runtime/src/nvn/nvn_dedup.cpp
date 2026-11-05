@@ -37,7 +37,7 @@ struct Front {
     uint64_t generation = 0;
     Entry entry;
 };
-constexpr size_t kFrontSlots = 8192;
+constexpr size_t kFrontSlots = 16384;
 Front g_front[kFrontSlots];
 uint64_t g_generation = 1;
 Front& front_of(const uint8_t* p) {

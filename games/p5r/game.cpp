@@ -400,8 +400,12 @@ void interval_setter_hook(CPU& c) {
         last_cull_eval = ev;
         last_cull_hidden = hd;
         if (d_ev > 0) {
-            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%) over 300 frames",
-                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev));
+            static const float s_log_scale = [] {
+                const char* e = std::getenv("NX_P5R_DIST_SCALE");
+                return e ? std::clamp(float(std::atof(e)), 0.5f, 3.0f) : 1.4f;
+            }();
+            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%, scale %.2fx) over 300 frames",
+                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev), s_log_scale);
         }
     }
 }
@@ -479,6 +483,11 @@ void cull_job_hook(CPU& c) {
         const char* e = std::getenv("NX_P5R_DIST_CULL");
         return !(e && e[0] == '0');
     }();
+    static const float dist_cull_scale = [] {
+        const char* e = std::getenv("NX_P5R_DIST_SCALE");
+        if (e) return std::clamp(float(std::atof(e)), 0.5f, 3.0f);
+        return 1.4f;  // Default 1.4x for Android mobile to aggressively cull street/supermarket clutter
+    }();
 
     if (dist_cull_on && after.ptr) {
         const int n = int(ld<uint32_t>(list + 8));
@@ -523,29 +532,33 @@ void cull_job_hook(CPU& c) {
                 if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
                 const float radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
 
+                // Protect structural meshes (building walls, roads, large ground planes, ceilings)
+                if (radius >= 3.0f) continue;
+
                 g_cull_eval.fetch_add(1, std::memory_order_relaxed);
 
                 // Progressive tiered small-object / clutter distance culling:
                 // Money bundles & small clutter boxes on vault shelves have radius ~0.15m - 0.35m.
+                // Small street props (produce crates, signs, lanterns, packages) have radius ~0.35m - 1.2m.
                 // Steel rack frames have radius > 2.5m, walls/floors > 8.0m, characters > 1.0m.
                 bool cull = false;
                 const float ratio = radius / view_dist;
 
                 if (view_dist < 5.0f) {
                     // Very close (2.5m - 5m): Only cull tiny sub-decimeter clutter
-                    if (radius < 0.08f) cull = true;
+                    if (radius < 0.10f * dist_cull_scale) cull = true;
                 } else if (view_dist < 10.0f) {
-                    // Close (5m - 10m): Cull small shelf boxes (e.g. money stacks on the next rack row)
-                    if (radius < 0.28f || ratio < 0.022f) cull = true;
+                    // Close (5m - 10m): Cull small shelf boxes and tiny street props
+                    if (radius < 0.35f * dist_cull_scale || ratio < 0.026f * dist_cull_scale) cull = true;
                 } else if (view_dist < 20.0f) {
-                    // Medium (10m - 20m): Cull props and clutter on shelves 2-3 rows back
-                    if (radius < 0.45f || ratio < 0.025f) cull = true;
+                    // Medium (10m - 20m): Cull crates, produce boxes, signs, and shelf clutter
+                    if (radius < 0.65f * dist_cull_scale || ratio < 0.032f * dist_cull_scale) cull = true;
                 } else if (view_dist < 40.0f) {
-                    // Far (20m - 40m): Cull clutter on shelves across the room (e.g. from stairs)
-                    if (radius < 0.85f || ratio < 0.025f) cull = true;
+                    // Far (20m - 40m): Cull vending machines, street clutter, and interior fixtures
+                    if (radius < 1.25f * dist_cull_scale || ratio < 0.035f * dist_cull_scale) cull = true;
                 } else {
-                    // Very far (> 40m): Cull anything under 2.0m across large vault halls
-                    if (radius < 2.0f || ratio < 0.030f) cull = true;
+                    // Very far (> 40m): Cull decorative clutter across street / palace vistas
+                    if (radius < 2.5f * dist_cull_scale || ratio < 0.040f * dist_cull_scale) cull = true;
                 }
 
                 if (cull) {
@@ -693,12 +706,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r52";
+static constexpr const char* kPerfBuildTag = "renderopt-r53";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (fast-core affinity, chunk draws 150, pipeline key bypass, stream cache)",
+    log("p5r perf build: %s (worker unpinning, street distance culling, EarlyFragmentTests, FP16 bloom, shadow depth DONT_CARE)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:

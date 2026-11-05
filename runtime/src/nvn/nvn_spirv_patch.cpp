@@ -654,6 +654,55 @@ bool optimize_spirv_mali(const std::vector<uint32_t>& in, std::vector<uint32_t>&
     return modified;
 }
 
+// Injects OpExecutionMode %main EarlyFragmentTests (ExecutionMode 20) for opaque fragment shaders
+// on ARM Mali GPUs (e.g. Mali-G57 MC2). This enables Forward Pixel Kill (FPK) hardware to discard
+// occluded fragments prior to shader execution, eliminating fragment shading for hidden surfaces.
+bool inject_early_fragment_tests_mali(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
+    constexpr uint32_t OpEntryPointOp = 15, OpExecutionModeOp = 16;
+    constexpr uint32_t ExecutionModelFragment = 4;
+    constexpr uint32_t ModeEarlyFragmentTests = 20;
+    constexpr uint32_t ModeDepthReplacing = 12;
+
+    if (in.size() < 5) return false;
+
+    uint32_t entry_id = 0;
+    size_t after_mode = 0;
+    bool has_discard = false;
+    bool has_early_tests = false;
+    bool is_fragment = false;
+
+    for (size_t i = 5; i < in.size();) {
+        uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+        if (!len || i + len > in.size()) return false;
+        const uint32_t* w = &in[i];
+
+        if (op == OpEntryPointOp && len >= 3) {
+            if (w[1] == ExecutionModelFragment) {
+                is_fragment = true;
+                entry_id = w[2];
+            }
+            after_mode = std::max(after_mode, i + len);
+        } else if (op == OpExecutionModeOp && len >= 3) {
+            after_mode = std::max(after_mode, i + len);
+            if (w[2] == ModeEarlyFragmentTests) has_early_tests = true;
+            if (w[2] == ModeDepthReplacing) has_discard = true;
+        } else if (op == 252 /* OpKill */ || op == 5380 /* OpDemoteToHelperInvocationEXT */ ||
+                   op == 4416 /* OpTerminateInvocation */) {
+            has_discard = true;
+        }
+        i += len;
+    }
+
+    if (!is_fragment || !entry_id || !after_mode || has_discard || has_early_tests) return false;
+
+    const std::vector<uint32_t> mode_inst = {(3u << 16) | OpExecutionModeOp, entry_id, ModeEarlyFragmentTests};
+
+    out.assign(in.begin(), in.begin() + long(after_mode));
+    out.insert(out.end(), mode_inst.begin(), mode_inst.end());
+    out.insert(out.end(), in.begin() + long(after_mode), in.end());
+    return true;
+}
+
 // Inject RelaxedPrecision (FP16 / mediump) for ARM Mali GPUs (e.g. Mali-G57 MC2 Bifrost/Valhall).
 // Mali execution engines have 2x peak throughput for FP16 ALU instructions and halved register pressure.
 // We decorate fragment color ALU (OpFAdd, OpFSub, OpFMul, OpVectorTimesScalar, OpDot) and
@@ -782,15 +831,32 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
         return !(e && e[0] == '0');
     }();
     if (mali_opt && optimize_spirv_mali(code, next)) code.swap(next);
-    static const bool mali_fp16 = [] {
-        // Disabled by default: prevents white outline cel-shading artifacts on character 3D models
+    static const bool early_tests_on = [] {
+        const char* e = std::getenv("NX_MALI_EARLY_TESTS");
+        return !(e && e[0] == '0');
+    }();
+    if (early_tests_on && s->stage == ShaderStage::Fragment && inject_early_fragment_tests_mali(code, next)) {
+        code.swap(next);
+        static int early_logs = 0;
+        if (early_logs++ < 5) log("nvn/vk: shader %s: injected EarlyFragmentTests for Mali FPK hardware culling", s->hash.c_str());
+    }
+    static const bool mali_fp16_bloom = [] {
+        const char* e = std::getenv("NX_MALI_FP16_BLOOM");
+        return !(e && e[0] == '0');
+    }();
+    static const bool mali_fp16_all = [] {
         const char* e = std::getenv("NX_MALI_FP16");
         return e && e[0] == '1';
     }();
-    if (mali_fp16 && s->stage == ShaderStage::Fragment && inject_fp16_relaxed_precision_mali(code, next)) {
+    // Protect character 3D cel-shading outlines by restricting default FP16 RelaxedPrecision
+    // strictly to post-processing, bloom, blur, and tone mapping passes (which declare <= 2 vertex inputs).
+    bool is_bloom_postfx = (s->refl.inputs.size() <= 2);
+    if ((mali_fp16_all || (mali_fp16_bloom && is_bloom_postfx)) &&
+        s->stage == ShaderStage::Fragment && inject_fp16_relaxed_precision_mali(code, next)) {
         code.swap(next);
         static int fp16_logs = 0;
-        if (fp16_logs++ < 5) log("nvn/vk: shader %s: injected FP16 RelaxedPrecision decorations", s->hash.c_str());
+        if (fp16_logs++ < 10) log("nvn/vk: shader %s (%s): injected FP16 RelaxedPrecision decorations",
+                                  s->hash.c_str(), is_bloom_postfx ? "bloom/postfx" : "general");
     }
     return code;
 }

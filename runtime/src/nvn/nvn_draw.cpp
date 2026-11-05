@@ -231,6 +231,11 @@ void pass_census(const Targets& t, const VkRenderingAttachmentInfo* colors, cons
     e.passes++, e.load += load, e.store += store;
 }
 
+static const bool s_shadows_off = [] {
+    const char* e = std::getenv("NX_SHADOWS");
+    return e && e[0] == '0';
+}();
+
 void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     if (clears_pending_other(t)) {  // other targets' clears first, in order (NX_CLEARS_V2: only those on its images)
         if (live_clears_why()) clears_log_mismatch("pass", t);
@@ -282,7 +287,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         depth.loadOp = fresh >> 8 & 1 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.clearValue.depthStencil = {1.0f, 0};  // far (a fresh depth buffer; the course passes test LESS)
-        depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depth.storeOp = (g_shadow_target && s_shadows_off) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
         extent = {std::min(extent.width, std::max(1u, dimg->width >> level)),
                   std::min(extent.height, std::max(1u, dimg->height >> level))};
     } else {
@@ -421,11 +426,6 @@ void vertex_read_barrier(VkCommandBuffer cb, const ShaderInfo* vs) {
                            nullptr, 0, nullptr);
     g_vertex_pending = false, g_vertex_barriers++, g_vertex_visible_at = g_pass_serial;
 }
-
-static const bool s_shadows_off = [] {
-    const char* e = std::getenv("NX_SHADOWS");
-    return e && e[0] == '0';
-}();
 
 // NX_SHADOWS=0 (the launcher's "Sombras: desactivadas"): no draws into shadow maps, the square depth-only targets of
 // 512 or more (P5R: 2048 and 1024, D32). Their clears stay: the maps say "lit" everywhere.

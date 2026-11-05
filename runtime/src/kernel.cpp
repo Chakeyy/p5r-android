@@ -413,6 +413,15 @@ static void thread_main(void* p) {
     // starving the frame-critical Vulkan Replay and Present threads.
     if (t->core >= 2 || t->prio >= 44) {
         plat::set_thread_priority(0);
+        static const bool worker_little = [] {
+            const char* e = std::getenv("NX_WORKER_LITTLE");
+            return e && e[0] == '1';
+        }();
+        if (worker_little) {
+            plat::pin_current_thread_to_little_cores(name);
+        } else {
+            plat::reset_current_thread_affinity(name);
+        }
     }
 
     call(t->ctx, t->entry);
