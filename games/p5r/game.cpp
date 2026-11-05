@@ -706,12 +706,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r53";
+static constexpr const char* kPerfBuildTag = "renderopt-r54";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (worker unpinning, street distance culling, EarlyFragmentTests, FP16 bloom, shadow depth DONT_CARE)",
+    log("p5r perf build: %s (worker unpinning, street distance culling, shadow depth DONT_CARE)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
