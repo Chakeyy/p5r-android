@@ -864,9 +864,29 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
     if (!p) return false;
     in.index_type = vk_index_type(c.mask);
     uint64_t bytes = uint64_t(uint32_t(c.i[0])) * index_size(c.mask);
-    g_upload_kind = kUploadIndex;
-    if (!written_read(cb, p, bytes, bytes, index_size(c.mask), in.index)) in.index = dedup_upload(p, bytes, bytes, 16);
-    g_upload_kind = kUploadOther;
+
+    struct LastIndexEntry {
+        uint64_t addr = 0;
+        uint64_t bytes = 0;
+        uint32_t mask = 0;
+        uint64_t gen = 0;
+        uint64_t inval = 0;
+        Upload upload{};
+    };
+    static LastIndexEntry s_last_index;
+    const uint64_t cur_gen = dedup_generation();
+    const uint64_t cur_inval = dedup_inval_epoch();
+
+    if (c.a[0] && c.a[0] == s_last_index.addr && bytes == s_last_index.bytes &&
+        c.mask == s_last_index.mask && cur_gen == s_last_index.gen && cur_inval == s_last_index.inval) {
+        in.index = s_last_index.upload;
+    } else {
+        g_upload_kind = kUploadIndex;
+        if (!written_read(cb, p, bytes, bytes, index_size(c.mask), in.index))
+            in.index = dedup_upload(p, bytes, bytes, 16);
+        g_upload_kind = kUploadOther;
+        s_last_index = {c.a[0], bytes, c.mask, cur_gen, cur_inval, in.index};
+    }
     return true;
 }
 

@@ -277,14 +277,34 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
         s_cached_used_mask = used;
         in.used = used;
     }
+    struct StreamCacheEntry {
+        uint64_t address = 0;
+        uint64_t size = 0;
+        uint64_t gen = 0;
+        uint64_t inval = 0;
+        Upload upload{};
+    };
+    static StreamCacheEntry s_stream_cache[16];
+
+    const uint64_t cur_gen = dedup_generation();
+    const uint64_t cur_inval = dedup_inval_epoch();
+
     for (uint32_t s = 0; s < 15; s++) {
         if (!(in.used >> s & 1)) continue;
         const Range& r = g_state.vertex_buffers[s];
+        if (r.address && r.address == s_stream_cache[s].address &&
+            r.size == s_stream_cache[s].size &&
+            cur_gen == s_stream_cache[s].gen &&
+            cur_inval == s_stream_cache[s].inval) {
+            in.vertex[s] = s_stream_cache[s].upload;
+            continue;
+        }
         const uint8_t* p = r.address ? guest_bytes(r.address) : nullptr;
         uint64_t size = p ? std::min<uint64_t>(r.size, 64ull << 20) : 0;
         g_upload_kind = kUploadVertex;
         in.vertex[s] = read_upload(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, 16), 16);
         g_upload_kind = kUploadOther;
+        s_stream_cache[s] = {r.address, r.size, cur_gen, cur_inval, in.vertex[s]};
     }
     if (!indexed) return true;
     uint32_t count = uint32_t(c.i[0]);

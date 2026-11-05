@@ -40,6 +40,7 @@ struct Front {
 constexpr size_t kFrontSlots = 16384;
 Front g_front[kFrontSlots];
 uint64_t g_generation = 1;
+static uint64_t s_dedup_inval = 1;
 Front& front_of(const uint8_t* p) {
     uintptr_t v = uintptr_t(p);
     return g_front[(v >> 4 ^ v >> 13 ^ v >> 22) & (kFrontSlots - 1)];
@@ -127,12 +128,16 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     return u;
 }
 
+uint64_t dedup_generation() { return g_generation; }
+uint64_t dedup_inval_epoch() { return s_dedup_inval; }
+
 void dedup_reset() {
     g_copies.clear(), g_generation++;
     s_last_dedup_p = nullptr;
 }
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
+    s_dedup_inval++;
     if (s_last_dedup_p >= p && s_last_dedup_p < p + size) s_last_dedup_p = nullptr;
     // Entries starting before p may still reach into it: look back over the few that can.
     auto it = g_copies.lower_bound(p + size);

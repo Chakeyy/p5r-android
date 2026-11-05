@@ -104,6 +104,8 @@ void cache_begin_submit();  // frees the copies retired submits read
 void cache_log();
 void dedup_reset();                                     // at each submit
 void dedup_invalidate(const uint8_t* p, uint64_t size);  // guest bytes written during the replay
+uint64_t dedup_generation();
+uint64_t dedup_inval_epoch();
 void dedup_log();
 // nvn_written.cpp: compute results within a submit (docs/nvn/GLITCH-PLAN.md G5), one copy per written guest range.
 bool written_separate();  // NX_COMPUTE_SEPARATE=1: a copy per binding, as before
