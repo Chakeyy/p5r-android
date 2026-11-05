@@ -555,18 +555,18 @@ void cull_job_hook(CPU& c) {
                 bool cull = false;
                 const float ratio = radius / view_dist;
 
-                if (view_dist < 6.0f) {
-                    // Very close (2.5m - 6m): Only cull tiny sub-decimeter clutter
-                    if (radius < 0.15f * dist_cull_scale) cull = true;
-                } else if (view_dist < 12.0f) {
-                    // Close (6m - 12m): Cull small shelf props, crates, trash cans, small signs
-                    if (radius < 0.60f * dist_cull_scale || ratio < 0.045f * dist_cull_scale) cull = true;
-                } else if (view_dist < 20.0f) {
-                    // Medium (12m - 20m): Cull street clutter, storefront displays, vending machines, lanterns
-                    if (radius < 1.40f * dist_cull_scale || ratio < 0.060f * dist_cull_scale) cull = true;
+                if (view_dist < 8.0f) {
+                    // Very close / Indoor rooms (2.5m - 8m): Only cull tiny micro-clutter (pebbles, coins)
+                    if (radius < 0.12f * dist_cull_scale) cull = true;
+                } else if (view_dist < 15.0f) {
+                    // Close (8m - 15m): Cull small shelf props, crates, trash cans, small signs
+                    if (radius < 0.45f * dist_cull_scale || ratio < 0.035f * dist_cull_scale) cull = true;
+                } else if (view_dist < 22.0f) {
+                    // Medium (15m - 22m): Cull street clutter, storefront displays, vending machines, lanterns
+                    if (radius < 1.20f * dist_cull_scale || ratio < 0.055f * dist_cull_scale) cull = true;
                 } else if (view_dist < vista_cutoff) {
-                    // Far (20m - vista_cutoff): Cull secondary storefronts, shop interiors, signs, decorative facades
-                    if (radius < 3.20f * dist_cull_scale || ratio < 0.085f * dist_cull_scale) cull = true;
+                    // Far (22m - vista_cutoff): Cull secondary storefronts, shop interiors, signs, decorative facades
+                    if (radius < 2.80f * dist_cull_scale || ratio < 0.075f * dist_cull_scale) cull = true;
                 } else {
                     // Vista / Long road / Shujin hallway (>= vista_cutoff):
                     // Aggressively cull corridor interiors, secondary storefronts, distant street props
@@ -718,12 +718,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r56";
+static constexpr const char* kPerfBuildTag = "renderopt-r57";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (targeted stream cache, vista distance cutoff, index dedup, worker core isolation)",
+    log("p5r perf build: %s (shadow depth STORE, indoor culling protection, targeted stream cache, vista cutoff)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:

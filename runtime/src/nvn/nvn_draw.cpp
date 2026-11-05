@@ -287,7 +287,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
         depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         depth.loadOp = fresh >> 8 & 1 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.clearValue.depthStencil = {1.0f, 0};  // far (a fresh depth buffer; the course passes test LESS)
-        depth.storeOp = (g_shadow_target && s_shadows_off) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         extent = {std::min(extent.width, std::max(1u, dimg->width >> level)),
                   std::min(extent.height, std::max(1u, dimg->height >> level))};
     } else {
