@@ -853,6 +853,27 @@ Upload zero_stream() {
     return z;
 }
 
+struct LastIndexEntry {
+    const uint8_t* host_p = nullptr;
+    uint64_t addr = 0;
+    uint64_t bytes = 0;
+    uint32_t mask = 0;
+    uint64_t gen = 0;
+    Upload upload{};
+};
+static LastIndexEntry s_last_index;
+
+void index_cache_invalidate(const uint8_t* p, uint64_t size) {
+    if (!p || !size) return;
+    const uint8_t* p_end = p + size;
+    if (s_last_index.host_p &&
+        p < s_last_index.host_p + s_last_index.bytes &&
+        s_last_index.host_p < p_end) {
+        s_last_index.addr = 0;
+        s_last_index.host_p = nullptr;
+    }
+}
+
 // draw_inputs (nvn_written.cpp) with the indices shared: a mesh drawn in several passes of a submit (depth, shadows,
 // colour) had its index buffer copied each time. Guest bytes, like the vertex streams, so dedup's rule holds; 8-bit
 // indices are widened per draw as before.
@@ -865,27 +886,17 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
     in.index_type = vk_index_type(c.mask);
     uint64_t bytes = uint64_t(uint32_t(c.i[0])) * index_size(c.mask);
 
-    struct LastIndexEntry {
-        uint64_t addr = 0;
-        uint64_t bytes = 0;
-        uint32_t mask = 0;
-        uint64_t gen = 0;
-        uint64_t inval = 0;
-        Upload upload{};
-    };
-    static LastIndexEntry s_last_index;
     const uint64_t cur_gen = dedup_generation();
-    const uint64_t cur_inval = dedup_inval_epoch();
 
     if (c.a[0] && c.a[0] == s_last_index.addr && bytes == s_last_index.bytes &&
-        c.mask == s_last_index.mask && cur_gen == s_last_index.gen && cur_inval == s_last_index.inval) {
+        c.mask == s_last_index.mask && cur_gen == s_last_index.gen) {
         in.index = s_last_index.upload;
     } else {
         g_upload_kind = kUploadIndex;
         if (!written_read(cb, p, bytes, bytes, index_size(c.mask), in.index))
             in.index = dedup_upload(p, bytes, bytes, 16);
         g_upload_kind = kUploadOther;
-        s_last_index = {c.a[0], bytes, c.mask, cur_gen, cur_inval, in.index};
+        s_last_index = {p, c.a[0], bytes, c.mask, cur_gen, in.index};
     }
     return true;
 }

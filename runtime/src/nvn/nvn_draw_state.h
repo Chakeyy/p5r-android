@@ -107,6 +107,8 @@ void dedup_invalidate(const uint8_t* p, uint64_t size);  // guest bytes written 
 uint64_t dedup_generation();
 uint64_t dedup_inval_epoch();
 void dedup_log();
+void stream_cache_invalidate(const uint8_t* p, uint64_t size);
+void index_cache_invalidate(const uint8_t* p, uint64_t size);
 // nvn_written.cpp: compute results within a submit (docs/nvn/GLITCH-PLAN.md G5), one copy per written guest range.
 bool written_separate();  // NX_COMPUTE_SEPARATE=1: a copy per binding, as before
 // A dispatch's storage binding it writes: the range's copy (made, reused or merged), kAlign aligned.

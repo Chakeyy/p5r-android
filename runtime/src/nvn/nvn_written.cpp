@@ -259,6 +259,28 @@ bool written_indirect(VkCommandBuffer cb, const uint8_t* p) {
     return true;
 }
 
+struct StreamCacheEntry {
+    uint64_t address = 0;
+    const uint8_t* host_p = nullptr;
+    uint64_t size = 0;
+    uint64_t gen = 0;
+    Upload upload{};
+};
+static StreamCacheEntry s_stream_cache[16];
+
+void stream_cache_invalidate(const uint8_t* p, uint64_t size) {
+    if (!p || !size) return;
+    const uint8_t* p_end = p + size;
+    for (uint32_t s = 0; s < 15; s++) {
+        if (s_stream_cache[s].host_p &&
+            p < s_stream_cache[s].host_p + s_stream_cache[s].size &&
+            s_stream_cache[s].host_p < p_end) {
+            s_stream_cache[s].address = 0;
+            s_stream_cache[s].host_p = nullptr;
+        }
+    }
+}
+
 bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in) {
     // Vertex buffers: the bound ranges of the streams the vertex shader reads (the pipeline declares no others).
     static const ShaderInfo* s_cached_stream_vs = nullptr;
@@ -277,25 +299,15 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
         s_cached_used_mask = used;
         in.used = used;
     }
-    struct StreamCacheEntry {
-        uint64_t address = 0;
-        uint64_t size = 0;
-        uint64_t gen = 0;
-        uint64_t inval = 0;
-        Upload upload{};
-    };
-    static StreamCacheEntry s_stream_cache[16];
 
     const uint64_t cur_gen = dedup_generation();
-    const uint64_t cur_inval = dedup_inval_epoch();
 
     for (uint32_t s = 0; s < 15; s++) {
         if (!(in.used >> s & 1)) continue;
         const Range& r = g_state.vertex_buffers[s];
         if (r.address && r.address == s_stream_cache[s].address &&
             r.size == s_stream_cache[s].size &&
-            cur_gen == s_stream_cache[s].gen &&
-            cur_inval == s_stream_cache[s].inval) {
+            cur_gen == s_stream_cache[s].gen) {
             in.vertex[s] = s_stream_cache[s].upload;
             continue;
         }
@@ -304,7 +316,7 @@ bool draw_inputs(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const C
         g_upload_kind = kUploadVertex;
         in.vertex[s] = read_upload(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, 16), 16);
         g_upload_kind = kUploadOther;
-        s_stream_cache[s] = {r.address, r.size, cur_gen, cur_inval, in.vertex[s]};
+        s_stream_cache[s] = {r.address, p, r.size, cur_gen, in.vertex[s]};
     }
     if (!indexed) return true;
     uint32_t count = uint32_t(c.i[0]);

@@ -138,6 +138,8 @@ void dedup_reset() {
 
 void dedup_invalidate(const uint8_t* p, uint64_t size) {
     s_dedup_inval++;
+    stream_cache_invalidate(p, size);
+    index_cache_invalidate(p, size);
     if (s_last_dedup_p >= p && s_last_dedup_p < p + size) s_last_dedup_p = nullptr;
     // Entries starting before p may still reach into it: look back over the few that can.
     auto it = g_copies.lower_bound(p + size);

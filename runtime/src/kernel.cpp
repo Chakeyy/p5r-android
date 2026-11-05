@@ -415,7 +415,7 @@ static void thread_main(void* p) {
         plat::set_thread_priority(0);
         static const bool worker_little = [] {
             const char* e = std::getenv("NX_WORKER_LITTLE");
-            return e && e[0] == '1';
+            return !(e && e[0] == '0');  // Default true: isolate workers to Little cores 0-5
         }();
         if (worker_little) {
             plat::pin_current_thread_to_little_cores(name);

@@ -533,33 +533,44 @@ void cull_job_hook(CPU& c) {
                 const float radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
 
                 // Protect structural meshes (massive road slabs, large ground planes, ceilings)
-                if (radius >= 8.0f) continue;
+                // Dynamic threshold: close structures are protected at 8.0m, mid-range at 14.0m,
+                // and distant vista structures at 22.0m so road slabs/sky are preserved while
+                // secondary buildings and corridor interiors are culled.
+                const float struct_limit = (view_dist < 15.0f) ? 8.0f : (view_dist < 28.0f ? 14.0f : 22.0f);
+                if (radius >= struct_limit) continue;
 
                 g_cull_eval.fetch_add(1, std::memory_order_relaxed);
+
+                static const float vista_cutoff = [] {
+                    const char* e = std::getenv("NX_P5R_VISTA_CUTOFF");
+                    if (e) return std::clamp(float(std::atof(e)), 15.0f, 60.0f);
+                    return 28.0f;  // Vista threshold (meters) for long road and hallway culling
+                }();
 
                 // Progressive tiered small-object / clutter distance culling:
                 // Money bundles & small clutter boxes on vault shelves have radius ~0.15m - 0.35m.
                 // Small street props (produce crates, signs, lanterns, packages) have radius ~0.35m - 1.2m.
                 // Storefronts & shop display fixtures have radius ~1.2m - 4.0m.
-                // Massive road planes and ground slabs have radius >= 8.0m.
+                // Massive road planes and ground slabs have radius >= 22.0m.
                 bool cull = false;
                 const float ratio = radius / view_dist;
 
                 if (view_dist < 6.0f) {
                     // Very close (2.5m - 6m): Only cull tiny sub-decimeter clutter
-                    if (radius < 0.12f * dist_cull_scale) cull = true;
+                    if (radius < 0.15f * dist_cull_scale) cull = true;
                 } else if (view_dist < 12.0f) {
                     // Close (6m - 12m): Cull small shelf props, crates, trash cans, small signs
-                    if (radius < 0.50f * dist_cull_scale || ratio < 0.038f * dist_cull_scale) cull = true;
-                } else if (view_dist < 22.0f) {
-                    // Medium (12m - 22m): Cull street clutter, storefront displays, vending machines, lanterns
-                    if (radius < 1.10f * dist_cull_scale || ratio < 0.050f * dist_cull_scale) cull = true;
-                } else if (view_dist < 40.0f) {
-                    // Far (22m - 40m): Cull distant storefronts, shop interiors, signs, decorative facades
-                    if (radius < 2.50f * dist_cull_scale || ratio < 0.065f * dist_cull_scale) cull = true;
+                    if (radius < 0.60f * dist_cull_scale || ratio < 0.045f * dist_cull_scale) cull = true;
+                } else if (view_dist < 20.0f) {
+                    // Medium (12m - 20m): Cull street clutter, storefront displays, vending machines, lanterns
+                    if (radius < 1.40f * dist_cull_scale || ratio < 0.060f * dist_cull_scale) cull = true;
+                } else if (view_dist < vista_cutoff) {
+                    // Far (20m - vista_cutoff): Cull secondary storefronts, shop interiors, signs, decorative facades
+                    if (radius < 3.20f * dist_cull_scale || ratio < 0.085f * dist_cull_scale) cull = true;
                 } else {
-                    // Very far (> 40m): Cull decorative clutter across street / palace vistas
-                    if (radius < 5.00f * dist_cull_scale || ratio < 0.080f * dist_cull_scale) cull = true;
+                    // Vista / Long road / Shujin hallway (>= vista_cutoff):
+                    // Aggressively cull corridor interiors, secondary storefronts, distant street props
+                    if (radius < 6.50f * dist_cull_scale || ratio < 0.120f * dist_cull_scale) cull = true;
                 }
 
                 if (cull) {
@@ -707,12 +718,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r55";
+static constexpr const char* kPerfBuildTag = "renderopt-r56";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (stream upload cache, street distance culling, index dedup, shadow depth DONT_CARE)",
+    log("p5r perf build: %s (targeted stream cache, vista distance cutoff, index dedup, worker core isolation)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
