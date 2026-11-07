@@ -519,100 +519,86 @@ void cull_job_hook(CPU& c) {
             }
 
             const uint64_t frame_draws = g_cull_frame_draws.load(std::memory_order_relaxed);
-            // Adaptive draw-pressure multiplier:
-            // - Low draw count (< 1350 draws/f, e.g. Leblanc / indoor rooms): 0.85x (conservative, protects room props)
-            // - High draw count (> 1550 draws/f, e.g. street vistas / long corridors): ramps up to 1.45x
-            float pressure_mult = 1.0f;
-            if (frame_draws > 0 && frame_draws < 1350) {
-                pressure_mult = 0.85f;
-            } else if (frame_draws > 1550) {
-                const float over = float(std::min<uint64_t>(frame_draws - 1550, 1100));
-                pressure_mult = 1.0f + (over / 1100.0f) * 0.45f;  // 1.00x -> 1.45x
-            }
-            const float eff_scale = dist_cull_scale * pressure_mult;
+            // Bypass distance culling completely when frame_draws < 1500 (e.g. Leblanc attic ~1034 draws/frame,
+            // classrooms, indoor rooms) to preserve 100% of room geometry, lights, windows, and light blockers.
+            if (frame_draws >= 1500) {
+                float dynamic_scale = 1.0f + (float)(frame_draws - 1500) * (0.25f / 900.0f);
+                if (dynamic_scale > 1.25f) dynamic_scale = 1.25f;
+                const float eff_scale = dist_cull_scale * dynamic_scale;
 
-            static const float base_vista_cutoff = [] {
-                const char* e = std::getenv("NX_P5R_VISTA_CUTOFF");
-                if (e) return std::clamp(float(std::atof(e)), 15.0f, 60.0f);
-                return 28.0f;  // Vista threshold (meters) for long road and hallway culling
-            }();
-            const float vista_cutoff = (frame_draws > 2100) ? std::min(base_vista_cutoff, 22.0f)
-                                     : (frame_draws > 1650) ? std::min(base_vista_cutoff, 25.0f)
-                                                            : base_vista_cutoff;
+                const float* p = after.p[0];  // Near plane normal (p[0], p[1], p[2]) and distance (p[3])
+                const uint64_t box = (sp - 0x200) & ~uint64_t(15);
+                thread_local MeshBoundsSlot tl_bounds_cache[4096];
+                const uint32_t cur_stamp = uint32_t(cur_p >> 4) + 1u;  // refreshes every 16 frames
+                uint64_t last_node = 0;
+                uint64_t last_matrix = 0;
 
-            const float* p = after.p[0];  // Near plane normal (p[0], p[1], p[2]) and distance (p[3])
-            const uint64_t box = (sp - 0x200) & ~uint64_t(15);
-            thread_local MeshBoundsSlot tl_bounds_cache[4096];
-            const uint32_t cur_stamp = uint32_t(cur_p >> 4) + 1u;  // refreshes every 16 frames
-            uint64_t last_node = 0;
-            uint64_t last_matrix = 0;
+                for (int i = 0; i < n && i < 1024; i++) {
+                    const uint64_t mesh = ld<uint64_t>(arr + stride * i);
+                    if (!mesh) continue;
+                    uint32_t flags = ld<uint32_t>(mesh + 0x20);
+                    if ((flags >> 14) & 1) continue;  // Already hidden by engine frustum/occlusion culling
 
-            for (int i = 0; i < n && i < 1024; i++) {
-                const uint64_t mesh = ld<uint64_t>(arr + stride * i);
-                if (!mesh) continue;
-                uint32_t flags = ld<uint32_t>(mesh + 0x20);
-                if ((flags >> 14) & 1) continue;  // Already hidden by engine frustum/occlusion culling
+                    const uint64_t node = ld<uint64_t>(mesh + 8);
+                    const uint64_t local_bounds = mesh + 0x90;
+                    if (!node || !local_bounds) continue;
 
-                const uint64_t node = ld<uint64_t>(mesh + 8);
-                const uint64_t local_bounds = mesh + 0x90;
-                if (!node || !local_bounds) continue;
+                    MeshBoundsSlot& slot = tl_bounds_cache[((mesh >> 5) ^ (mesh >> 17)) & 4095];
+                    float b0, b1, b2, radius;
+                    if (slot.mesh == mesh && slot.node == node && slot.stamp == cur_stamp) {
+                        b0 = slot.cx;
+                        b1 = slot.cy;
+                        b2 = slot.cz;
+                        radius = slot.radius;
+                    } else {
+                        CPU scratch = c;
+                        scratch.x[31] = sp;
+                        uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
+                        if (!matrix) continue;
+                        last_node = node;
+                        last_matrix = matrix;
+                        guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
 
-                MeshBoundsSlot& slot = tl_bounds_cache[((mesh >> 5) ^ (mesh >> 17)) & 4095];
-                float b0, b1, b2, radius;
-                if (slot.mesh == mesh && slot.node == node && slot.stamp == cur_stamp) {
-                    b0 = slot.cx;
-                    b1 = slot.cy;
-                    b2 = slot.cz;
-                    radius = slot.radius;
-                } else {
-                    CPU scratch = c;
-                    scratch.x[31] = sp;
-                    uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
-                    if (!matrix) continue;
-                    last_node = node;
-                    last_matrix = matrix;
-                    guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
+                        b0 = ld<float>(box);
+                        b1 = ld<float>(box + 4);
+                        b2 = ld<float>(box + 8);
+                        const float r16 = std::fabs(ld<float>(box + 16 * 4));
+                        const float r17 = std::fabs(ld<float>(box + 17 * 4));
+                        const float r18 = std::fabs(ld<float>(box + 18 * 4));
+                        if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
+                        radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
+                        slot = {mesh, node, cur_stamp, b0, b1, b2, radius};
+                    }
 
-                    b0 = ld<float>(box);
-                    b1 = ld<float>(box + 4);
-                    b2 = ld<float>(box + 8);
-                    const float r16 = std::fabs(ld<float>(box + 16 * 4));
-                    const float r17 = std::fabs(ld<float>(box + 17 * 4));
-                    const float r18 = std::fabs(ld<float>(box + 18 * 4));
-                    if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
-                    radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
-                    slot = {mesh, node, cur_stamp, b0, b1, b2, radius};
-                }
+                    // Signed distance of box center from near plane along camera view axis
+                    const float view_dist = p[0] * b0 + p[1] * b1 + p[2] * b2 - p[3];
+                    if (!std::isfinite(view_dist) || view_dist <= 2.5f) continue;
 
-                // Signed distance of box center from near plane along camera view axis
-                const float view_dist = p[0] * b0 + p[1] * b1 + p[2] * b2 - p[3];
-                if (!std::isfinite(view_dist) || view_dist <= 2.5f) continue;
+                    // Hard structural ceiling: never cull large structural geometry (walls, floors, ceilings)
+                    if (radius >= 8.0f) continue;
 
-                const float struct_limit = (view_dist < 15.0f) ? 8.0f : (view_dist < 28.0f ? 14.0f : 22.0f);
-                if (radius >= struct_limit) continue;
+                    g_cull_eval.fetch_add(1, std::memory_order_relaxed);
 
-                g_cull_eval.fetch_add(1, std::memory_order_relaxed);
+                    const float ratio = radius / view_dist;
+                    bool cull = false;
+                    if (view_dist < 5.0f) {
+                        if (radius < 0.08f * eff_scale) cull = true;
+                    } else if (view_dist < 10.0f) {
+                        if (radius < 0.28f * eff_scale || ratio < 0.022f * eff_scale) cull = true;
+                    } else if (view_dist < 20.0f) {
+                        if (radius < 0.45f * eff_scale || ratio < 0.025f * eff_scale) cull = true;
+                    } else if (view_dist < 40.0f) {
+                        if (radius < 0.85f * eff_scale || ratio < 0.025f * eff_scale) cull = true;
+                    } else {
+                        if (radius < 2.0f * eff_scale || ratio < 0.030f * eff_scale) cull = true;
+                    }
 
-                bool cull = false;
-                const float ratio = radius / view_dist;
-
-                if (view_dist < 8.0f) {
-                    if (radius < 0.12f * eff_scale) cull = true;
-                } else if (view_dist < 15.0f) {
-                    if (radius < 0.45f * eff_scale || ratio < 0.035f * eff_scale) cull = true;
-                } else if (view_dist < 22.0f) {
-                    if (radius < 1.20f * eff_scale || ratio < 0.055f * eff_scale) cull = true;
-                } else if (view_dist < vista_cutoff) {
-                    if (radius < 2.80f * eff_scale || ratio < 0.075f * eff_scale) cull = true;
-                } else {
-                    if (radius < 6.50f * eff_scale || ratio < 0.120f * eff_scale) cull = true;
-                }
-
-                if (cull) {
-                    g_cull_hidden.fetch_add(1, std::memory_order_relaxed);
-                    flags |= (1u << 14);
-                    st<uint32_t>(mesh + 0x20, flags);
-                    st<uint8_t>(sarr + sstride * i + 0x10, 1);
+                    if (cull) {
+                        g_cull_hidden.fetch_add(1, std::memory_order_relaxed);
+                        flags |= (1u << 14);
+                        st<uint32_t>(mesh + 0x20, flags);
+                        st<uint8_t>(sarr + sstride * i + 0x10, 1);
+                    }
                 }
             }
         }
@@ -753,19 +739,17 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r59";
+static constexpr const char* kPerfBuildTag = "renderopt-r60";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (world-bounds cache, adaptive vista pressure culling, 288B c0 dirty check, cross-submit buffer cache)",
+    log("p5r perf build: %s (world-bounds cache, adaptive vista pressure culling, lowend-r50 brackets)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
     // - Force bilinear (1x) sampling instead of 16x anisotropic filtering on mobile TBDR GPUs.
     setenv("NX_MAX_ANISO", "1", 0);
-    // - Default LOD bias to 1.0 (one mip lower for 3D depth-tested meshes) to reduce L2 cache pressure on Mali-G57.
-    setenv("NX_LOD_BIAS", "1.0", 0);
     // - Enable per-image deferred clears (PROGRESO 77) so P5R's depth-only clears and dual
     //   shadow-map clears fold into VK_ATTACHMENT_LOAD_OP_CLEAR instead of 12,000+ standalone
     //   vkCmdClear*Image transfer clears.

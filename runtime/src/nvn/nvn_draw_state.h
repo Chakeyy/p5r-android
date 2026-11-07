@@ -60,8 +60,6 @@ extern State g_state;
 extern Stats g_stats;
 extern uint32_t g_pipeline_state_version;
 extern uint32_t g_attrib_state_version;
-extern uint32_t g_tex_state_version;
-extern uint32_t g_c0_state_version;
 extern bool g_hud_target;  // NX_HUD_1080: this draw's target is a 1920x1080 image of a 1280x720 texture (nvn_vk.h)
 extern bool g_low_3d_target;  // NX_LOW_3D: this draw's target is a 720x405 image of a 960x540 texture (nvn_vk.h)
 
@@ -172,8 +170,7 @@ std::vector<WriteBack> written_take();                         // one write-back
 void written_reset();
 void written_log();
 // c[0], the NVN driver constants of a stage (nvn_dedup.cpp).
-constexpr size_t kDriverConstBytes = 0x620;
-std::array<uint8_t, kDriverConstBytes> driver_constants(ShaderStage stage, int st);
+std::array<uint8_t, 0x1000> driver_constants(ShaderStage stage, int st);
 
 bool debug_shader_overrides_active();
 bool debug_shader_overrides(const std::vector<const ShaderInfo*>*& shaders, const ShaderInfo*& fs,

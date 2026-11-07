@@ -745,29 +745,6 @@ bool live_ui_draw(const Targets& t) {
 bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, const Cmd& c) {
     g_stats.total++;
     if (g_state.rasterizer_discard || !g_state.render_enable) return false;  // nothing reaches the targets
-    {
-        static uint64_t s_last_frame = 0;
-        static uint64_t s_last_done = 0;
-        static uint64_t s_frame_draws = 0;
-        const uint64_t cur_f = g_frame.load(std::memory_order_relaxed);
-        if (cur_f != s_last_frame) {
-            if (cur_f > s_last_frame) {
-                const uint64_t df = cur_f - s_last_frame;
-                s_frame_draws = (g_stats.done - s_last_done) / df;
-            }
-            s_last_frame = cur_f;
-            s_last_done = g_stats.done;
-        }
-        // Under heavy vista draw pressure (> 1650 draws/frame), skip small secondary detail draws
-        // that the engine explicitly marked as conditional occlusion candidates (g_state.cond_on).
-        if (g_state.cond_on && indexed && s_frame_draws > 1650 && c.i[3] <= 1 && t.color_count > 0) {
-            const int32_t max_cond_idx = (s_frame_draws > 2300) ? 450 : (s_frame_draws > 1950 ? 300 : 180);
-            if (c.i[0] > 0 && c.i[0] <= max_cond_idx) {
-                g_stats.done++;
-                return true;
-            }
-        }
-    }
     if (occlusion_object_skipped() && !g_state.depth.depth_write && !g_state.depth.stencil_test) {
         bool writes_color = false;
         for (uint32_t k = 0; k < t.color_count; k++) {
@@ -935,8 +912,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         s_cached_hud_target = hi && hi->hud;
         s_cached_shadow_target = depth_only(t) && t.depth && image_of(t.depth) && image_of(t.depth)->shadow;
         s_cached_low_3d_target = hi && hi->low_3d;
-        g_tex_state_version++;
-        g_c0_state_version++;
     }
     g_uw_wide = s_cached_uw_wide;
     g_hud_target = s_cached_hud_target;
@@ -1393,8 +1368,6 @@ std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copi
 }
 
 void draw_begin_submit() {
-    g_tex_state_version++;
-    g_c0_state_version++;
     g_bound_serial = 0;
     g_rendering = false;
     g_linear_targets.clear(), g_late_write_backs.clear();
@@ -1487,11 +1460,7 @@ void draw_end_rendering(VkCommandBuffer cb, int reason) {  // and the pending cl
 bool pass_open() { return g_rendering; }
 bool pass_open_on(const Targets& t) { return g_rendering && targets_same(g_pass, t); }
 VkExtent2D pass_extent() { return g_pass_extent; }
-void pass_begin(VkCommandBuffer cb, const Targets& t) {
-    g_tex_state_version++;
-    g_c0_state_version++;
-    begin_rendering(cb, t);
-}
+void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); }
 // After a clear inside the pass (nvn_clears.cpp). A masked one is a fullscreen draw with its own pipeline, viewport
 // and scissor (nvn_mask_clear.cpp): the next draw sets everything again.
 void pass_mark_written(uint32_t bits) { g_pass_written |= bits, g_bound = Bound{}, sets_invalidate_bound(); }

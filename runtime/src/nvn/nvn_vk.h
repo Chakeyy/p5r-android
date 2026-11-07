@@ -39,7 +39,6 @@ struct GpuImage {
     bool uw = false;          // NX_ULTRAWIDE: a widened render target (nvn_ultrawide.cpp)
     bool hud = false;         // NX_HUD_1080: a 1280x720 render target made at 1920x1080 or 1600x900 (hud_1080_texture)
     bool shadow = false;      // NX_MALI_LOW_SHADOWS: 0.5x downscaled shadow depth map
-    bool shadow_cleared = false;  // NX_SHADOWS=0: shadow map initialized and cleared once
     bool low_3d = false;      // NX_LOW_3D: 0.75x downscaled 3D render target (720x405)
 };
 

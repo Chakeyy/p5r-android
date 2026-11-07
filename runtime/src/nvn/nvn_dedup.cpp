@@ -140,7 +140,7 @@ void dedup_invalidate(const uint8_t* p, uint64_t size) {
     s_dedup_inval++;
     stream_cache_invalidate(p, size);
     index_cache_invalidate(p, size);
-    if (s_last_dedup_p >= p && s_last_dedup_p < p + size) s_last_dedup_p = nullptr;
+    s_last_dedup_p = nullptr;
     // Entries starting before p may still reach into it: look back over the few that can.
     auto it = g_copies.lower_bound(p + size);
     while (it != g_copies.begin()) {
@@ -154,11 +154,11 @@ void dedup_invalidate(const uint8_t* p, uint64_t size) {
     }
 }
 
-// NVN driver constants (c[0]) for a shader stage: texture handles at 0x20, image handles at 0xa0, storage buffer
-// addresses and sizes at 0xe0 (low 32 bits) and 0x100 (high 32 bits), viewport scale at 0x110.
-std::array<uint8_t, kDriverConstBytes> driver_constants(ShaderStage stage, int st) {
-    std::array<uint8_t, kDriverConstBytes> c0{};
-    if (st < 0 || st >= kStages) return c0;
+// c[0], the NVN driver's constants, as far as shaders read them (docs/nvn/TRANSLATOR.md): buffer descriptors
+// {u64 GPU address; u32 size} of what is bound, which compute shaders search to find the buffer an address falls in
+// (they wrote garbage with a zero table), and the maximum point size.
+std::array<uint8_t, 0x1000> driver_constants(ShaderStage stage, int st) {
+    std::array<uint8_t, 0x1000> c0{};
     auto put = [&](uint32_t at, const Range& r) {
         if (at + 12 > c0.size()) return;
         std::memcpy(c0.data() + at, &r.address, 8);
@@ -171,10 +171,8 @@ std::array<uint8_t, kDriverConstBytes> driver_constants(ShaderStage stage, int s
     } else {
         int hw = stage == ShaderStage::Fragment ? 4 : 0;  // Maxwell stage numbers: vertex 0, fragment 4
         for (int n = 0; n < 16; n++) put(0x110 + 0x100 * hw + 0x10 * n, g_state.storage[st][n]);
-        if (0x610 + 4 <= c0.size()) {
-            float max_point = 64.0f;
-            std::memcpy(c0.data() + 0x610, &max_point, 4);
-        }
+        float max_point = 64.0f;
+        std::memcpy(c0.data() + 0x610, &max_point, 4);
     }
     return c0;
 }

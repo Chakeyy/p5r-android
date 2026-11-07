@@ -210,7 +210,7 @@ struct SupportBlock {
 struct ConstantsBlock {
     int hw = 0;         // the key: the Maxwell stage (vertex 0, fragment 4) and the stage's storage bindings,
     Range storage[16];  // all driver_constants reads outside compute
-    std::array<uint8_t, kDriverConstBytes> bytes;
+    std::array<uint8_t, 0x1000> bytes;
 };
 constexpr size_t kBlocks = 32;  // more distinct ones in a submit: copied per draw, as before
 std::vector<std::unique_ptr<SupportBlock>> g_support;
@@ -299,12 +299,6 @@ VkDescriptorBufferInfo buffer_of(VkCommandBuffer cb, const void* bytes, uint64_t
         g_write_backs.push_back({u.ptr, const_cast<uint8_t*>(static_cast<const uint8_t*>(bytes)), size});
     return {u.buffer, u.offset, n};
 }
-
-Upload g_c0_upload[kStages] = {};
-std::array<uint8_t, kDriverConstBytes> g_c0_last[kStages];
-uint32_t g_c0_ver[kStages] = {};
-uint64_t g_gather_s0 = 0, g_gather_s1 = 0, g_gather_serial = 0;
-uint32_t g_gather_tex_ver = 0;
 
 // The sets being built: scratch kept from draw to draw (three vectors, one of them ~130 KB, were allocated per draw).
 struct SetWrite {  // one write of a set, as the set cache compares it
@@ -596,22 +590,13 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                     break;
                 }
                 case NvnSource::DriverConstants: {
-                    if (!draw_slow(kSlowUploads)) {
-                        if (g_c0_upload[st].buffer == VK_NULL_HANDLE || g_c0_ver[st] != g_c0_state_version) {
-                            auto c0 = driver_constants(s->stage, st);
-                            if (g_c0_upload[st].buffer == VK_NULL_HANDLE ||
-                                std::memcmp(c0.data(), g_c0_last[st].data(), kDriverConstBytes) != 0) {
-                                g_c0_last[st] = c0;
-                                g_c0_upload[st] = upload(c0.data(), kDriverConstBytes, 256);
-                            }
-                            g_c0_ver[st] = g_c0_state_version;
-                        }
-                        info = {g_c0_upload[st].buffer, g_c0_upload[st].offset, kDriverConstBytes};
-                    } else {
-                        auto c0 = driver_constants(s->stage, st);
-                        Upload u = upload(c0.data(), c0.size(), 256);
-                        info = {u.buffer, u.offset, c0.size()};
+                    if (const uint8_t* block = shared ? constants_block(s->stage, st) : nullptr) {
+                        Upload u = dedup_upload(block, 0x1000, 0x1000, 256);
+                        info = {u.buffer, u.offset, 0x1000};
+                        break;
                     }
+                    auto c0 = driver_constants(s->stage, st);
+                    info = buffer_of(cb, c0.data(), c0.size(), 16, false, false);
                     break;
                 }
                 default: info = buffer_of(cb, nullptr, 0x1000, 16, false, false); break;
@@ -691,7 +676,6 @@ uint64_t g_sets_bind_calls = 0, g_sets_bound = 0, g_sets_bind_skipped = 0;
 void sets_invalidate_bound() {
     g_bound_sets[0] = BoundSets{};
     g_bound_sets[1] = BoundSets{};
-    g_gather_serial = 0;
 }
 
 void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayout& layout) {
@@ -770,18 +754,8 @@ static thread_local const ShaderInfo* s_cached_sh1 = nullptr;
 static thread_local size_t s_cached_sh_count = 0;
 static thread_local uint32_t s_cached_need_break = 0;
 static thread_local bool s_cached_biased = false;
-static thread_local bool s_cached_has_ubo_handle = false;
 
 uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
-    const uint64_t s0 = shaders.size() > 0 ? reinterpret_cast<uint64_t>(shaders[0]) : 0;
-    const uint64_t s1 = shaders.size() > 1 ? reinterpret_cast<uint64_t>(shaders[1]) : 0;
-    if (!draw_slow(kSlowHandles) && !s_cached_has_ubo_handle &&
-        g_state.depth.depth_test == s_cached_biased && shaders.size() <= 2 && t_replay_serial &&
-        g_gather_serial == t_replay_serial && g_gather_tex_ver == g_tex_state_version &&
-        g_gather_s0 == s0 && g_gather_s1 == s1) {
-        return 0;
-    }
-
     DrawTextures& t = g_textures;
     if (draw_slow(kSlowScratch))
         t = DrawTextures{};
@@ -796,13 +770,9 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
     if (!shaders_same || draw_slow(kSlowScratch)) {
         t.bindings.clear();
         s_cached_need_break = 0;
-        s_cached_has_ubo_handle = false;
         for (const ShaderInfo* s : shaders)
             for (const DescriptorBinding& b : s->refl.bindings) {
-                if (b.set == 2) {
-                    t.bindings.push_back({s, &b});
-                    if (b.nvn.source == NvnSource::HandleInUniform) s_cached_has_ubo_handle = true;
-                }
+                if (b.set == 2) t.bindings.push_back({s, &b});
                 if (b.set == 3) s_cached_need_break |= kNeedBreak;  // storage images change layout
             }
         s_cached_sh0 = sh0;
@@ -861,14 +831,6 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
         // (docs/nvn/DEBUG.md #35). Only when a draw of this pass wrote it (pass_wrote, nvn_draw.cpp).
         if (pass_wrote(img)) out |= kNeedBreak;
         if (clears_pending_image(img)) out |= kNeedBreak | kSampledPending;
-    }
-    if (out == 0 && shaders.size() <= 2) {
-        g_gather_serial = t_replay_serial;
-        g_gather_tex_ver = g_tex_state_version;
-        g_gather_s0 = s0;
-        g_gather_s1 = s1;
-    } else {
-        g_gather_serial = 0;
     }
     return out;
 }
@@ -940,10 +902,6 @@ bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, 
 }
 
 void sets_begin_submit() {
-    std::memset(g_c0_ver, 0, sizeof(g_c0_ver));
-    for (int i = 0; i < kStages; i++) g_c0_upload[i] = {};
-    g_gather_serial = 0;
-    g_gather_tex_ver = 0;
     s_cached_zero_valid = false;
     s_cached_sh_count = 0;
     s_cached_sh0 = nullptr;
