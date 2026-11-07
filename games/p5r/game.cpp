@@ -24,7 +24,6 @@ namespace nx {
 
 namespace nvn {
 uint64_t presents_recorded();  // runtime nvn_state.cpp: nvnQueuePresentTexture calls so far
-uint64_t recorded_draws();     // runtime nvn_state.cpp: total recorded draw calls so far
 void linear_write_back_pause(bool paused);  // runtime nvn_draw.cpp: no copies of linear targets back to memory
 }
 
@@ -362,7 +361,6 @@ void frame_origin() {
 }
 
 static std::atomic<uint64_t> g_cull_eval{0}, g_cull_hidden{0};
-static std::atomic<uint64_t> g_cull_frame_draws{0};
 
 struct MeshBoundsSlot {
     uint64_t mesh = 0;
@@ -411,11 +409,10 @@ void interval_setter_hook(CPU& c) {
         if (d_ev > 0) {
             static const float s_log_scale = [] {
                 const char* e = std::getenv("NX_P5R_DIST_SCALE");
-                return e ? std::clamp(float(std::atof(e)), 0.5f, 3.0f) : 1.4f;
+                return e ? std::clamp(float(std::atof(e)), 0.5f, 3.0f) : 1.0f;
             }();
-            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%, scale %.2fx, draws/f %llu) over 300 frames",
-                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev), s_log_scale,
-                (unsigned long long)g_cull_frame_draws.load(std::memory_order_relaxed));
+            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%, scale %.2fx) over 300 frames",
+                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev), s_log_scale);
         }
     }
 }
@@ -496,7 +493,7 @@ void cull_job_hook(CPU& c) {
     static const float dist_cull_scale = [] {
         const char* e = std::getenv("NX_P5R_DIST_SCALE");
         if (e) return std::clamp(float(std::atof(e)), 0.5f, 3.0f);
-        return 1.4f;  // Default 1.4x for Android mobile to aggressively cull street/supermarket clutter
+        return 1.0f;  // Default 1.0x for lowend-r50 proven distance curve
     }();
 
     if (dist_cull_on && after.ptr) {
@@ -504,101 +501,75 @@ void cull_job_hook(CPU& c) {
         const int64_t stride = int32_t(ld<uint32_t>(list + 4)), sstride = int32_t(ld<uint32_t>(states + 4));
         const uint64_t arr = ld<uint64_t>(list + 0x10), sarr = ld<uint64_t>(states + 0x10);
         if (arr && sarr && stride > 0 && sstride > 0) {
-            // Sample per-frame recorded draw pressure
-            static std::atomic<uint64_t> s_last_present{0}, s_last_rec_draws{0};
+            const float* p = after.p[0];  // Near plane normal (p[0], p[1], p[2]) and distance (p[3])
+            const uint64_t box = (sp - 0x200) & ~uint64_t(15);
+            thread_local MeshBoundsSlot tl_bounds_cache[4096];
             const uint64_t cur_p = nvn::presents_recorded();
-            uint64_t prev_p = s_last_present.load(std::memory_order_relaxed);
-            if (cur_p > prev_p && s_last_present.compare_exchange_weak(
-                                      prev_p, cur_p, std::memory_order_relaxed)) {
-                const uint64_t cur_d = nvn::recorded_draws();
-                const uint64_t prev_d = s_last_rec_draws.exchange(cur_d, std::memory_order_relaxed);
-                const uint64_t dp = cur_p - prev_p;
-                if (cur_d >= prev_d && dp > 0 && dp <= 8) {
-                    g_cull_frame_draws.store((cur_d - prev_d) / dp, std::memory_order_relaxed);
+            const uint32_t cur_stamp = uint32_t(cur_p >> 4) + 1u;  // refreshes every 16 frames
+            uint64_t last_node = 0;
+            uint64_t last_matrix = 0;
+
+            for (int i = 0; i < n && i < 1024; i++) {
+                const uint64_t mesh = ld<uint64_t>(arr + stride * i);
+                if (!mesh) continue;
+                uint32_t flags = ld<uint32_t>(mesh + 0x20);
+                if ((flags >> 14) & 1) continue;  // Already hidden by engine frustum/occlusion culling
+
+                const uint64_t node = ld<uint64_t>(mesh + 8);
+                const uint64_t local_bounds = mesh + 0x90;
+                if (!node || !local_bounds) continue;
+
+                MeshBoundsSlot& slot = tl_bounds_cache[((mesh >> 5) ^ (mesh >> 17)) & 4095];
+                float b0, b1, b2, radius;
+                if (slot.mesh == mesh && slot.node == node && slot.stamp == cur_stamp) {
+                    b0 = slot.cx;
+                    b1 = slot.cy;
+                    b2 = slot.cz;
+                    radius = slot.radius;
+                } else {
+                    CPU scratch = c;
+                    scratch.x[31] = sp;
+                    uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
+                    if (!matrix) continue;
+                    last_node = node;
+                    last_matrix = matrix;
+                    guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
+
+                    b0 = ld<float>(box);
+                    b1 = ld<float>(box + 4);
+                    b2 = ld<float>(box + 8);
+                    const float r16 = std::fabs(ld<float>(box + 16 * 4));
+                    const float r17 = std::fabs(ld<float>(box + 17 * 4));
+                    const float r18 = std::fabs(ld<float>(box + 18 * 4));
+                    if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
+                    radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
+                    slot = {mesh, node, cur_stamp, b0, b1, b2, radius};
                 }
-            }
 
-            const uint64_t frame_draws = g_cull_frame_draws.load(std::memory_order_relaxed);
-            // Bypass distance culling completely when frame_draws < 1500 (e.g. Leblanc attic ~1034 draws/frame,
-            // classrooms, indoor rooms) to preserve 100% of room geometry, lights, windows, and light blockers.
-            if (frame_draws >= 1500) {
-                float dynamic_scale = 1.0f + (float)(frame_draws - 1500) * (0.25f / 900.0f);
-                if (dynamic_scale > 1.25f) dynamic_scale = 1.25f;
-                const float eff_scale = dist_cull_scale * dynamic_scale;
+                // Signed distance of box center from near plane along camera view axis
+                const float view_dist = p[0] * b0 + p[1] * b1 + p[2] * b2 - p[3];
+                if (!std::isfinite(view_dist) || view_dist <= 12.0f) continue;  // Protect indoor rooms & 12m player bubble
 
-                const float* p = after.p[0];  // Near plane normal (p[0], p[1], p[2]) and distance (p[3])
-                const uint64_t box = (sp - 0x200) & ~uint64_t(15);
-                thread_local MeshBoundsSlot tl_bounds_cache[4096];
-                const uint32_t cur_stamp = uint32_t(cur_p >> 4) + 1u;  // refreshes every 16 frames
-                uint64_t last_node = 0;
-                uint64_t last_matrix = 0;
+                // Hard structural ceiling: never cull large structural geometry (walls, floors, ceilings)
+                if (radius >= 8.0f) continue;
 
-                for (int i = 0; i < n && i < 1024; i++) {
-                    const uint64_t mesh = ld<uint64_t>(arr + stride * i);
-                    if (!mesh) continue;
-                    uint32_t flags = ld<uint32_t>(mesh + 0x20);
-                    if ((flags >> 14) & 1) continue;  // Already hidden by engine frustum/occlusion culling
+                g_cull_eval.fetch_add(1, std::memory_order_relaxed);
 
-                    const uint64_t node = ld<uint64_t>(mesh + 8);
-                    const uint64_t local_bounds = mesh + 0x90;
-                    if (!node || !local_bounds) continue;
+                const float ratio = radius / view_dist;
+                bool cull = false;
+                if (view_dist < 20.0f) {
+                    if (radius < 0.45f * dist_cull_scale || ratio < 0.025f * dist_cull_scale) cull = true;
+                } else if (view_dist < 40.0f) {
+                    if (radius < 0.85f * dist_cull_scale || ratio < 0.025f * dist_cull_scale) cull = true;
+                } else {
+                    if (radius < 2.0f * dist_cull_scale || ratio < 0.030f * dist_cull_scale) cull = true;
+                }
 
-                    MeshBoundsSlot& slot = tl_bounds_cache[((mesh >> 5) ^ (mesh >> 17)) & 4095];
-                    float b0, b1, b2, radius;
-                    if (slot.mesh == mesh && slot.node == node && slot.stamp == cur_stamp) {
-                        b0 = slot.cx;
-                        b1 = slot.cy;
-                        b2 = slot.cz;
-                        radius = slot.radius;
-                    } else {
-                        CPU scratch = c;
-                        scratch.x[31] = sp;
-                        uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
-                        if (!matrix) continue;
-                        last_node = node;
-                        last_matrix = matrix;
-                        guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
-
-                        b0 = ld<float>(box);
-                        b1 = ld<float>(box + 4);
-                        b2 = ld<float>(box + 8);
-                        const float r16 = std::fabs(ld<float>(box + 16 * 4));
-                        const float r17 = std::fabs(ld<float>(box + 17 * 4));
-                        const float r18 = std::fabs(ld<float>(box + 18 * 4));
-                        if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
-                        radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
-                        slot = {mesh, node, cur_stamp, b0, b1, b2, radius};
-                    }
-
-                    // Signed distance of box center from near plane along camera view axis
-                    const float view_dist = p[0] * b0 + p[1] * b1 + p[2] * b2 - p[3];
-                    if (!std::isfinite(view_dist) || view_dist <= 2.5f) continue;
-
-                    // Hard structural ceiling: never cull large structural geometry (walls, floors, ceilings)
-                    if (radius >= 8.0f) continue;
-
-                    g_cull_eval.fetch_add(1, std::memory_order_relaxed);
-
-                    const float ratio = radius / view_dist;
-                    bool cull = false;
-                    if (view_dist < 5.0f) {
-                        if (radius < 0.08f * eff_scale) cull = true;
-                    } else if (view_dist < 10.0f) {
-                        if (radius < 0.28f * eff_scale || ratio < 0.022f * eff_scale) cull = true;
-                    } else if (view_dist < 20.0f) {
-                        if (radius < 0.45f * eff_scale || ratio < 0.025f * eff_scale) cull = true;
-                    } else if (view_dist < 40.0f) {
-                        if (radius < 0.85f * eff_scale || ratio < 0.025f * eff_scale) cull = true;
-                    } else {
-                        if (radius < 2.0f * eff_scale || ratio < 0.030f * eff_scale) cull = true;
-                    }
-
-                    if (cull) {
-                        g_cull_hidden.fetch_add(1, std::memory_order_relaxed);
-                        flags |= (1u << 14);
-                        st<uint32_t>(mesh + 0x20, flags);
-                        st<uint8_t>(sarr + sstride * i + 0x10, 1);
-                    }
+                if (cull) {
+                    g_cull_hidden.fetch_add(1, std::memory_order_relaxed);
+                    flags |= (1u << 14);
+                    st<uint32_t>(mesh + 0x20, flags);
+                    st<uint8_t>(sarr + sstride * i + 0x10, 1);
                 }
             }
         }
@@ -739,12 +710,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r60";
+static constexpr const char* kPerfBuildTag = "renderopt-r61";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (world-bounds cache, adaptive vista pressure culling, lowend-r50 brackets)",
+    log("p5r perf build: %s (world-bounds cache, 12m indoor safe bubble, lowend-r50 brackets)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
