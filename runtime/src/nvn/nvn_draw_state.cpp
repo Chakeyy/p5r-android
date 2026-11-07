@@ -14,6 +14,8 @@ using namespace replay;
 namespace replay {
 uint32_t g_pipeline_state_version = 1;
 uint32_t g_attrib_state_version = 1;
+uint32_t g_tex_state_version = 1;
+uint32_t g_c0_state_version = 1;
 }
 
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets) {
@@ -26,6 +28,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             if (!s.has_viewport || std::memcmp(s.viewport, c.i, sizeof s.viewport) != 0) {
                 std::memcpy(s.viewport, c.i, sizeof s.viewport);
                 s.has_viewport = true;
+                g_c0_state_version++;
             }
             break;
         case Cmd::SetRasterizerDiscard: s.rasterizer_discard = c.n != 0; break;
@@ -42,6 +45,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) {
                 if (s.images[c.i[0]][c.i[1]] != c.a[0]) {
                     s.images[c.i[0]][c.i[1]] = c.a[0];
+                    g_c0_state_version++;
                 }
             }
             break;
@@ -72,11 +76,13 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         case Cmd::BindUniformBuffer:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 18) {
                 s.uniforms[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
+                if (c.i[0] == 5) g_c0_state_version++;
             }
             break;
         case Cmd::BindStorageBuffer:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) {
                 s.storage[c.i[0]][c.i[1]] = {c.a[0], c.a[1]};
+                g_c0_state_version++;
             }
             break;
         case Cmd::BindDeferred: {
@@ -92,16 +98,18 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                                                                             : ld<uint64_t>(c.a[0] + 8 * at);
                 };
                 int slot = c.i[1] + int(k);
-                if (c.mask == 0 && slot >= 0 && slot < 32) s.textures[st][slot] = value(0);
-                if (c.mask == 1 && slot >= 0 && slot < 16) s.images[st][slot] = value(0);
-                if (c.mask == 2 && slot >= 0 && slot < 18) s.uniforms[st][slot] = {value(0), value(1)};
-                if (c.mask == 3 && slot >= 0 && slot < 16) s.storage[st][slot] = {value(0), value(1)};
+                if (c.mask == 0 && slot >= 0 && slot < 32) { s.textures[st][slot] = value(0); g_tex_state_version++; g_c0_state_version++; }
+                if (c.mask == 1 && slot >= 0 && slot < 16) { s.images[st][slot] = value(0); g_c0_state_version++; }
+                if (c.mask == 2 && slot >= 0 && slot < 18) { s.uniforms[st][slot] = {value(0), value(1)}; if (st == 5) g_c0_state_version++; }
+                if (c.mask == 3 && slot >= 0 && slot < 16) { s.storage[st][slot] = {value(0), value(1)}; g_c0_state_version++; }
             }
             break;
         }
         case Cmd::BindTexture:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 32) {
                 s.textures[c.i[0]][c.i[1]] = c.a[0];
+                g_tex_state_version++;
+                g_c0_state_version++;
             }
             break;
         case Cmd::BindVertexBuffer:
@@ -109,8 +117,16 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                 s.vertex_buffers[c.i[0]] = {c.a[0], c.a[1]};
             }
             break;
-        case Cmd::SetTexturePool: s.texture_pool = c.a[0]; break;
-        case Cmd::SetSamplerPool: s.sampler_pool = c.a[0]; break;
+        case Cmd::SetTexturePool:
+            s.texture_pool = c.a[0];
+            g_tex_state_version++;
+            g_c0_state_version++;
+            break;
+        case Cmd::SetSamplerPool:
+            s.sampler_pool = c.a[0];
+            g_tex_state_version++;
+            g_c0_state_version++;
+            break;
         case Cmd::BindVertexAttribs:
             if (auto* p = blob(c.n * sizeof(VertexAttrib))) {
                 s.attribs.assign(reinterpret_cast<const VertexAttrib*>(p), reinterpret_cast<const VertexAttrib*>(p) + c.n);

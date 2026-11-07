@@ -113,7 +113,7 @@ bool low_3d_on() {
 }
 
 bool low_3d_texture(const Texture& t) {
-    if (!low_3d_on()) return false;
+    if (!low_3d_on() || t.stride) return false;
     // P5R 3D scene render targets (960x540) and post-process chain targets (480x270, 240x135) in handheld mode
     if (t.target == 1 && t.levels <= 1 && t.samples <= 1) {
         if ((t.width == 960 && t.height == 540) ||

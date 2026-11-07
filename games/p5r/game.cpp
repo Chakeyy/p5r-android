@@ -24,6 +24,7 @@ namespace nx {
 
 namespace nvn {
 uint64_t presents_recorded();  // runtime nvn_state.cpp: nvnQueuePresentTexture calls so far
+uint64_t recorded_draws();     // runtime nvn_state.cpp: total recorded draw calls so far
 void linear_write_back_pause(bool paused);  // runtime nvn_draw.cpp: no copies of linear targets back to memory
 }
 
@@ -361,6 +362,14 @@ void frame_origin() {
 }
 
 static std::atomic<uint64_t> g_cull_eval{0}, g_cull_hidden{0};
+static std::atomic<uint64_t> g_cull_frame_draws{0};
+
+struct MeshBoundsSlot {
+    uint64_t mesh = 0;
+    uint64_t node = 0;
+    uint32_t stamp = 0;
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f, radius = 0.0f;
+};
 
 void interval_setter_hook(CPU& c) {
     scan_tasks();
@@ -404,8 +413,9 @@ void interval_setter_hook(CPU& c) {
                 const char* e = std::getenv("NX_P5R_DIST_SCALE");
                 return e ? std::clamp(float(std::atof(e)), 0.5f, 3.0f) : 1.4f;
             }();
-            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%, scale %.2fx) over 300 frames",
-                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev), s_log_scale);
+            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%, scale %.2fx, draws/f %llu) over 300 frames",
+                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev), s_log_scale,
+                (unsigned long long)g_cull_frame_draws.load(std::memory_order_relaxed));
         }
     }
 }
@@ -494,10 +504,49 @@ void cull_job_hook(CPU& c) {
         const int64_t stride = int32_t(ld<uint32_t>(list + 4)), sstride = int32_t(ld<uint32_t>(states + 4));
         const uint64_t arr = ld<uint64_t>(list + 0x10), sarr = ld<uint64_t>(states + 0x10);
         if (arr && sarr && stride > 0 && sstride > 0) {
+            // Sample per-frame recorded draw pressure
+            static std::atomic<uint64_t> s_last_present{0}, s_last_rec_draws{0};
+            const uint64_t cur_p = nvn::presents_recorded();
+            uint64_t prev_p = s_last_present.load(std::memory_order_relaxed);
+            if (cur_p > prev_p && s_last_present.compare_exchange_weak(
+                                      prev_p, cur_p, std::memory_order_relaxed)) {
+                const uint64_t cur_d = nvn::recorded_draws();
+                const uint64_t prev_d = s_last_rec_draws.exchange(cur_d, std::memory_order_relaxed);
+                const uint64_t dp = cur_p - prev_p;
+                if (cur_d >= prev_d && dp > 0 && dp <= 8) {
+                    g_cull_frame_draws.store((cur_d - prev_d) / dp, std::memory_order_relaxed);
+                }
+            }
+
+            const uint64_t frame_draws = g_cull_frame_draws.load(std::memory_order_relaxed);
+            // Adaptive draw-pressure multiplier:
+            // - Low draw count (< 1350 draws/f, e.g. Leblanc / indoor rooms): 0.85x (conservative, protects room props)
+            // - High draw count (> 1550 draws/f, e.g. street vistas / long corridors): ramps up to 1.45x
+            float pressure_mult = 1.0f;
+            if (frame_draws > 0 && frame_draws < 1350) {
+                pressure_mult = 0.85f;
+            } else if (frame_draws > 1550) {
+                const float over = float(std::min<uint64_t>(frame_draws - 1550, 1100));
+                pressure_mult = 1.0f + (over / 1100.0f) * 0.45f;  // 1.00x -> 1.45x
+            }
+            const float eff_scale = dist_cull_scale * pressure_mult;
+
+            static const float base_vista_cutoff = [] {
+                const char* e = std::getenv("NX_P5R_VISTA_CUTOFF");
+                if (e) return std::clamp(float(std::atof(e)), 15.0f, 60.0f);
+                return 28.0f;  // Vista threshold (meters) for long road and hallway culling
+            }();
+            const float vista_cutoff = (frame_draws > 2100) ? std::min(base_vista_cutoff, 22.0f)
+                                     : (frame_draws > 1650) ? std::min(base_vista_cutoff, 25.0f)
+                                                            : base_vista_cutoff;
+
             const float* p = after.p[0];  // Near plane normal (p[0], p[1], p[2]) and distance (p[3])
             const uint64_t box = (sp - 0x200) & ~uint64_t(15);
+            thread_local MeshBoundsSlot tl_bounds_cache[4096];
+            const uint32_t cur_stamp = uint32_t(cur_p >> 4) + 1u;  // refreshes every 16 frames
             uint64_t last_node = 0;
             uint64_t last_matrix = 0;
+
             for (int i = 0; i < n && i < 1024; i++) {
                 const uint64_t mesh = ld<uint64_t>(arr + stride * i);
                 if (!mesh) continue;
@@ -508,69 +557,55 @@ void cull_job_hook(CPU& c) {
                 const uint64_t local_bounds = mesh + 0x90;
                 if (!node || !local_bounds) continue;
 
-                CPU scratch = c;
-                scratch.x[31] = sp;
-                uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
-                if (!matrix) continue;
-                last_node = node;
-                last_matrix = matrix;
-                guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
+                MeshBoundsSlot& slot = tl_bounds_cache[((mesh >> 5) ^ (mesh >> 17)) & 4095];
+                float b0, b1, b2, radius;
+                if (slot.mesh == mesh && slot.node == node && slot.stamp == cur_stamp) {
+                    b0 = slot.cx;
+                    b1 = slot.cy;
+                    b2 = slot.cz;
+                    radius = slot.radius;
+                } else {
+                    CPU scratch = c;
+                    scratch.x[31] = sp;
+                    uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
+                    if (!matrix) continue;
+                    last_node = node;
+                    last_matrix = matrix;
+                    guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
 
-                // Direct load center coordinates (b[0..2])
-                const float b0 = ld<float>(box);
-                const float b1 = ld<float>(box + 4);
-                const float b2 = ld<float>(box + 8);
+                    b0 = ld<float>(box);
+                    b1 = ld<float>(box + 4);
+                    b2 = ld<float>(box + 8);
+                    const float r16 = std::fabs(ld<float>(box + 16 * 4));
+                    const float r17 = std::fabs(ld<float>(box + 17 * 4));
+                    const float r18 = std::fabs(ld<float>(box + 18 * 4));
+                    if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
+                    radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
+                    slot = {mesh, node, cur_stamp, b0, b1, b2, radius};
+                }
 
                 // Signed distance of box center from near plane along camera view axis
                 const float view_dist = p[0] * b0 + p[1] * b1 + p[2] * b2 - p[3];
-                if (!std::isfinite(view_dist) || view_dist <= 2.5f) continue;  // Protect immediate player interaction bubble
+                if (!std::isfinite(view_dist) || view_dist <= 2.5f) continue;
 
-                // Direct load half-extents (b[16..18])
-                const float r16 = std::fabs(ld<float>(box + 16 * 4));
-                const float r17 = std::fabs(ld<float>(box + 17 * 4));
-                const float r18 = std::fabs(ld<float>(box + 18 * 4));
-                if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
-                const float radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
-
-                // Protect structural meshes (massive road slabs, large ground planes, ceilings)
-                // Dynamic threshold: close structures are protected at 8.0m, mid-range at 14.0m,
-                // and distant vista structures at 22.0m so road slabs/sky are preserved while
-                // secondary buildings and corridor interiors are culled.
                 const float struct_limit = (view_dist < 15.0f) ? 8.0f : (view_dist < 28.0f ? 14.0f : 22.0f);
                 if (radius >= struct_limit) continue;
 
                 g_cull_eval.fetch_add(1, std::memory_order_relaxed);
 
-                static const float vista_cutoff = [] {
-                    const char* e = std::getenv("NX_P5R_VISTA_CUTOFF");
-                    if (e) return std::clamp(float(std::atof(e)), 15.0f, 60.0f);
-                    return 28.0f;  // Vista threshold (meters) for long road and hallway culling
-                }();
-
-                // Progressive tiered small-object / clutter distance culling:
-                // Money bundles & small clutter boxes on vault shelves have radius ~0.15m - 0.35m.
-                // Small street props (produce crates, signs, lanterns, packages) have radius ~0.35m - 1.2m.
-                // Storefronts & shop display fixtures have radius ~1.2m - 4.0m.
-                // Massive road planes and ground slabs have radius >= 22.0m.
                 bool cull = false;
                 const float ratio = radius / view_dist;
 
                 if (view_dist < 8.0f) {
-                    // Very close / Indoor rooms (2.5m - 8m): Only cull tiny micro-clutter (pebbles, coins)
-                    if (radius < 0.12f * dist_cull_scale) cull = true;
+                    if (radius < 0.12f * eff_scale) cull = true;
                 } else if (view_dist < 15.0f) {
-                    // Close (8m - 15m): Cull small shelf props, crates, trash cans, small signs
-                    if (radius < 0.45f * dist_cull_scale || ratio < 0.035f * dist_cull_scale) cull = true;
+                    if (radius < 0.45f * eff_scale || ratio < 0.035f * eff_scale) cull = true;
                 } else if (view_dist < 22.0f) {
-                    // Medium (15m - 22m): Cull street clutter, storefront displays, vending machines, lanterns
-                    if (radius < 1.20f * dist_cull_scale || ratio < 0.055f * dist_cull_scale) cull = true;
+                    if (radius < 1.20f * eff_scale || ratio < 0.055f * eff_scale) cull = true;
                 } else if (view_dist < vista_cutoff) {
-                    // Far (22m - vista_cutoff): Cull secondary storefronts, shop interiors, signs, decorative facades
-                    if (radius < 2.80f * dist_cull_scale || ratio < 0.075f * dist_cull_scale) cull = true;
+                    if (radius < 2.80f * eff_scale || ratio < 0.075f * eff_scale) cull = true;
                 } else {
-                    // Vista / Long road / Shujin hallway (>= vista_cutoff):
-                    // Aggressively cull corridor interiors, secondary storefronts, distant street props
-                    if (radius < 6.50f * dist_cull_scale || ratio < 0.120f * dist_cull_scale) cull = true;
+                    if (radius < 6.50f * eff_scale || ratio < 0.120f * eff_scale) cull = true;
                 }
 
                 if (cull) {
@@ -718,12 +753,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r58";
+static constexpr const char* kPerfBuildTag = "renderopt-r59";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (upstream v0.5.5 NCE dual stub pools, shadow depth STORE, indoor protection, targeted stream cache, vista cutoff)",
+    log("p5r perf build: %s (world-bounds cache, adaptive vista pressure culling, 288B c0 dirty check, cross-submit buffer cache)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
