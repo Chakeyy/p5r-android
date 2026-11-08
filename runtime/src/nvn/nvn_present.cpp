@@ -243,7 +243,7 @@ bool build_pipeline(VkRenderPass pass, const uint32_t* code, size_t bytes, VkPip
     gp.pVertexInputState = &vin, gp.pInputAssemblyState = &ia, gp.pViewportState = &vp;
     gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cb, gp.pDynamicState = &ds;
     gp.layout = g.layout, gp.renderPass = pass;
-    VkResult r = p_vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &gp, nullptr, out);
+    VkResult r = p_vkCreateGraphicsPipelines(d, pipeline_cache(), 1, &gp, nullptr, out);
     p_vkDestroyShaderModule(d, vs, nullptr);
     p_vkDestroyShaderModule(d, fs, nullptr);
     return r == VK_SUCCESS;
@@ -434,16 +434,8 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
     p.crop[2] = cw / float(src.width), p.crop[3] = ch / float(src.height);
     bool sideways = r == 1 || r == 3;
     float tw = float(sideways ? g.extent.height : g.extent.width), th = float(sideways ? g.extent.width : g.extent.height);
-    float bw = 1.0f, bh = 1.0f;
-    const char* stretch_env = std::getenv("NX_STRETCH");
-    bool stretch = stretch_env && (stretch_env[0] == '1' || std::strcmp(stretch_env, "true") == 0);
-    if (stretch) {
-        p.box[0] = 0.0f, p.box[1] = 0.0f, p.box[2] = 1.0f, p.box[3] = 1.0f;
-    } else {
-        float scale = std::min(tw / cw, th / ch);
-        bw = cw * scale / tw, bh = ch * scale / th;
-        p.box[0] = (1 - bw) / 2, p.box[1] = (1 - bh) / 2, p.box[2] = bw, p.box[3] = bh;
-    }
+    float scale = std::min(tw / cw, th / ch), bw = cw * scale / tw, bh = ch * scale / th;
+    p.box[0] = (1 - bw) / 2, p.box[1] = (1 - bh) / 2, p.box[2] = bw, p.box[3] = bh;
     // The touch controls (platform_android_input.cpp), in upright uv; none elsewhere.
     plat::OverlayShape shapes[kOverlayMax];
     size_t count = plat::touch_overlay(shapes, kOverlayMax);

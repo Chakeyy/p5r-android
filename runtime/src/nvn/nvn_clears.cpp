@@ -47,7 +47,7 @@ uint64_t g_scissored = 0, g_masked = 0, g_mask_fallback = 0, g_scissor_lost = 0;
 bool clears_v2() {
     static const bool on = [] {
         const char* e = std::getenv("NX_CLEARS_V2");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     return on;
 }

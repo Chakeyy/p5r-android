@@ -18,6 +18,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <malloc.h>
 #include <unistd.h>
@@ -47,6 +48,10 @@
 #if NX_NCE
 #include "nce/nce.h"
 #endif
+
+namespace nx::nvn {
+void pipeline_cache_save();
+}
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -137,6 +142,76 @@ void yield() {
 }
 void set_thread_name(const char* name) { pthread_setname_np(pthread_self(), name); }
 int64_t current_thread_id() { return gettid(); }
+
+void pin_current_thread_to_big_cores(const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (num_cores < 8) return;  // Only apply on 8-core Big.LITTLE topologies
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    // On 8-core MediaTek/Qualcomm SoCs, cores 6 and 7 are the Cortex-A76/A78/X-cores
+    CPU_SET(6, &cpuset);
+    CPU_SET(7, &cpuset);
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s': errno %d", thread_name, rc);
+    }
+}
+
+void pin_current_thread_to_core(int core_id, const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (core_id < 0 || core_id >= num_cores) return;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Core %d: errno %d", thread_name, core_id, rc);
+    }
+}
+
+void pin_current_thread_to_little_cores(const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (num_cores < 8) return;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    // On 8-core MediaTek/Qualcomm SoCs, cores 0-5 are the Cortex-A55 LITTLE cores
+    for (int i = 0; i < 6; ++i) {
+        CPU_SET(i, &cpuset);
+    }
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Little Cores: errno %d", thread_name, rc);
+    }
+}
+
+void reset_current_thread_affinity(const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (num_cores <= 0) return;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    for (int i = 0; i < num_cores; ++i) {
+        CPU_SET(i, &cpuset);
+    }
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to reset affinity for thread '%s': errno %d", thread_name, rc);
+    }
+}
+
+void set_thread_priority(int priority) {
+    int rc = setpriority(PRIO_PROCESS, 0, priority);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to set thread priority %d: errno %d", priority, errno);
+    }
+}
 
 // ---- sampling profiler (simpleperf is not always allowed on retail phones) ------------------------------------
 
@@ -264,6 +339,14 @@ void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, nx::game
 
 std::string data_root() { return g_root; }
 
+const char* get_pipeline_cache_path() {
+    static std::string path;
+    if (path.empty() && g_app && g_app->activity && g_app->activity->internalDataPath) {
+        path = std::string(g_app->activity->internalDataPath) + "/vk_pipeline_cache.bin";
+    }
+    return path.empty() ? nullptr : path.c_str();
+}
+
 // The device's locale (Settings > System > Languages) as "es-MX".
 std::string system_language() {
     if (!g_app || !g_app->config) return "";
@@ -314,32 +397,43 @@ void screen_size(uint32_t& w, uint32_t& h) {
     h = uint32_t(std::min(a, b));
 }
 
-// The render size: resolution=WxH if set, else the screen's size times the render scale (render_scale=0.5..1, or
-// the GPU's default), never taller than 1080 (the game's art is made for 720p/1080p; more only costs GPU time).
+static int parse_resolution_height(const std::string& r) {
+    if (r.find("540") != std::string::npos) return 540;
+    if (r.find("1080") != std::string::npos) return 1080;
+    if (r.find("720") != std::string::npos) return 720;
+    return 0;
+}
+
+// The render size: resolution=WxH or height (540, 720, 1080) if set, else the screen's size times the render scale.
 void window_size(uint32_t& w, uint32_t& h) {
-    uint32_t sw = 0, sh = 0;
-    screen_size(sw, sh);
     std::string r = setting("resolution");
     if (r.empty()) r = setting("NX_RES");
-    if (r.empty()) r = setting("RESOLUTION");
+    if (const char* e = getenv("NX_RES"); e && *e) r = e;
+    if (const char* e = getenv("resolution"); e && *e) r = e;
+
+    int configured_height = parse_resolution_height(r);
+    if (configured_height == 540) {
+        w = 1280;
+        h = 720;
+        return;
+    } else if (configured_height == 1080) {
+        w = 1920;
+        h = 1080;
+        return;
+    } else if (configured_height == 720) {
+        w = 1280;
+        h = 720;
+        return;
+    }
+
     unsigned cw = 0, ch = 0;
     if (!r.empty() && std::sscanf(r.c_str(), "%ux%u", &cw, &ch) == 2 && cw && ch) {
         w = cw;
         h = ch;
         return;
     }
-    uint32_t target_h = 0;
-    if (r == "360p" || r == "360") target_h = 360;
-    else if (r == "480p" || r == "480") target_h = 480;
-    else if (r == "720p" || r == "720") target_h = 720;
-    else if (r == "1080p" || r == "1080") target_h = 1080;
-
-    if (target_h && sh) {
-        float scale = float(target_h) / float(sh);
-        w = uint32_t(float(sw) * scale + 0.5f) & ~1u;
-        h = target_h & ~1u;
-        return;
-    }
+    uint32_t sw = 0, sh = 0;
+    screen_size(sw, sh);
     std::string rs = setting("render_scale");
     float scale = rs.empty() ? default_render_scale() : std::strtof(rs.c_str(), nullptr);
     scale = std::clamp(scale, 0.25f, 1.0f);
@@ -399,21 +493,10 @@ void* vulkan_get_instance_proc_addr() {
 const char* vulkan_surface_extension() { return VK_KHR_ANDROID_SURFACE_EXTENSION_NAME; }
 
 int vulkan_create_surface(void* instance, void* native_window, uint64_t* surface, void* gipa) {
-    ANativeWindow* win = static_cast<ANativeWindow*>(native_window);
-    uint32_t rw = 0, rh = 0;
-    window_size(rw, rh);
-    if (win && rw && rh) {
-        int32_t cur_w = ANativeWindow_getWidth(win), cur_h = ANativeWindow_getHeight(win);
-        bool portrait = cur_w < cur_h;
-        int32_t bw = int32_t(portrait ? std::min(rw, rh) : std::max(rw, rh));
-        int32_t bh = int32_t(portrait ? std::max(rw, rh) : std::min(rw, rh));
-        int r_geom = ANativeWindow_setBuffersGeometry(win, bw, bh, 0);
-        nx::log("android: setBuffersGeometry %dx%d (screen %dx%d) -> %d", bw, bh, cur_w, cur_h, r_geom);
-    }
     auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(reinterpret_cast<PFN_vkGetInstanceProcAddr>(gipa)(
         static_cast<VkInstance>(instance), "vkCreateAndroidSurfaceKHR"));
     VkAndroidSurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
-    ci.window = win;
+    ci.window = static_cast<ANativeWindow*>(native_window);
     VkSurfaceKHR s = VK_NULL_HANDLE;
     VkResult r = create(static_cast<VkInstance>(instance), &ci, nullptr, &s);
     *surface = reinterpret_cast<uint64_t>(s);
@@ -466,6 +549,8 @@ void crash(int sig, siginfo_t* info, void* uc) {
 }
 
 void game_thread(void*) {
+    nx::plat::set_thread_priority(-4);
+    nx::plat::perf_hint_thread();
     try {
         nx::boot();
     } catch (const nx::LongJmp& j) {
@@ -502,16 +587,32 @@ void request_frame_rate(ANativeWindow* w) {
 void on_cmd(android_app* app, int32_t cmd) {
     using namespace nx::plat;
     switch (cmd) {
-        case APP_CMD_INIT_WINDOW:
+        case APP_CMD_INIT_WINDOW: {
             g_window = app->window;
             g_window_gen++;
             g_visible = true;
+            uint32_t rw = 0, rh = 0;
+            window_size(rw, rh);
+            if (rw && rh && app->window) {
+                int32_t sw = ANativeWindow_getWidth(app->window);
+                int32_t sh = ANativeWindow_getHeight(app->window);
+                int32_t bw = rw, bh = rh;
+                if (sw > 0 && sh > 0) {
+                    float aspect = float(std::max(sw, sh)) / float(std::min(sw, sh));
+                    bw = (uint32_t(float(rh) * aspect + 0.5f)) & ~1u;
+                    bh = rh;
+                }
+                ANativeWindow_setBuffersGeometry(app->window, bw, bh, 0);
+                nx::log("android: ANativeWindow buffer geometry set to %dx%d (render height %u)", bw, bh, rh);
+            }
             request_frame_rate(app->window);
             request_immersive();
             break;
+        }
         case APP_CMD_TERM_WINDOW:  // the window goes away once this returns
             g_window = nullptr;
             g_visible = false;
+            nx::nvn::pipeline_cache_save();
             break;
         case APP_CMD_GAINED_FOCUS:
             g_visible = g_window != nullptr;
@@ -521,6 +622,11 @@ void on_cmd(android_app* app, int32_t cmd) {
             break;
         case APP_CMD_PAUSE:  // home, app switcher, screen off: the game holds (no window), so does its sound
             audio_pause(true);
+            nx::nvn::pipeline_cache_save();
+            break;
+        case APP_CMD_STOP:
+        case APP_CMD_DESTROY:
+            nx::nvn::pipeline_cache_save();
             break;
         case APP_CMD_RESUME:
             audio_pause(false);
@@ -660,32 +766,53 @@ extern "C" void android_main(android_app* app) {
     g_root = !chosen.empty() && has_data(chosen) ? chosen : has_data(own) ? own : shared;
     // config.txt's NX_* lines become environment variables (the NVN layer reads its switches with getenv), without
     // overriding a variable already set. Android defaults: handheld (720p, the lighter GPU load).
-    {
-        std::ifstream f(g_root + "/config.txt");
-        std::string line;
-        while (std::getline(f, line)) {
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-            auto eq = line.find('=');
-            if (line.rfind("NX_", 0) == 0 && eq != std::string::npos) {
-                const std::string key = line.substr(0, eq);
-                const std::string value = line.substr(eq + 1);
-                // Launcher and NativeActivity share a process: update stretch even if a previous launch set it to "1".
-                setenv(key.c_str(), value.c_str(), key == "NX_STRETCH" ? 1 : 0);
+        {
+            std::ifstream f(g_root + "/config.txt");
+            std::string line;
+            while (std::getline(f, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                auto eq = line.find('=');
+                if (line.rfind("NX_", 0) == 0 && eq != std::string::npos)
+                    setenv(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), 0);
+                if (eq != std::string::npos && line.substr(0, eq) == "resolution")
+                    setenv("NX_RES", line.substr(eq + 1).c_str(), 0);
             }
+            // If resolution is 1080, NX_HANDHELD=0; if 720, NX_HANDHELD=1; if 540, NX_HANDHELD=1 and NX_LOW_3D=1 (true 405p 3D)
+            std::string r = setting("resolution");
+            if (r.empty()) r = setting("NX_RES");
+            const char* low_env = getenv("NX_LOW_3D");
+            int h = parse_resolution_height(r);
+            bool low_3d = (h == 540) || (low_env && low_env[0] == '1');
+
+            if (h == 1080 && !low_3d) {
+                unsetenv("NX_HANDHELD");
+                unsetenv("NX_LOW_3D");
+            } else if (low_3d) {
+                setenv("NX_HANDHELD", "1", 1);
+                setenv("NX_LOW_3D", "1", 1);
+            } else {
+                setenv("NX_HANDHELD", "1", 1);
+                unsetenv("NX_LOW_3D");
+            }
+            nx::log("display: resolution parsed '%s' -> height %d, handheld=%s, low_3d=%s",
+                    r.c_str(), h, getenv("NX_HANDHELD") ? getenv("NX_HANDHELD") : "0",
+                    getenv("NX_LOW_3D") ? getenv("NX_LOW_3D") : "0");
         }
-        // NX_HANDHELD=0 in config.txt (the launcher's TV mode): docked, 1080p. svc_am.cpp tests only whether the variable
-        // exists, so "0" must remove it.
-        if (const char* h = getenv("NX_HANDHELD"); h && h[0] == '0')
-            unsetenv("NX_HANDHELD");
-        else
-            setenv("NX_HANDHELD", "1", 0);
-    }
     // The heap (scudo) zero-fills every allocation and gives freed pages back at once by default: in the replay, a
     // memset under each allocation and madvise churn (docs/nvn/android-perf/PLAN.md, phase 2). NX_MALLOC_TUNE=0: as
     // the system set it.
     if (const char* e = getenv("NX_MALLOC_TUNE"); !(e && e[0] == '0')) {
         int zero = mallopt(M_BIONIC_ZERO_INIT, 0), decay = mallopt(M_DECAY_TIME, 1);
-        nx::log("heap: zero-fill off (%d), page release delayed (%d)", zero, decay);
+#ifndef M_CACHE_COUNT_MAX
+#define M_CACHE_COUNT_MAX (-200)
+#endif
+#ifndef M_CACHE_SIZE_MAX
+#define M_CACHE_SIZE_MAX (-201)
+#endif
+        int cache_cnt = mallopt(M_CACHE_COUNT_MAX, 64);
+        int cache_sz = mallopt(M_CACHE_SIZE_MAX, 4 << 20);
+        nx::log("heap: zero-fill off (%d), page release delayed (%d), scudo cache (%d, %d)",
+                zero, decay, cache_cnt, cache_sz);
     }
     start_memory_guard();
     gpu_turbo();
@@ -701,7 +828,7 @@ extern "C" void android_main(android_app* app) {
     struct sigaction sa{};
     sa.sa_sigaction = crash;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, &g_previous[s]);
+    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) sigaction(s, &sa, &g_previous[s]);
 
     nx::log("%s (Switch recomp) on Android, data at %s (own folder %s: %s)", nx::game::kInfo.title, g_root.c_str(),
             own.c_str(), has_data(own) ? "has the data" : kDataProbe);

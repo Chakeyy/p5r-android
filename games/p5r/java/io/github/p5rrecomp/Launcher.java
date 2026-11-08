@@ -30,6 +30,7 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -93,15 +94,31 @@ public class Launcher extends Activity {
     final Map<String, String> config = new LinkedHashMap<>();
     TextView status;
     Button play;
-    static final int PICK_ZIP = 1, PICK_FOLDER = 2, PICK_GAME = 3, PICK_KEYS = 4, PICK_ICON = 5, PREPARE = 6;
+    static final int PICK_ZIP = 1, PICK_FOLDER = 2, PICK_GAME = 3, PICK_KEYS = 4, PICK_ICON = 5, PREPARE = 6, PICK_CPK = 7;
 
     String t(String spanish, String english) { return Lang.t(spanish, english); }
 
     String label(Option o) { return t(o.labelsEs[o.pick], o.labelsEn[o.pick]); }
 
+    Option findOption(String key) {
+        for (Option o : options) {
+            if (key.equals(o.key)) return o;
+        }
+        return null;
+    }
+
     static File dataDir() { return new File(Environment.getExternalStorageDirectory(), DATA); }
 
-    boolean hasAccess() { return Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager(); }
+    static final class Api30Helper {
+        static boolean isExternalStorageManager() {
+            return Environment.isExternalStorageManager();
+        }
+    }
+
+    boolean hasAccess() {
+        if (Build.VERSION.SDK_INT < 30) return true;
+        return Api30Helper.isExternalStorageManager();
+    }
 
     // ---- the game file, read in place at every start ----
 
@@ -261,9 +278,14 @@ public class Launcher extends Activity {
 
     // The build ID the port is made for (Persona 5 Royal 1.0.0, the base game): the start of exefs/main's module ID
     // (NSO header +0x40). The native build refuses another (runtime main.cpp); say so here instead of closing.
-    static final String BUILD_ID = "708BCACA873EA32B";
+    static final String[] KNOWN_BUILDS = {
+        "708BCACA873EA32B",  // US
+        "B78A03E489E5BD92",  // EU
+        "6E1F4CAE92A28C91",  // JP
+        "2F2253ACD6BE5D87"   // Asia
+    };
 
-    // Null when exefs/main is missing or the right version, else its build ID.
+    // Null when exefs/main is missing or a recognized base game version, else its build ID.
     String wrongBuild() {
         File main = new File(dataDir(), "exefs/main");
         if (!main.canRead()) return null;
@@ -276,7 +298,11 @@ public class Launcher extends Activity {
         }
         StringBuilder hex = new StringBuilder();
         for (byte b : id) hex.append(String.format("%02X", b & 0xFF));
-        return hex.toString().equals(BUILD_ID) ? null : hex.toString();
+        String have = hex.toString();
+        for (String k : KNOWN_BUILDS) {
+            if (have.equals(k)) return null;
+        }
+        return have;
     }
 
     @Override
@@ -290,11 +316,11 @@ public class Launcher extends Activity {
                         "Italiano", "日本語", "한국어", "简体中文", "繁體中文"},
                 new String[] {"Automatic (device language)", "English", "Español", "Français", "Deutsch", "Italiano",
                         "日本語", "한국어", "简体中文", "繁體中文"}, 0));
-        options.add(new Option("RESOLUTION", "Resolución", "Resolution",
-                new String[] {"360p", "480p", "720p", "1080p"},
-                new String[] {"360p", "480p", "720p", "1080p"},
-                new String[] {"360p", "480p", "720p", "1080p"}, 2));
-        options.add(new Option("NX_STRETCH", "Pantalla completa (estirar)", "Fullscreen (stretch)",
+        options.add(new Option("resolution", "Resolución", "Resolution",
+                new String[] {"540", "720", "1080"},
+                new String[] {"540p (3D a 405p - máxima fluidez)", "720p (portátil)", "1080p (sobremesa)"},
+                new String[] {"540p (3D 405p - Max Performance)", "720p (Handheld)", "1080p (Docked)"}, 1));
+        options.add(new Option("NX_FSR", "Superresolución (FSR 1.0)", "Super resolution (FSR 1.0)",
                 new String[] {"0", "1"},
                 new String[] {"Desactivada", "Activada"},
                 new String[] {"Off", "On"}, 0));
@@ -307,6 +333,14 @@ public class Launcher extends Activity {
                 new String[] {"30 fps", "60 fps (experimental)"}, new String[] {"30 fps", "60 fps (experimental)"}, 0));
         options.add(new Option("NX_SHADOWS", "Sombras", "Shadows", new String[] {"0", "1"},
                 new String[] {"Desactivadas", "Activadas"}, new String[] {"Off", "On"}, 0));
+        options.add(new Option("NX_MALI_LOW_SHADOWS", "Calidad de sombras", "Shadow quality",
+                new String[] {"1", "0"},
+                new String[] {"Baja (0.5x - mejor rendimiento)", "Original (1.0x)"},
+                new String[] {"Low (0.5x - best performance)", "Original (1.0x)"}, 0));
+        options.add(new Option("NX_GAMEPAD_LAYOUT", "Disposición del mando", "Controller layout",
+                new String[] {"auto", "xbox", "nintendo"},
+                new String[] {"Automática (Xbox/8BitDo/Switch)", "Xbox / Estándar (A=Abajo, B=Derecha)", "Nintendo Switch (B=Abajo, A=Derecha)"},
+                new String[] {"Auto-detect (Xbox/8BitDo/Switch)", "Xbox / Standard (A=Bottom, B=Right)", "Nintendo Switch (B=Bottom, A=Right)"}, 0));
         options.add(new Option("NX_SHOW_FPS", "Contador de FPS", "FPS counter", new String[] {"0", "1"},
                 new String[] {"Desactivado", "Activado"}, new String[] {"Off", "On"}, 0));
         options.add(new Option("NX_TOUCH_SHOW", "Controles táctiles", "On-screen controls", new String[] {"1", "0"},
@@ -317,6 +351,22 @@ public class Launcher extends Activity {
         options.add(new Option("NX_TOUCH_OPACITY", "Opacidad de los botones", "Button opacity",
                 new String[] {"50", "85", "100"}, new String[] {"Baja", "Normal", "Alta"},
                 new String[] {"Low", "Normal", "High"}, 1));
+        options.add(new Option("NX_NO_CROWD", "Gente / Multitudes de NPCs", "Crowd NPCs",
+                new String[] {"0", "1"},
+                new String[] {"Activada (normal)", "Desactivada (más FPS)"},
+                new String[] {"Enabled (normal)", "Disabled (more FPS)"}, 0));
+        options.add(new Option("NX_DISABLE_BLOOM", "Post-procesado (bloom/brillo)", "Post-processing (bloom)",
+                new String[] {"0", "1"},
+                new String[] {"Activado (normal)", "Desactivado (más FPS)"},
+                new String[] {"Enabled (normal)", "Disabled (more FPS)"}, 0));
+        options.add(new Option("NX_STICK_SENSITIVITY", "Sensibilidad palanca táctil", "Touch stick sensitivity",
+                new String[] {"50", "75", "100", "125", "150", "200"},
+                new String[] {"50%", "75%", "100%", "125%", "150%", "200%"},
+                new String[] {"50%", "75%", "100%", "125%", "150%", "200%"}, 2));
+        options.add(new Option("NX_CAMERA_SENSITIVITY", "Sensibilidad cámara táctil", "Touch camera sensitivity",
+                new String[] {"50", "75", "100", "125", "150", "200", "250"},
+                new String[] {"50%", "75%", "100%", "125%", "150%", "200%", "250%"},
+                new String[] {"50%", "75%", "100%", "125%", "150%", "200%", "250%"}, 2));
         build();
     }
 
@@ -386,6 +436,7 @@ public class Launcher extends Activity {
                     o.pick = (o.pick + 1) % o.values.length;
                     value.setText(label(o));
                     save();
+                    updateButtons(getWindow().getDecorView());
                 }
             });
             value.setTag(o);
@@ -461,6 +512,56 @@ public class Launcher extends Activity {
         });
         root.addView(saves);
 
+        // Translation CPK import
+        LinearLayout transRow = new LinearLayout(this);
+        transRow.setOrientation(LinearLayout.HORIZONTAL);
+        transRow.setGravity(Gravity.CENTER_VERTICAL);
+        transRow.setPadding(0, dp(4), 0, dp(4));
+        TextView transName = new TextView(this);
+        transName.setText(t("Traducción / Paquete (.cpk)", "Translation / CPK mod"));
+        transName.setTextColor(Color.WHITE);
+        transName.setTextSize(17);
+        transRow.addView(transName, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        Button transButton = new Button(this);
+        transButton.setAllCaps(false);
+        transButton.setMinWidth(dp(180));
+        transButton.setText(t("Importar CPK", "Import CPK"));
+        transRow.addView(transButton);
+        transButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (!hasAccess()) {
+                    askAccess();
+                    return;
+                }
+                pick(PICK_CPK, "*/*", false);
+            }
+        });
+        root.addView(transRow);
+
+        // Debug logs export
+        LinearLayout logsRow = new LinearLayout(this);
+        logsRow.setOrientation(LinearLayout.HORIZONTAL);
+        logsRow.setGravity(Gravity.CENTER_VERTICAL);
+        logsRow.setPadding(0, dp(4), 0, dp(4));
+        TextView logsName = new TextView(this);
+        logsName.setText(t("Registros de depuración", "Debug logs"));
+        logsName.setTextColor(Color.WHITE);
+        logsName.setTextSize(17);
+        logsRow.addView(logsName, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        Button logsButton = new Button(this);
+        logsButton.setAllCaps(false);
+        logsButton.setMinWidth(dp(180));
+        logsButton.setText(t("Exportar registros", "Export logs"));
+        logsRow.addView(logsButton);
+        logsButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                exportLogs();
+            }
+        });
+        root.addView(logsRow);
+
         play = new Button(this);
         play.setTextSize(20);
         play.setAllCaps(false);
@@ -510,15 +611,17 @@ public class Launcher extends Activity {
         load();
         for (Option o : options) {
             String v = config.get(o.key);
-            if ("RESOLUTION".equals(o.key) && v == null) {
-                String hh = config.get("NX_HANDHELD");
-                if ("0".equals(hh)) v = "1080p";
-                else {
-                    String r = config.get("resolution");
-                    if (r != null && r.contains("360")) v = "360p";
-                    else if (r != null && r.contains("480")) v = "480p";
-                    else v = "720p";
+            if ("resolution".equals(o.key)) {
+                if (v == null) {
+                    String hh = config.get("NX_HANDHELD");
+                    if ("0".equals(hh)) v = "1080";
+                    else if ("1".equals(hh)) v = "720";
+                } else {
+                    if (v.contains("540")) v = "540";
+                    else if (v.contains("1080")) v = "1080";
+                    else if (v.contains("720")) v = "720";
                 }
+                if ("1".equals(config.get("NX_LOW_3D"))) v = "540";
             }
             for (int k = 0; v != null && k < o.values.length; k++)
                 if (o.values[k].equals(v)) o.pick = k;
@@ -561,7 +664,17 @@ public class Launcher extends Activity {
     void updateButtons(View v) {
         if (v instanceof Button && v.getTag() instanceof Option) {
             Option o = (Option) v.getTag();
-            ((Button) v).setText(label((Option) v.getTag()));
+            Button b = (Button) v;
+            b.setText(label(o));
+            if ("NX_MALI_LOW_SHADOWS".equals(o.key)) {
+                Option shadows = findOption("NX_SHADOWS");
+                boolean enabled = shadows != null && "1".equals(shadows.values[shadows.pick]);
+                b.setEnabled(enabled);
+                b.setAlpha(enabled ? 1.0f : 0.4f);
+                if (b.getParent() instanceof View) {
+                    ((View) b.getParent()).setAlpha(enabled ? 1.0f : 0.4f);
+                }
+            }
         } else if (v instanceof android.view.ViewGroup) {
             android.view.ViewGroup g = (android.view.ViewGroup) v;
             for (int k = 0; k < g.getChildCount(); k++) updateButtons(g.getChildAt(k));
@@ -623,6 +736,10 @@ public class Launcher extends Activity {
         }
         if (request == PICK_ICON) {
             onIconPicked(data.getData());
+            return;
+        }
+        if (request == PICK_CPK) {
+            importCpk(data.getData());
             return;
         }
         try {
@@ -704,36 +821,127 @@ public class Launcher extends Activity {
         if (!dataDir().isDirectory()) return;
         load();
         for (Option o : options) config.put(o.key, o.values[o.pick]);
-        final String res = config.get("RESOLUTION");
-        if ("360p".equals(res)) {
-            config.put("NX_HANDHELD", "1");
-            config.put("resolution", "640x360");
-            config.put("NX_RENDER_RES", "640x360");
-            config.put("NX_RES", "360p");
-        } else if ("480p".equals(res)) {
-            config.put("NX_HANDHELD", "1");
-            config.put("resolution", "854x480");
-            config.put("NX_RENDER_RES", "854x480");
-            config.put("NX_RES", "480p");
-        } else if ("1080p".equals(res)) {
-            config.put("NX_HANDHELD", "0");
-            config.put("resolution", "1920x1080");
-            config.put("NX_RENDER_RES", "1920x1080");
-            config.put("NX_RES", "1080p");
-        } else {
-            config.put("NX_HANDHELD", "1");
-            config.put("resolution", "1280x720");
-            config.put("NX_RENDER_RES", "1280x720");
-            config.put("NX_RES", "720p");
+        String res = config.get("resolution");
+        if (res != null) {
+            if (res.contains("540")) res = "540";
+            else if (res.contains("1080")) res = "1080";
+            else if (res.contains("720")) res = "720";
         }
-        for (String k : new String[] {"RENDER_SCALE", "NX_ANISO_MAX", "NX_LOD_BIAS"}) config.remove(k);
+        if ("1080".equals(res)) {
+            config.put("resolution", "1080");
+            config.put("NX_HANDHELD", "0");
+            config.remove("NX_LOW_3D");
+        } else if ("540".equals(res)) {
+            config.put("resolution", "540");
+            config.put("NX_HANDHELD", "1");
+            config.put("NX_LOW_3D", "1");
+        } else {
+            config.put("resolution", "720");
+            config.put("NX_HANDHELD", "1");
+            config.remove("NX_LOW_3D");
+        }
+        if ("1".equals(config.get("NX_FSR"))) {
+            config.put("NX_FSR_SHARP", "0.2");
+        } else {
+            config.remove("NX_FSR");
+            config.remove("NX_FSR_SHARP");
+        }
+        // GRAPHICS is the launcher's own key: the preset's switches are written with it (and removed for "high").
+        // RENDER_SCALE (the old option), NX_RENDER_RES and NX_ANISO_MAX are dropped: P5R sizes its targets from the
+        // console mode, not from the reported resolution, and never asks for anisotropic filtering.
+        for (String k : new String[] {"RENDER_SCALE", "NX_RENDER_RES", "NX_ANISO_MAX", "NX_LOD_BIAS", "NX_MAX_ANISO", "RESOLUTION", "NX_RES"}) config.remove(k);
         final String preset = config.get("GRAPHICS");
-        if ("low".equals(preset)) config.put("NX_LOD_BIAS", "1");
-        else if ("medium".equals(preset)) config.put("NX_LOD_BIAS", "0.5");
+        if ("low".equals(preset)) {
+            config.put("NX_LOD_BIAS", "1");
+            config.put("NX_MAX_ANISO", "1");
+        } else if ("medium".equals(preset)) {
+            config.put("NX_LOD_BIAS", "0.5");
+            config.put("NX_MAX_ANISO", "2");
+        }
         writeConfig(new File(dataDir(), "config.txt"), config);
     }
 
     int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+    void importCpk(Uri uri) {
+        try {
+            File cpkDir = new File(dataDir(), "mods" + File.separator + "translation" + File.separator + "romfs" + File.separator + "CPK");
+            if (!cpkDir.exists()) cpkDir.mkdirs();
+            File dest = new File(cpkDir, "PATCH1.CPK");
+            try (InputStream in = getContentResolver().openInputStream(uri);
+                 OutputStream out = new FileOutputStream(dest)) {
+                if (in == null) throw new java.io.IOException("Cannot open selected file");
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            }
+            Toast.makeText(this, t("Traducción instalada en mods/translation/ (PATCH1.CPK)",
+                    "Translation installed to mods/translation/ (as PATCH1.CPK)"), Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, t("Error al importar CPK: " + e.getMessage(),
+                    "Error importing CPK: " + e.getMessage()), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    void exportLogs() {
+        try {
+            File dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            if (!dl.exists()) dl.mkdirs();
+            File out = new File(dl, "p5r-log.txt");
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== Persona 5 Royal Recomp Log Export ===\n");
+            sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
+            sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
+            sb.append("Date: ").append(new java.util.Date().toString()).append("\n\n");
+
+            try {
+                Process p = Runtime.getRuntime().exec(new String[] {"logcat", "-d", "-t", "500"});
+                try (BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append("\n");
+                }
+            } catch (Exception e) {
+                sb.append("logcat capture error: ").append(e.getMessage()).append("\n");
+            }
+
+            File nxLog = new File(dataDir(), "nx.log");
+            if (nxLog.exists()) {
+                sb.append("\n=== nx.log ===\n");
+                try (BufferedReader br = new BufferedReader(new FileReader(nxLog))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append("\n");
+                }
+            }
+
+            File nxLogPrev = new File(dataDir(), "nx.log.prev");
+            if (nxLogPrev.exists()) {
+                sb.append("\n=== nx.log.prev ===\n");
+                try (BufferedReader br = new BufferedReader(new FileReader(nxLogPrev))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append("\n");
+                }
+            }
+
+            try (FileWriter fw = new FileWriter(out)) {
+                fw.write(sb.toString());
+            }
+
+            Toast.makeText(this, t("Registros exportados a Download/p5r-log.txt",
+                    "Logs exported to Download/p5r-log.txt"), Toast.LENGTH_SHORT).show();
+
+            Uri logUri = Uri.parse("content://" + getPackageName() + ".logprovider" + out.getAbsolutePath());
+            Intent share = new Intent(Intent.ACTION_SEND);
+            share.setType("text/plain");
+            share.putExtra(Intent.EXTRA_STREAM, logUri);
+            share.putExtra(Intent.EXTRA_SUBJECT, "Persona 5 Royal Debug Log");
+            share.setClipData(android.content.ClipData.newRawUri("Log", logUri));
+            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(share, t("Compartir archivo de registros", "Share log file")));
+        } catch (Exception e) {
+            Toast.makeText(this, t("Error al exportar registros: " + e.getMessage(),
+                    "Error exporting logs: " + e.getMessage()), Toast.LENGTH_LONG).show();
+        }
+    }
 
     void addRow(LinearLayout root, String label, String button, View.OnClickListener click) {
         LinearLayout row = new LinearLayout(this);

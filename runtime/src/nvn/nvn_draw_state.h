@@ -59,6 +59,7 @@ struct Stats {
 extern State g_state;
 extern Stats g_stats;
 extern bool g_hud_target;  // NX_HUD_1080: this draw's target is a 1920x1080 image of a 1280x720 texture (nvn_vk.h)
+extern bool g_low_3d_target;  // NX_LOW_3D: this draw's target is a 720x405 image of a 960x540 texture (nvn_vk.h)
 
 const uint8_t* guest_bytes(uint64_t gpu);
 uint32_t handle_texture(uint64_t handle, uint32_t* sampler);
@@ -153,9 +154,11 @@ Upload zero_stream();  // 64 zero bytes for vertex binding 15
 bool draw_inputs_shared(VkCommandBuffer cb, const ShaderInfo* vs, bool indexed, const Cmd& c, DrawInputs& in);
 std::vector<WriteBack>& separate_write_backs();  // NX_COMPUTE_SEPARATE=1: a write-back per binding
 void sets_begin_submit();
+void sets_invalidate_bound();
 void sets_log();
 // nvn_draw.cpp: `img` is a target of the open pass that a draw or clear of the pass wrote.
 bool pass_wrote(const GpuImage* img);
+void flush_compute_barrier(VkCommandBuffer cb);
 void written_cpu_write(const uint8_t* p, uint64_t size);       // replay-time guest writes (logged when they meet one)
 std::vector<WriteBack> written_take();                         // one write-back per range, at the end of the submit
 void written_reset();
@@ -163,6 +166,7 @@ void written_log();
 // c[0], the NVN driver constants of a stage (nvn_dedup.cpp).
 std::array<uint8_t, 0x1000> driver_constants(ShaderStage stage, int st);
 
+bool debug_shader_overrides_active();
 bool debug_shader_overrides(const std::vector<const ShaderInfo*>*& shaders, const ShaderInfo*& fs,
                             std::vector<const ShaderInfo*>& swapped);
 // nvn_raster.cpp: the stencil, polygon offset, depth bounds and depth clamp commands into g_state (false for other
