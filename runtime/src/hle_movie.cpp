@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -212,12 +213,37 @@ struct Decoder {
 #if defined(__ANDROID__)
 constexpr int32_t kColorI420 = 19, kColorNV12 = 21, kColorFlexible = 0x7F420888, kColorQcom32m = 0x7FA30C04;
 
+bool is_planar_codec(int32_t color, const std::string& name) {
+    if (color == kColorI420) return true;
+    if (color == kColorNV12) return false;
+    if (const char* env = std::getenv("NX_MOVIE_PLANAR")) {
+        return env[0] == '1' || std::strcmp(env, "true") == 0;
+    }
+    std::string lower;
+    lower.reserve(name.size());
+    for (char ch : name) lower.push_back(std::tolower(static_cast<unsigned char>(ch)));
+
+    // Qualcomm (c2.qti.*, OMX.qcom.*) and Samsung Exynos (c2.exynos.*, OMX.Exynos.*, c2.samsung.*)
+    // output Semi-Planar NV12 in ByteBuffer mode.
+    if (lower.find("qcom") != std::string::npos ||
+        lower.find("qti") != std::string::npos ||
+        lower.find("exynos") != std::string::npos ||
+        lower.find("samsung") != std::string::npos) {
+        return false;
+    }
+    // MediaTek (c2.mtk.*, OMX.MTK.*), Unisoc/Spreadtrum (c2.unisoc.*, OMX.sprd.*),
+    // Transsion/Infinix/Tecno (c2.transsion.*, c2.vdec.*), HiSilicon (c2.hisilicon.*),
+    // and Google software decoders (c2.android.*, OMX.google.*) output Planar I420.
+    return true;
+}
+
 // The codec's picture (color format `color`, rows of `stride` bytes, `rows` rows per plane) into tight NV12 of the
 // video's size, from the crop origin. I420 is interleaved; every other format is taken as semi-planar (NV12 and the
 // Qualcomm/MediaTek variants with aligned strides, which is what ByteBuffer decoders hand out).
 void to_nv12(const Decoder& d, const uint8_t* src, size_t size, std::vector<uint8_t>& out) {
     const int32_t w = d.width, h = d.height;
-    int32_t stride = d.codec_stride > 0 ? d.codec_stride : w, rows = d.codec_rows > 0 ? d.codec_rows : h;
+    int32_t stride = d.codec_stride > 0 ? d.codec_stride : ((w + 15) & ~15);
+    int32_t rows   = d.codec_rows > 0   ? d.codec_rows   : ((h + 15) & ~15);
     if (d.color == kColorQcom32m && d.codec_stride <= 0) stride = (w + 127) & ~127, rows = (h + 31) & ~31;
     out.resize(size_t(w) * h * 3 / 2);
     const size_t y0 = size_t(d.crop_top) * stride + d.crop_left;
@@ -254,20 +280,7 @@ void read_codec_format(Decoder& d) {
     int32_t l = 0, t = 0, r = 0, b = 0;
     if (AMediaFormat_getRect(f, "crop", &l, &t, &r, &b)) d.crop_left = l, d.crop_top = t;
 
-    // COLOR_FormatYUV420Flexible (0x7F420888) is requested in make_codec().
-    // MediaTek (c2.mtk.*, OMX.MTK.*) and Google software decoders (c2.android.*, OMX.google.*)
-    // output Planar I420 in ByteBuffer mode while leaving color-format as 0x7F420888.
-    // Qualcomm (c2.qti.*, OMX.qcom.*) and Exynos output Semi-Planar NV12.
-    if (d.color == kColorI420) {
-        d.is_planar = true;
-    } else if (d.color == kColorFlexible || d.color == 0) {
-        d.is_planar = (d.codec_name.find(".mtk.") != std::string::npos ||
-                       d.codec_name.find(".MTK.") != std::string::npos ||
-                       d.codec_name.find(".android.") != std::string::npos ||
-                       d.codec_name.find(".google.") != std::string::npos);
-    } else {
-        d.is_planar = false;
-    }
+    d.is_planar = is_planar_codec(d.color, d.codec_name);
 
     log("movie: codec output: color format %#x (planar %d), stride %d, slice height %d, crop at %d,%d (%s)", d.color,
         d.is_planar, d.codec_stride, d.codec_rows, d.crop_left, d.crop_top, AMediaFormat_toString(f));
@@ -341,10 +354,7 @@ AMediaCodec* make_codec(Decoder& d) {
     if (AMediaCodec_getName(c, &name) == AMEDIA_OK && name) {
         log("movie: VP9 decoder %s", name);
         d.codec_name = name;
-        d.is_planar = (d.codec_name.find(".mtk.") != std::string::npos ||
-                       d.codec_name.find(".MTK.") != std::string::npos ||
-                       d.codec_name.find(".android.") != std::string::npos ||
-                       d.codec_name.find(".google.") != std::string::npos);
+        d.is_planar = is_planar_codec(d.color, d.codec_name);
         AMediaCodec_releaseName(c, name);
     }
     return c;

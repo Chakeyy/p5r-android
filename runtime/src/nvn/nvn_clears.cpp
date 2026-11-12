@@ -47,7 +47,7 @@ uint64_t g_scissored = 0, g_masked = 0, g_mask_fallback = 0, g_scissor_lost = 0;
 bool clears_v2() {
     static const bool on = [] {
         const char* e = std::getenv("NX_CLEARS_V2");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     return on;
 }
@@ -329,6 +329,7 @@ void draw_clear(VkCommandBuffer cb, const Targets& t, const Cmd& c) {
     GpuImage* img = guest ? image_of(guest) : nullptr;
     if (!img || color != (img->aspect == VK_IMAGE_ASPECT_COLOR_BIT)) return;
     if (color && !(c.mask & 0xF)) return;  // no channel enabled
+
     VkClearAttachment a{};
     if (color) {
         a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, a.colorAttachment = c.n;

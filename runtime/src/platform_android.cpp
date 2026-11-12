@@ -18,6 +18,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <malloc.h>
 #include <unistd.h>
@@ -37,6 +38,9 @@
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
+#if defined(NX_CUSTOM_DRIVER)
+#include <adrenotools/driver.h>
+#endif
 
 #include <nx/game.h>
 #include <nx/runtime.h>
@@ -47,6 +51,10 @@
 #if NX_NCE
 #include "nce/nce.h"
 #endif
+
+namespace nx::nvn {
+void pipeline_cache_save();
+}
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -61,6 +69,7 @@ namespace nx::plat {
 namespace {
 android_app* g_app = nullptr;
 std::string g_root;
+std::string g_internal_dir;  // ANativeActivity::internalDataPath (the imported GPU driver lives under it)
 std::atomic<ANativeWindow*> g_window{nullptr};
 std::atomic<uint64_t> g_window_gen{0};  // bumped for every new window
 std::atomic<bool> g_visible{false};
@@ -97,6 +106,7 @@ struct ThreadStart {
 };
 
 static void* thread_entry(void* p) {
+    nx::plat::place_fast_cores();
     ThreadStart s = *static_cast<ThreadStart*>(p);
     delete static_cast<ThreadStart*>(p);
     s.fn(s.arg);
@@ -137,6 +147,76 @@ void yield() {
 }
 void set_thread_name(const char* name) { pthread_setname_np(pthread_self(), name); }
 int64_t current_thread_id() { return gettid(); }
+
+void pin_current_thread_to_big_cores(const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (num_cores < 8) return;  // Only apply on 8-core Big.LITTLE topologies
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    // On 8-core MediaTek/Qualcomm SoCs, cores 6 and 7 are the Cortex-A76/A78/X-cores
+    CPU_SET(6, &cpuset);
+    CPU_SET(7, &cpuset);
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s': errno %d", thread_name, rc);
+    }
+}
+
+void pin_current_thread_to_core(int core_id, const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (core_id < 0 || core_id >= num_cores) return;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Core %d: errno %d", thread_name, core_id, rc);
+    }
+}
+
+void pin_current_thread_to_little_cores(const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (num_cores < 8) return;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    // On 8-core MediaTek/Qualcomm SoCs, cores 0-5 are the Cortex-A55 LITTLE cores
+    for (int i = 0; i < 6; ++i) {
+        CPU_SET(i, &cpuset);
+    }
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Little Cores: errno %d", thread_name, rc);
+    }
+}
+
+void reset_current_thread_affinity(const char* thread_name) {
+    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
+    if (num_cores <= 0) return;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    for (int i = 0; i < num_cores; ++i) {
+        CPU_SET(i, &cpuset);
+    }
+
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to reset affinity for thread '%s': errno %d", thread_name, rc);
+    }
+}
+
+void set_thread_priority(int priority) {
+    int rc = setpriority(PRIO_PROCESS, 0, priority);
+    if (rc != 0) {
+        __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to set thread priority %d: errno %d", priority, errno);
+    }
+}
 
 // ---- sampling profiler (simpleperf is not always allowed on retail phones) ------------------------------------
 
@@ -264,6 +344,14 @@ void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, nx::game
 
 std::string data_root() { return g_root; }
 
+const char* get_pipeline_cache_path() {
+    static std::string path;
+    if (path.empty() && g_app && g_app->activity && g_app->activity->internalDataPath) {
+        path = std::string(g_app->activity->internalDataPath) + "/vk_pipeline_cache.bin";
+    }
+    return path.empty() ? nullptr : path.c_str();
+}
+
 // The device's locale (Settings > System > Languages) as "es-MX".
 std::string system_language() {
     if (!g_app || !g_app->config) return "";
@@ -314,30 +402,42 @@ void screen_size(uint32_t& w, uint32_t& h) {
     h = uint32_t(std::min(a, b));
 }
 
-// The render size: resolution=WxH if set, else the screen's size times the render scale (render_scale=0.5..1, or
-// the GPU's default), never taller than 1080 (the game's art is made for 720p/1080p; more only costs GPU time).
+static int parse_resolution_height(const std::string& r) {
+    if (r.find("360") != std::string::npos) return 360;
+    if (r.find("480") != std::string::npos) return 480;
+    if (r.find("540") != std::string::npos) return 540;
+    if (r.find("1080") != std::string::npos) return 1080;
+    if (r.find("720") != std::string::npos) return 720;
+    return 0;
+}
+
+// The render size: resolution=WxH or height (360, 480, 540, 720, 1080) if set, scaled to the display's aspect
+// ratio so fullscreen stretch fills the screen and aspect-fit keeps 16:9 without distortion.
 void window_size(uint32_t& w, uint32_t& h) {
     uint32_t sw = 0, sh = 0;
     screen_size(sw, sh);
+    if (!sw || !sh) { w = 1280; h = 720; return; }
+
     std::string r = setting("resolution");
     if (r.empty()) r = setting("NX_RES");
-    if (r.empty()) r = setting("RESOLUTION");
-    unsigned cw = 0, ch = 0;
-    if (!r.empty() && std::sscanf(r.c_str(), "%ux%u", &cw, &ch) == 2 && cw && ch) {
-        w = cw;
-        h = ch;
-        return;
-    }
-    uint32_t target_h = 0;
-    if (r == "360p" || r == "360") target_h = 360;
-    else if (r == "480p" || r == "480") target_h = 480;
-    else if (r == "720p" || r == "720") target_h = 720;
-    else if (r == "1080p" || r == "1080") target_h = 1080;
+    if (const char* e = getenv("NX_RES"); e && *e) r = e;
+    if (const char* e = getenv("resolution"); e && *e) r = e;
 
-    if (target_h && sh) {
+    int configured_height = parse_resolution_height(r);
+    if (configured_height) {
+        // 540p mode uses a 720p swapchain for crisp HUD while NX_LOW_3D=1 scales 3D targets to 405p.
+        uint32_t target_h = configured_height == 540 ? 720u : uint32_t(configured_height);
         float scale = float(target_h) / float(sh);
         w = uint32_t(float(sw) * scale + 0.5f) & ~1u;
         h = target_h & ~1u;
+        return;
+    }
+
+    unsigned cw = 0, ch = 0;
+    if (!r.empty() && std::sscanf(r.c_str(), "%ux%u", &cw, &ch) == 2 && cw && ch) {
+        float scale = float(ch) / float(sh);
+        w = uint32_t(float(sw) * scale + 0.5f) & ~1u;
+        h = ch & ~1u;
         return;
     }
     std::string rs = setting("render_scale");
@@ -391,9 +491,174 @@ float default_render_scale() {
 
 // ---- Vulkan ---------------------------------------------------------------------------------------------------
 
+#if defined(NX_CUSTOM_DRIVER)
+// A GPU driver the user imported (the launcher's "Import GPU driver", e.g. Turnip for Adreno or custom/PanVK for Mali),
+// opened with libadrenotools in place of the system driver, or directly via dlopen for standalone ICDs (Mali/PanVK).
+// <files>/gpu_driver/active.txt holds the driver's file name; without it, or with NX_SYSTEM_DRIVER=1 in config.txt,
+// or if the driver fails to open, the system libvulkan.so is used.
+static void* g_custom_gipa = nullptr;
+
+void* open_custom_vulkan() {
+    if (const char* e = getenv("NX_SYSTEM_DRIVER"); e && e[0] == '1') {
+        nx::log("gpu driver: NX_SYSTEM_DRIVER=1 set, using system driver");
+        return nullptr;
+    }
+
+    std::string dir;
+    if (const char* env_d = getenv("NX_GPU_DRIVER_DIR"); env_d && env_d[0]) {
+        dir = env_d;
+    } else if (!g_internal_dir.empty()) {
+        dir = g_internal_dir + "/gpu_driver";
+    } else if (g_app && g_app->activity && g_app->activity->internalDataPath) {
+        dir = std::string(g_app->activity->internalDataPath) + "/gpu_driver";
+    } else if (const char* env_int = getenv("NX_INTERNAL_DIR"); env_int && env_int[0]) {
+        dir = std::string(env_int) + "/gpu_driver";
+    }
+    if (dir.empty()) {
+        nx::log("gpu driver: internal directory unknown, using system driver");
+        return nullptr;
+    }
+    if (dir.back() != '/') dir += '/';
+
+    std::string name;
+    if (const char* env_n = getenv("NX_GPU_DRIVER_NAME"); env_n && env_n[0]) {
+        name = env_n;
+    } else {
+        std::ifstream f(dir + "active.txt");
+        std::getline(f, name);
+    }
+    while (!name.empty() && (name.back() == '\r' || name.back() == '\n' || name.back() == ' ')) name.pop_back();
+    if (name.empty() || name == "system" || name == "default") {
+        nx::log("gpu driver: active driver empty/system, using system driver");
+        return nullptr;
+    }
+
+    std::string full_path = dir + name;
+    if (access(full_path.c_str(), R_OK) != 0) {
+        nx::log("gpu driver: active driver not readable: %s (errno %d)", full_path.c_str(), errno);
+        return nullptr;
+    }
+
+    // Determine whether this driver is a Mali / PanVK / Mesa ICD
+    bool is_mali_driver = false;
+    std::string lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+    if (lower_name.find("pan") != std::string::npos ||
+        lower_name.find("mali") != std::string::npos ||
+        lower_name.find("bifrost") != std::string::npos ||
+        lower_name.find("valhall") != std::string::npos ||
+        lower_name.find("midgard") != std::string::npos) {
+        is_mali_driver = true;
+    }
+
+    {
+        std::ifstream meta_file(dir + "meta.json");
+        if (meta_file.is_open()) {
+            std::string meta_content((std::istreambuf_iterator<char>(meta_file)),
+                                      std::istreambuf_iterator<char>());
+            std::string lower_meta = meta_content;
+            std::transform(lower_meta.begin(), lower_meta.end(), lower_meta.begin(), ::tolower);
+            if (lower_meta.find("panvk") != std::string::npos ||
+                lower_meta.find("panfrost") != std::string::npos ||
+                lower_meta.find("mali") != std::string::npos) {
+                is_mali_driver = true;
+            }
+        }
+    }
+
+    void* h = nullptr;
+    void* gipa = nullptr;
+
+    if (is_mali_driver) {
+        nx::log("gpu driver: opening Mali/PanVK ICD directly: %s", full_path.c_str());
+        h = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            gipa = dlsym(h, "vk_icdGetInstanceProcAddr");
+            if (!gipa) gipa = dlsym(h, "vkGetInstanceProcAddr");
+            if (gipa) {
+                nx::log("gpu driver: direct Mali ICD opened successfully, gipa=%p", gipa);
+                g_custom_gipa = gipa;
+                return h;
+            } else {
+                nx::log("gpu driver: direct dlopen succeeded but neither vk_icdGetInstanceProcAddr nor vkGetInstanceProcAddr found");
+                dlclose(h);
+                h = nullptr;
+            }
+        } else {
+            nx::log("gpu driver: direct dlopen of %s failed: %s", full_path.c_str(), dlerror());
+        }
+    }
+
+    // Try adrenotools for Adreno/Turnip or as fallback
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&open_custom_vulkan), &info) && info.dli_fname) {
+        std::string libdir = info.dli_fname;
+        libdir = libdir.substr(0, libdir.rfind('/') + 1);
+        nx::log("gpu driver: trying adrenotools for %s (hooks in %s)", full_path.c_str(), libdir.c_str());
+        h = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, libdir.c_str(),
+                                       dir.c_str(), name.c_str(), nullptr, nullptr);
+        if (h) {
+            gipa = dlsym(h, "vkGetInstanceProcAddr");
+            if (!gipa) gipa = dlsym(h, "vk_icdGetInstanceProcAddr");
+            if (gipa) {
+                nx::log("gpu driver: adrenotools custom driver opened successfully, gipa=%p", gipa);
+                g_custom_gipa = gipa;
+                return h;
+            } else {
+                nx::log("gpu driver: adrenotools opened library but no GIPA found");
+                dlclose(h);
+                h = nullptr;
+            }
+        } else {
+            nx::log("gpu driver: adrenotools returned null");
+        }
+    }
+
+    // Generic direct dlopen fallback if neither was successful
+    if (!h) {
+        nx::log("gpu driver: trying generic direct dlopen fallback: %s", full_path.c_str());
+        h = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            gipa = dlsym(h, "vkGetInstanceProcAddr");
+            if (!gipa) gipa = dlsym(h, "vk_icdGetInstanceProcAddr");
+            if (gipa) {
+                nx::log("gpu driver: generic direct dlopen succeeded, gipa=%p", gipa);
+                g_custom_gipa = gipa;
+                return h;
+            } else {
+                nx::log("gpu driver: generic direct dlopen has no GIPA symbol");
+                dlclose(h);
+                h = nullptr;
+            }
+        } else {
+            nx::log("gpu driver: generic direct dlopen of %s failed: %s", full_path.c_str(), dlerror());
+        }
+    }
+
+    nx::log("gpu driver: %s", h ? "custom driver opened" : "failed, the system driver is used");
+    return h;
+}
+#endif
+
 void* vulkan_get_instance_proc_addr() {
-    void* lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-    return lib ? dlsym(lib, "vkGetInstanceProcAddr") : nullptr;
+    static void* gipa = []() -> void* {  // once: the custom driver is opened only once
+#if defined(NX_CUSTOM_DRIVER)
+        void* custom_lib = open_custom_vulkan();
+        if (custom_lib && g_custom_gipa) {
+            return g_custom_gipa;
+        }
+#endif
+        nx::log("gpu driver: loading system libvulkan.so");
+        void* lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+        if (!lib) {
+            nx::log("gpu driver: failed to open system libvulkan.so: %s", dlerror());
+            return nullptr;
+        }
+        void* p = dlsym(lib, "vkGetInstanceProcAddr");
+        if (!p) p = dlsym(lib, "vk_icdGetInstanceProcAddr");
+        return p;
+    }();
+    return gipa;
 }
 
 const char* vulkan_surface_extension() { return VK_KHR_ANDROID_SURFACE_EXTENSION_NAME; }
@@ -466,6 +731,8 @@ void crash(int sig, siginfo_t* info, void* uc) {
 }
 
 void game_thread(void*) {
+    nx::plat::set_thread_priority(-4);
+    nx::plat::perf_hint_thread();
     try {
         nx::boot();
     } catch (const nx::LongJmp& j) {
@@ -502,16 +769,29 @@ void request_frame_rate(ANativeWindow* w) {
 void on_cmd(android_app* app, int32_t cmd) {
     using namespace nx::plat;
     switch (cmd) {
-        case APP_CMD_INIT_WINDOW:
+        case APP_CMD_INIT_WINDOW: {
             g_window = app->window;
             g_window_gen++;
             g_visible = true;
+            uint32_t rw = 0, rh = 0;
+            window_size(rw, rh);
+            if (rw && rh && app->window) {
+                int32_t sw = ANativeWindow_getWidth(app->window);
+                int32_t sh = ANativeWindow_getHeight(app->window);
+                bool portrait = sw > 0 && sh > 0 && sw < sh;
+                int32_t bw = int32_t(portrait ? std::min(rw, rh) : std::max(rw, rh));
+                int32_t bh = int32_t(portrait ? std::max(rw, rh) : std::min(rw, rh));
+                ANativeWindow_setBuffersGeometry(app->window, bw, bh, 0);
+                nx::log("android: ANativeWindow buffer geometry set to %dx%d (screen %dx%d)", bw, bh, sw, sh);
+            }
             request_frame_rate(app->window);
             request_immersive();
             break;
+        }
         case APP_CMD_TERM_WINDOW:  // the window goes away once this returns
             g_window = nullptr;
             g_visible = false;
+            nx::nvn::pipeline_cache_save();
             break;
         case APP_CMD_GAINED_FOCUS:
             g_visible = g_window != nullptr;
@@ -521,6 +801,11 @@ void on_cmd(android_app* app, int32_t cmd) {
             break;
         case APP_CMD_PAUSE:  // home, app switcher, screen off: the game holds (no window), so does its sound
             audio_pause(true);
+            nx::nvn::pipeline_cache_save();
+            break;
+        case APP_CMD_STOP:
+        case APP_CMD_DESTROY:
+            nx::nvn::pipeline_cache_save();
             break;
         case APP_CMD_RESUME:
             audio_pause(false);
@@ -589,6 +874,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_io_github_belmantegu_wonderrecomp_GameAc
 
 extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* saved, size_t size) {
     g_activity = activity;
+    if (activity->internalDataPath) nx::plat::g_internal_dir = activity->internalDataPath;
     if (g_ui_pipe[0] < 0 && pipe2(g_ui_pipe, O_NONBLOCK | O_CLOEXEC) == 0)
         ALooper_addFd(ALooper_forThread(), g_ui_pipe[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, on_ui_request, nullptr);
     glue_ANativeActivity_onCreate(activity, saved, size);
@@ -634,6 +920,9 @@ static bool has_data(const std::string& root) { return access((root + kDataProbe
 extern "C" void android_main(android_app* app) {
     using namespace nx::plat;
     g_app = app;
+    if (app->activity && app->activity->internalDataPath && g_internal_dir.empty()) {
+        g_internal_dir = app->activity->internalDataPath;
+    }
     // Game data: Internal storage/<game title> (put there by the player, needs all-files access) or the app's own
     // external files folder (adb push).
     // The folder picked on the home screen (games/<game>/java Home.java writes <files>/data_root.txt) comes first.
@@ -660,32 +949,58 @@ extern "C" void android_main(android_app* app) {
     g_root = !chosen.empty() && has_data(chosen) ? chosen : has_data(own) ? own : shared;
     // config.txt's NX_* lines become environment variables (the NVN layer reads its switches with getenv), without
     // overriding a variable already set. Android defaults: handheld (720p, the lighter GPU load).
-    {
-        std::ifstream f(g_root + "/config.txt");
-        std::string line;
-        while (std::getline(f, line)) {
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-            auto eq = line.find('=');
-            if (line.rfind("NX_", 0) == 0 && eq != std::string::npos) {
-                const std::string key = line.substr(0, eq);
-                const std::string value = line.substr(eq + 1);
-                // Launcher and NativeActivity share a process: update stretch even if a previous launch set it to "1".
-                setenv(key.c_str(), value.c_str(), key == "NX_STRETCH" ? 1 : 0);
+        {
+            unsetenv("NX_STRETCH");
+            std::ifstream f(g_root + "/config.txt");
+            std::string line;
+            while (std::getline(f, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                auto eq = line.find('=');
+                if (line.rfind("NX_", 0) == 0 && eq != std::string::npos) {
+                    const std::string key = line.substr(0, eq);
+                    const std::string value = line.substr(eq + 1);
+                    // Launcher and NativeActivity share a process: update stretch even if a previous launch set it to "1".
+                    setenv(key.c_str(), value.c_str(), key == "NX_STRETCH" ? 1 : 0);
+                }
+                if (eq != std::string::npos && line.substr(0, eq) == "resolution")
+                    setenv("NX_RES", line.substr(eq + 1).c_str(), 0);
             }
+            // If resolution is 1080, NX_HANDHELD=0; if 720, NX_HANDHELD=1; if 540, NX_HANDHELD=1 and NX_LOW_3D=1 (true 405p 3D)
+            std::string r = setting("resolution");
+            if (r.empty()) r = setting("NX_RES");
+            const char* low_env = getenv("NX_LOW_3D");
+            int h = parse_resolution_height(r);
+            bool low_3d = (h == 540) || (low_env && low_env[0] == '1');
+
+            if (h == 1080 && !low_3d) {
+                unsetenv("NX_HANDHELD");
+                unsetenv("NX_LOW_3D");
+            } else if (low_3d) {
+                setenv("NX_HANDHELD", "1", 1);
+                setenv("NX_LOW_3D", "1", 1);
+            } else {
+                setenv("NX_HANDHELD", "1", 1);
+                unsetenv("NX_LOW_3D");
+            }
+            nx::log("display: resolution parsed '%s' -> height %d, handheld=%s, low_3d=%s",
+                    r.c_str(), h, getenv("NX_HANDHELD") ? getenv("NX_HANDHELD") : "0",
+                    getenv("NX_LOW_3D") ? getenv("NX_LOW_3D") : "0");
         }
-        // NX_HANDHELD=0 in config.txt (the launcher's TV mode): docked, 1080p. svc_am.cpp tests only whether the variable
-        // exists, so "0" must remove it.
-        if (const char* h = getenv("NX_HANDHELD"); h && h[0] == '0')
-            unsetenv("NX_HANDHELD");
-        else
-            setenv("NX_HANDHELD", "1", 0);
-    }
     // The heap (scudo) zero-fills every allocation and gives freed pages back at once by default: in the replay, a
     // memset under each allocation and madvise churn (docs/nvn/android-perf/PLAN.md, phase 2). NX_MALLOC_TUNE=0: as
     // the system set it.
     if (const char* e = getenv("NX_MALLOC_TUNE"); !(e && e[0] == '0')) {
         int zero = mallopt(M_BIONIC_ZERO_INIT, 0), decay = mallopt(M_DECAY_TIME, 1);
-        nx::log("heap: zero-fill off (%d), page release delayed (%d)", zero, decay);
+#ifndef M_CACHE_COUNT_MAX
+#define M_CACHE_COUNT_MAX (-200)
+#endif
+#ifndef M_CACHE_SIZE_MAX
+#define M_CACHE_SIZE_MAX (-201)
+#endif
+        int cache_cnt = mallopt(M_CACHE_COUNT_MAX, 64);
+        int cache_sz = mallopt(M_CACHE_SIZE_MAX, 4 << 20);
+        nx::log("heap: zero-fill off (%d), page release delayed (%d), scudo cache (%d, %d)",
+                zero, decay, cache_cnt, cache_sz);
     }
     start_memory_guard();
     gpu_turbo();
@@ -701,10 +1016,11 @@ extern "C" void android_main(android_app* app) {
     struct sigaction sa{};
     sa.sa_sigaction = crash;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, &g_previous[s]);
+    for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) sigaction(s, &sa, &g_previous[s]);
 
     nx::log("%s (Switch recomp) on Android, data at %s (own folder %s: %s)", nx::game::kInfo.title, g_root.c_str(),
             own.c_str(), has_data(own) ? "has the data" : kDataProbe);
+    nx::plat::place_fast_cores();
     static bool started = false;
     for (;;) {
         int events;

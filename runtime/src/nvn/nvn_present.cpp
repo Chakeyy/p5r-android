@@ -243,7 +243,7 @@ bool build_pipeline(VkRenderPass pass, const uint32_t* code, size_t bytes, VkPip
     gp.pVertexInputState = &vin, gp.pInputAssemblyState = &ia, gp.pViewportState = &vp;
     gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cb, gp.pDynamicState = &ds;
     gp.layout = g.layout, gp.renderPass = pass;
-    VkResult r = p_vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &gp, nullptr, out);
+    VkResult r = p_vkCreateGraphicsPipelines(d, pipeline_cache(), 1, &gp, nullptr, out);
     p_vkDestroyShaderModule(d, vs, nullptr);
     p_vkDestroyShaderModule(d, fs, nullptr);
     return r == VK_SUCCESS;

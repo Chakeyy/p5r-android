@@ -2,6 +2,7 @@
 // resources, draws). Everything here runs under the GPU lock taken by gpu_submit / gpu_present.
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@ struct GpuImage {
     VkComponentMapping swizzle{};  // for sampling (attachment views stay identity)
     bool storage = false;          // created with VK_IMAGE_USAGE_STORAGE_BIT (compute shaders write it)
     bool mutable_format = true;
+    bool cube_compat = false;  // a square 2D array of 6*n layers made cube-compatible: a shader may sample it as a cube
     uint64_t rendered_at = 0;      // the pass-end serial of the last pass that rendered into it (nvn_draw.cpp, G4)    // views may use another format (MUTABLE_FORMAT; nvn_image.cpp, ubwc_flags)
     // An R8 texture always read as (1, 1, 1, R) (a glyph cache): stored as RGBA8 (255, 255, 255, R) and sampled
     // without swizzle. MoltenVK returned alpha 0 for that view swizzle on a 2D-array view, so all text was invisible.
@@ -37,7 +39,14 @@ struct GpuImage {
     uint32_t nvn_format = 0;  // the texture's NVN format
     bool uw = false;          // NX_ULTRAWIDE: a widened render target (nvn_ultrawide.cpp)
     bool hud = false;         // NX_HUD_1080: a 1280x720 render target made at 1920x1080 or 1600x900 (hud_1080_texture)
+    bool shadow = false;      // NX_MALI_LOW_SHADOWS: 0.5x downscaled shadow depth map
+    bool low_3d = false;      // NX_LOW_3D: 0.75x downscaled 3D render target (720x405)
 };
+
+// NX_LOW_3D (nvn_image.cpp): 3D scene render targets (960x540) are created at 720x405 (0.75x)
+// to dramatically cut GPU fillrate on low-end Mali, while HUD/menus stay at 720p.
+bool low_3d_on();
+bool low_3d_texture(const Texture& t);
 
 // NX_HUD_1080 (nvn_image.cpp): render targets of the handheld screen's size, 1280x720, are made at 3/2 of it,
 // 1920x1080, so the 2D layers drawn into them (a game's HUD, menus and the window) reach the screen at the size their
@@ -58,6 +67,10 @@ bool vk_list_restart();  // VK_EXT_primitive_topology_list_restart enabled (nvn_
 bool vk_dynamic_rendering();  // core 1.3 dynamic rendering; without it, render pass objects (nvn_renderpass.cpp)
 // The core features the device was created with (all the GPU has): depthClamp, depthBiasClamp, depthBounds, ...
 const VkPhysicalDeviceFeatures& vk_features();
+bool is_xclipse();
+bool is_mali();
+bool is_adreno();
+bool is_adreno_8xx();
 bool gpu_require_subgroup32();  // compute pipelines pin the subgroup size to 32 (nvn_pipeline.cpp)
 bool gpu_is_integrated();  // the device in use is an integrated GPU (set when the device is made)
 VkPhysicalDevice vk_physical();
@@ -213,10 +226,15 @@ struct Targets {
 // Field by field: a memcmp also compared the padding after color_count, which a copy need not keep.
 inline bool targets_same(const Targets& a, const Targets& b) {
     if (a.color_count != b.color_count || a.depth != b.depth) return false;
-    for (uint32_t k = 0; k < 9; k++) {
-        if (k < 8 && a.colors[k] != b.colors[k]) return false;
+    for (uint32_t k = 0; k < a.color_count; k++) {
+        if (a.colors[k] != b.colors[k]) return false;
         if (a.views.level[k] != b.views.level[k] || a.views.layer[k] != b.views.layer[k] ||
             a.views.format[k] != b.views.format[k])
+            return false;
+    }
+    if (a.depth) {
+        if (a.views.level[8] != b.views.level[8] || a.views.layer[8] != b.views.layer[8] ||
+            a.views.format[8] != b.views.format[8])
             return false;
     }
     return true;
@@ -282,16 +300,31 @@ void occlusion_reset(VkCommandBuffer cb, const Cmd& c, const Targets& t);
 void occlusion_report(VkCommandBuffer cb, const Cmd& c, const Targets& t);
 void occlusion_conditional(VkCommandBuffer cb, const Cmd& c, const Targets& t);
 void occlusion_render_enable();  // SetRenderEnable: the conditional draws end
+bool occlusion_cpu_culling();  // CPU temporal occlusion culling is on (NX_OCCL_CPU=1): draws it hides still touch their textures
+bool occlusion_object_skipped();  // inside ResetCounter(1)..ReportCounter(1) while occlusion queries are off
 // Around a draw call inside the pass: its query when it is a query pass draw (-1: none).
-int32_t occlusion_query_begin(VkCommandBuffer cb);
-void occlusion_query_end(VkCommandBuffer cb, int32_t q);
+extern bool g_occl_object;
+int32_t occlusion_query_begin_slow(VkCommandBuffer cb);
+void occlusion_query_end_slow(VkCommandBuffer cb, int32_t q);
+
+inline int32_t occlusion_query_begin(VkCommandBuffer cb) {
+    if (!g_occl_object) return -1;
+    return occlusion_query_begin_slow(cb);
+}
+
+inline void occlusion_query_end(VkCommandBuffer cb, int32_t q) {
+    if (q >= 0) occlusion_query_end_slow(cb, q);
+}
 // A conditional draw as an indirect draw counted by its object's query; false: not conditional, draw it as it is.
 bool occlusion_draw(VkCommandBuffer cb, bool indexed, uint32_t count, uint32_t instances, uint32_t first,
                     int32_t vertex_offset, uint32_t first_instance);
 void occlusion_log();
 
 // nvn_debug.cpp: NX_ZERO_DRAWS, shader pairs whose draws produce no pixel.
-bool zero_draws_on();
+inline bool zero_draws_on() {
+    static const bool on = std::getenv("NX_ZERO_DRAWS") != nullptr;
+    return on;
+}
 void zero_draws_begin_submit(VkCommandBuffer cb);
 bool zero_draws_begin(VkCommandBuffer cb, const std::string& label);
 void zero_draws_end(VkCommandBuffer cb);
@@ -303,7 +336,10 @@ extern uint32_t g_snap_layer, g_snap_level;  // the layer and level debug_snapsh
 void debug_snapshots_write();  // nvn_pipeline.cpp: before an image is freed
 
 // nvn_debug.cpp: GPU time per render pass (NX_GPU_PROFILE=1).
-bool gpu_profile_on();  // NX_GPU_PROFILE=1: per-pass labels, every submit waited for (nvn_debug.cpp)
+inline bool gpu_profile_on() {
+    static const bool on = std::getenv("NX_GPU_PROFILE") && std::atoi(std::getenv("NX_GPU_PROFILE")) == 1;
+    return on;
+}
 // NX_GPU_PROFILE=3: the GPU's busy time per frame without waits, from per-part timestamps (nvn_gpu_busy.cpp).
 // The janitor thread (nvn_janitor.cpp, NX_JANITOR): pool resets of retired slots, off the replay thread.
 bool janitor_on();
@@ -336,6 +372,7 @@ void gpu_profile_log(uint64_t frames);
 
 namespace replay {
 void dedup_reset();  // nvn_dedup.cpp
+void written_reset();            // nvn_written.cpp
 bool written_separate();         // nvn_written.cpp (nvn_draw_state.h)
 uint64_t written_bind_count();   // nvn_written.cpp: written_bind calls so far (a dispatch bound storage it writes)
 void trace_nan_write_back(const uint8_t* from, const uint8_t* to, uint64_t size);  // nvn_draw_trace.cpp

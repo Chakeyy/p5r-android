@@ -101,7 +101,10 @@ aaudio_data_callback_result_t audio_cb(AAudioStream*, void*, void* out, int32_t 
     {
         std::lock_guard lk(g_audio);
         const uint64_t n = std::min<uint64_t>(uint64_t(frames), g_written - g_read);
-        for (uint64_t k = 0; k < n; k++) dst[k] = g_ring[(g_read + k) % kRingFrames];
+        const uint64_t rpos = g_read % kRingFrames;
+        const uint64_t first = std::min(n, kRingFrames - rpos);
+        std::memcpy(dst, &g_ring[rpos], first * 4);
+        if (n > first) std::memcpy(dst + first, &g_ring[0], (n - first) * 4);
         g_read += n;
         g_device += uint64_t(frames);
         missing = size_t(frames) - size_t(n);
@@ -170,7 +173,10 @@ bool audio_submit(const void* data, size_t bytes, void* ctx) {
         start = g_written, read = g_read, device = g_device;
         const uint64_t n = std::min<uint64_t>(bytes / 4, kRingFrames - (g_written - g_read));  // never more than a full ring
         const auto* src = static_cast<const uint8_t*>(data);
-        for (uint64_t k = 0; k < n; k++) std::memcpy(&g_ring[(g_written + k) % kRingFrames], src + 4 * k, 4);
+        const uint64_t wpos = g_written % kRingFrames;
+        const uint64_t first = std::min(n, kRingFrames - wpos);
+        std::memcpy(&g_ring[wpos], src, first * 4);
+        if (n > first) std::memcpy(&g_ring[0], src + first * 4, (n - first) * 4);
         g_written += n;
         g_pending.push_back({g_written, ctx});
     }

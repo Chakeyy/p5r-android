@@ -28,6 +28,7 @@ namespace kstate {  // kernel_state.h
 
 std::recursive_mutex g_k;
 std::vector<KThread*> g_sync_waiters;
+std::atomic<uint32_t> g_sync_waiter_count{0};
 std::unordered_map<uint32_t, std::shared_ptr<KObject>> g_handles;
 uint32_t g_next_handle = 0x10000;
 std::atomic<uint64_t> g_next_thread_id{0x50};
@@ -69,6 +70,7 @@ void handle_close(uint32_t h) {
 // Mutex, condition variable and address waiters are woken one by one (wake()): one global condition variable woke
 // every waiting thread of the process on each signal (the engine's job system broadcasts all the time).
 void notify_all() {
+    if (g_sync_waiter_count.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard lk(g_k);
     for (KThread* t : g_sync_waiters) t->cv.notify_one();
 }
@@ -331,12 +333,25 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
 }
 
 static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count, int64_t timeout) {
+    if (count < 0) count = 0;
     std::unique_lock lk(g_k);
-    std::vector<std::shared_ptr<KObject>> objs;
+    constexpr int kStackObjs = 8;
+    std::shared_ptr<KObject> stack_objs[kStackObjs];
+    std::vector<std::shared_ptr<KObject>> heap_objs;
+    std::shared_ptr<KObject>* objs = stack_objs;
+    if (count > kStackObjs) {
+        heap_objs.resize(count);
+        objs = heap_objs.data();
+    }
     for (int i = 0; i < count; i++) {
-        auto o = handle_get(ld<uint32_t>(handles + 4 * i));
-        if (!o) return 0xE401;  // invalid handle
-        objs.push_back(o);
+        uint32_t h = ld<uint32_t>(handles + 4 * i);
+        if (h == kPseudoCurrentThread && t_self) {
+            objs[i] = t_self->self.lock();
+        } else {
+            auto it = g_handles.find(h);
+            objs[i] = (it == g_handles.end()) ? nullptr : it->second;
+        }
+        if (!objs[i]) return 0xE401;  // invalid handle
     }
     auto ready = [&]() -> int {
         for (int i = 0; i < count; i++)
@@ -350,9 +365,13 @@ static uint32_t svc_wait_synchronization(CPU& c, uint64_t handles, int32_t count
     // between its own check and this svc was lost (P5R's video decoder thread never saw its exit event; the game
     // waited for that thread for ever).
     g_sync_waiters.push_back(self);
+    g_sync_waiter_count.fetch_add(1, std::memory_order_release);
     struct Leave {
         KThread* t;
-        ~Leave() { remove(g_sync_waiters, t); }
+        ~Leave() {
+            remove(g_sync_waiters, t);
+            g_sync_waiter_count.fetch_sub(1, std::memory_order_release);
+        }
     } leave{self};
     for (;;) {
         if (self->cancel) {
@@ -382,6 +401,29 @@ static void thread_main(void* p) {
     char name[16];
     std::snprintf(name, sizeof name, "g%llx", (unsigned long long)t->id);
     plat::set_thread_name(name);
+
+    // On asymmetric big.LITTLE / DynamIQ mobile SoCs (e.g. 2 Big + 6 Little CPU cores),
+    // guest background worker threads (core >= 2, prio >= 44) should run at nice 0 (standard foreground priority).
+    // Over-elevating worker threads can cause them to contend with the Main thread (nice -4)
+    // and Vulkan Replay thread (nice -8) for Big cores, leading to excessive context switching.
+    // At nice 0, Linux EAS schedules background tasks across energy-efficient Little cores
+    // while keeping Big cores available for the Replay and Main render threads.
+    // NOTE: Background worker threads must NOT register with plat::perf_hint_thread() (ADPF),
+    // as ADPF has a maximum capacity of 8 thread IDs. Background workers saturated all 8 slots,
+    // starving the frame-critical Vulkan Replay and Present threads.
+    if (t->core >= 2 || t->prio >= 44) {
+        plat::set_thread_priority(0);
+        static const bool worker_little = [] {
+            const char* e = std::getenv("NX_WORKER_LITTLE");
+            return !(e && e[0] == '0');  // Default true: isolate workers to Little cores 0-5
+        }();
+        if (worker_little) {
+            plat::pin_current_thread_to_little_cores(name);
+        } else {
+            plat::reset_current_thread_affinity(name);
+        }
+    }
+
     call(t->ctx, t->entry);
     // Returning from the entry point is like svcExitThread.
     std::lock_guard lk(g_k);
@@ -475,9 +517,47 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
             c.x[1] = 0;
             break;
         }
-        case 0x07:
-            log("svcExitProcess");
+        case 0x07: {
+            // Keep the final guest context: startup exits can be an intentional game decision or an SDK
+            // failure path. The symbolic PCs and nearby instructions let us distinguish them from one log.
+            const uint32_t insn_m8 = ld<uint32_t>(pc - 8);
+            const uint32_t insn_m4 = ld<uint32_t>(pc - 4);
+            const uint32_t insn_0 = ld<uint32_t>(pc);
+            const uint32_t insn_p4 = ld<uint32_t>(pc + 4);
+            log("svcExitProcess: pc=%s lr=%s sp=%llx x0=%llx x1=%llx x2=%llx x3=%llx x4=%llx x5=%llx x6=%llx x7=%llx",
+                describe(pc).c_str(), describe(c.x[30]).c_str(), (unsigned long long)c.x[31],
+                (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2],
+                (unsigned long long)c.x[3], (unsigned long long)c.x[4], (unsigned long long)c.x[5],
+                (unsigned long long)c.x[6], (unsigned long long)c.x[7]);
+            log("svcExitProcess: x19=%llx x20=%llx x21=%llx x22=%llx x23=%llx x29=%llx insn[-8,-4,0,+4]=%08x,%08x,%08x,%08x",
+                (unsigned long long)c.x[19], (unsigned long long)c.x[20], (unsigned long long)c.x[21],
+                (unsigned long long)c.x[22], (unsigned long long)c.x[23], (unsigned long long)c.x[29],
+                insn_m8, insn_m4, insn_0, insn_p4);
+            // The LR only identifies ExitProcessImpl's return site, not who triggered shutdown.
+            // Dump a small stack window and symbol-like candidates to identify the preceding caller.
+            for (int i = 0; i < 12; ++i) {
+                const uint64_t a = c.x[31] + uint64_t(i) * 8;
+                const uint64_t v = ld<uint64_t>(a);
+                log("svcExitProcess: stack[%02d] @%llx = %llx (%s)", i,
+                    (unsigned long long)a, (unsigned long long)v, describe(v).c_str());
+            }
+            uint64_t fp = c.x[29];
+            for (int i = 0; i < 8 && fp >= c.x[31] && fp < c.x[31] + 0x100000; ++i) {
+                const uint64_t prev = ld<uint64_t>(fp);
+                const uint64_t ret = ld<uint64_t>(fp + 8);
+                log("svcExitProcess: frame[%02d] fp=%llx prev=%llx ret=%llx (%s)", i,
+                    (unsigned long long)fp, (unsigned long long)prev, (unsigned long long)ret, describe(ret).c_str());
+                if (describe(ret).rfind("main+", 0) == 0) {
+                    for (int j = -12; j <= 3; ++j) {
+                        const uint64_t at = ret + int64_t(j) * 4;
+                        log("svcExitProcess: caller_insn %s %08x", describe(at).c_str(), ld<uint32_t>(at));
+                    }
+                }
+                if (prev <= fp || prev - fp > 0x100000) break;
+                fp = prev;
+            }
             plat::exit_process(0);
+        }
         case 0x08: {  // CreateThread(entry x1, arg x2, stack_top x3, prio w4, core w5) -> handle
             auto t = new_thread(c.x[1], c.x[2], c.x[3], int(c.x[4]), int32_t(c.x[5]));
             c.x[1] = t->handle;
@@ -519,10 +599,13 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
             KThread* t = t_self;
             uint64_t now = plat::monotonic_ns();
             if (now - t->last_yield > 2'000'000) t->yields = 0;
-            if (!spin_naps() || ++t->yields <= 32)
-                plat::yield();
-            else
+            ++t->yields;
+            if (spin_naps() && t->yields > 32)
                 plat::sleep_ns(500'000);
+            else if (t->yields > 64)
+                plat::sleep_ns(200'000);
+            else
+                plat::yield();
             t->last_yield = plat::monotonic_ns();
             return;
         }

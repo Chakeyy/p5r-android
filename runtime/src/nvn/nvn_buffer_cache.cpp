@@ -34,9 +34,9 @@ namespace {
 constexpr uint64_t kBlock = 16ull << 20;  // bytes per memory block
 constexpr uint64_t kAlign = 256;          // every copy: the largest buffer offset alignment Vulkan allows
 constexpr uint64_t kMaxCopy = 4ull << 20; // larger ranges stay in the ring (one copy per submit)
-constexpr uint64_t kStaleSubmits = 600;   // a copy no submit bound for this long is freed (~200 frames)
+constexpr uint64_t kStaleSubmits = 3600;  // keep resident across camera turns (~1200 frames)
 constexpr uint32_t kStableSeen = 2;       // the same bytes this many times in a row before they get a copy here
-constexpr uint64_t kSeenGap = 6;          // "in a row": at most this many submits apart (P5R: 3 submits a frame)
+constexpr uint64_t kSeenGap = 24;         // tolerate temporary frustum-cull intervals (~8 frames)
 constexpr uint32_t kClasses = 15;         // copy sizes 256 B << class, up to 4 MB
 
 struct Block {
@@ -56,6 +56,8 @@ std::vector<Slot> g_free[kClasses];  // free slots per size class
 struct Seen {
     uint64_t size = 0, hash = 0;
     uint32_t count = 0;
+    uint32_t unstable_streak = 0;
+    uint64_t skip_until = 0;
     uint64_t submit = 0;  // g_submits when last seen
 };
 std::unordered_map<const uint8_t*, Seen> g_seen;
@@ -67,6 +69,7 @@ struct Entry {
     uint32_t size_class = 0;  // the allocation: one slot of that class
     uint64_t serial = 0;             // the last submit that bound it (frees wait for it to retire)
     uint64_t seen = 0;               // g_submits then (copies unbound for kStaleSubmits are freed)
+    uint64_t last_verified_submit = 0;  // the last submit that hashed guest memory
 };
 std::unordered_map<const uint8_t*, Entry> g_entries;
 
@@ -87,8 +90,8 @@ struct {
 
 bool on() {
     static const bool v = [] {
-        const char* e = std::getenv("NX_BUFFER_CACHE");  // off until measured on the tablet
-        return e && e[0] == '1';
+        const char* e = std::getenv("NX_BUFFER_CACHE");
+        return !e || e[0] != '0';
     }();
     return v;
 }
@@ -185,21 +188,43 @@ void cache_begin_submit() {
     if (++g_submits % 64 == 0) {
         evict_stale();
         for (auto it = g_seen.begin(); it != g_seen.end();)  // candidates not seen lately
-            it = it->second.submit + kStaleSubmits < g_submits ? g_seen.erase(it) : std::next(it);
+            it = it->second.submit + std::max<uint64_t>(kSeenGap * 2, 64) < g_submits ? g_seen.erase(it) : std::next(it);
     }
 }
 
 bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
     if (!on() || !p || !size || padded > kMaxCopy || align > kAlign) return false;
-    const uint64_t t0 = plat::monotonic_ns();
-    uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
-    for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
-    g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
-    const uint64_t serial = frame_recording_serial();
+    // Small per-draw uniform/storage blocks (< 4 KB) come from P5R's dynamic ring buffer:
+    // intra-submit repeats are already handled in O(1) by dedup_upload (g_front), while
+    // probing g_entries + g_seen across submits caused 1.46M "not stable" map lookups/600f.
+    if (g_upload_kind == kUploadBlock && size < 4096) return false;
+
+    static const bool time_hash = std::getenv("NX_BUFFER_CACHE_STATS") != nullptr;
+
+    // Check if this buffer is already cached
     auto it = g_entries.find(p);
     if (it != g_entries.end()) {
         Entry& e = it->second;
+        // Fast path: if already backed by a VkBuffer and verified in this exact submit, skip re-hashing guest RAM.
+        if (e.size == size && e.padded == padded && e.block < g_blocks.size() && g_blocks[e.block].buffer != VK_NULL_HANDLE) {
+            const bool same_submit = (e.last_verified_submit == g_submits);
+            if (same_submit) {
+                e.serial = std::max(e.serial, frame_recording_serial());
+                e.seen = g_submits;
+                g_stats_cache.hits++;
+                g_stats_cache.hit_bytes += padded;
+                out = {g_blocks[e.block].buffer, e.offset, g_blocks[e.block].ptr + e.offset};
+                return true;
+            }
+        }
+
+        const uint64_t t0 = time_hash ? plat::monotonic_ns() : 0;
+        uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
+        for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+        if (time_hash) g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
+
         if (e.size == size && e.padded == padded && e.hash == h) {
+            e.last_verified_submit = g_submits;
             // NX_BUFFER_CACHE_VERIFY=1: every hit compared with the guest bytes (slow: the copy is uncached memory).
             static const bool verify = std::getenv("NX_BUFFER_CACHE_VERIFY") != nullptr;
             if (verify && std::memcmp(g_blocks[e.block].ptr + e.offset, p, size) != 0) {
@@ -208,7 +233,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
                                      (unsigned long long)size, (const void*)p);
                 g_stats_cache.wrong++;
             }
-            e.serial = std::max(e.serial, serial), e.seen = g_submits;
+            e.serial = std::max(e.serial, frame_recording_serial()), e.seen = g_submits;
             g_stats_cache.hits++, g_stats_cache.hit_bytes += padded;
             out = {g_blocks[e.block].buffer, e.offset, g_blocks[e.block].ptr + e.offset};
             return true;
@@ -216,12 +241,31 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
         retire(e);  // read by the submits up to e.serial: freed after them
         g_entries.erase(it);
     }
-    // Not cached: a copy here only once the bytes stayed the same for kStableSeen submits in a row.
+
+    // Not cached: check if this buffer changes frequently (volatile dynamic uniform/constant blocks)
     Seen& seen = g_seen[p];
-    if (seen.size == size && seen.hash == h && seen.submit + kSeenGap >= g_submits)
+    if (seen.skip_until > g_submits) {
+        g_stats_cache.unstable++;
+        return false;  // Bypass hashing entirely for volatile dynamic buffers
+    }
+
+    const uint64_t t0 = time_hash ? plat::monotonic_ns() : 0;
+    uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
+    for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+    if (time_hash) g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
+
+    const uint64_t serial = frame_recording_serial();
+    if (seen.size == size && seen.hash == h && seen.submit + kSeenGap >= g_submits) {
         seen.count++;
-    else
+        seen.unstable_streak = 0;
+    } else {
         seen.count = 1;
+        seen.unstable_streak++;
+        if (seen.unstable_streak >= 2) {
+            // Unstable across consecutive checks: back off for 30 submits (~10 frames)
+            seen.skip_until = g_submits + 30;
+        }
+    }
     seen.size = size, seen.hash = h, seen.submit = g_submits;
     if (seen.count < kStableSeen) {
         g_stats_cache.unstable++;
@@ -237,9 +281,9 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     g_used += class_bytes(c);
     uint8_t* dst = g_blocks[slot.block].ptr + slot.offset;
     frame_guest_read(p, size);
-    std::memcpy(dst, p, size);
+    plat::fast_memcpy(dst, p, size);
     if (padded > size) std::memset(dst + size, 0, padded - size);
-    g_entries[p] = {size, padded, h, slot.block, slot.offset, c, serial, g_submits};
+    g_entries[p] = {size, padded, h, slot.block, slot.offset, c, serial, g_submits, g_submits};
     g_stats_cache.misses++, g_stats_cache.miss_bytes += padded;
     out = {g_blocks[slot.block].buffer, slot.offset, dst};
     return true;

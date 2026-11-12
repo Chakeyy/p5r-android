@@ -63,7 +63,7 @@ constexpr uint32_t kPathNotFound = 0x202;       // fs 1
 constexpr uint32_t kPathAlreadyExists = 0x402;  // fs 2
 constexpr uint32_t kTargetNotFound = 0x2EE202;  // fs 6001-ish: generic "not mounted"
 
-std::mutex g_fs;
+std::recursive_mutex g_fs;
 std::map<std::string, fs::path> g_mounts;
 // Open files: shared so a read in progress survives a close from another thread. Reads run outside g_fs (which
 // only guards the tables): one global lock made every streaming thread (Bink animations, FMOD banks) wait behind
@@ -92,15 +92,28 @@ std::string virtual_key(const fs::path& p) {
     return s;
 }
 
-// The virtual file whose key the resolved path ends with, or nullptr.
-const std::string* find_virtual(const fs::path& resolved) {
-    if (g_virtual.empty() || resolved.empty()) return nullptr;
-    std::string k = virtual_key(resolved);
-    for (auto& [key, data] : g_virtual)
-        if (k.size() >= key.size() + 1 && k.compare(k.size() - key.size(), key.size(), key) == 0 &&
-            k[k.size() - key.size() - 1] == '/')
-            return &data;
+std::string utf8(const fs::path& p) {
+    auto s = p.u8string();
+    return std::string(s.begin(), s.end());
+}
+
+// The virtual file whose key matches the path or whose key the path ends with, or nullptr.
+const std::string* find_virtual_str(const std::string& path_str) {
+    if (g_virtual.empty() || path_str.empty()) return nullptr;
+    std::string k = virtual_key(fs::u8path(path_str));
+    for (const auto& [key, data] : g_virtual) {
+        if (k == key) return &data;
+        if (k.size() > key.size() && k.compare(k.size() - key.size(), key.size(), key) == 0) {
+            char prev = k[k.size() - key.size() - 1];
+            if (prev == '/' || prev == '\\' || prev == ':') return &data;
+        }
+    }
     return nullptr;
+}
+
+const std::string* find_virtual(const fs::path& resolved) {
+    if (resolved.empty()) return nullptr;
+    return find_virtual_str(utf8(resolved));
 }
 struct Dir {
     std::vector<fs::directory_entry> entries;
@@ -113,11 +126,6 @@ std::map<uint64_t, Dir> g_dirs;
 uint64_t g_next = 1;
 
 fs::path data_root() { return fs::u8path(plat::data_root()); }
-
-std::string utf8(const fs::path& p) {
-    auto s = p.u8string();
-    return std::string(s.begin(), s.end());
-}
 
 std::string cstr(uint64_t p) { return p ? std::string(reinterpret_cast<const char*>(p)) : std::string(); }
 
@@ -158,22 +166,132 @@ bool image_rel(const std::string& guest, std::string& rel) {
 std::vector<fs::path> g_mod_roots;  // low priority first
 const nxi::GameImage::Entry kModDir{0, 0, true};
 
+fs::path find_case_insensitive(const fs::path& base, const std::string& rel) {
+    fs::path current = base;
+    size_t start = 0;
+    std::error_code ec;
+    while (start < rel.size()) {
+        size_t next = rel.find('/', start);
+        std::string part = (next == std::string::npos) ? rel.substr(start) : rel.substr(start, next - start);
+        start = (next == std::string::npos) ? rel.size() : next + 1;
+        if (part.empty()) continue;
+
+        fs::path direct = current / fs::u8path(part);
+        if (fs::exists(direct, ec)) {
+            current = direct;
+            continue;
+        }
+        bool found = false;
+        if (fs::is_directory(current, ec)) {
+            for (auto& entry : fs::directory_iterator(current, ec)) {
+                auto name_u8 = entry.path().filename().u8string();
+                std::string name(name_u8.begin(), name_u8.end());
+                if (name.size() == part.size()) {
+                    bool match = true;
+                    for (size_t i = 0; i < name.size(); i++) {
+                        if (std::tolower(static_cast<unsigned char>(name[i])) !=
+                            std::tolower(static_cast<unsigned char>(part[i]))) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        current = entry.path();
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!found) return {};
+    }
+    return current;
+}
+
 void scan_mods() {
     g_mod_roots.clear();
     std::error_code ec;
     fs::path root = data_root() / "mods";
-    if (!fs::is_directory(root, ec)) return;
     std::vector<fs::path> found;
-    for (auto& e : fs::directory_iterator(root, ec)) {
-        if (!e.is_directory(ec)) continue;
-        auto u8 = e.path().filename().u8string();
-        std::string name(u8.begin(), u8.end());
-        if (name.empty() || name[0] == '.' || name[0] == '_') continue;
-        if (fs::is_directory(e.path() / "romfs", ec)) found.push_back(e.path() / "romfs");
+
+    // Check direct mods/romfs (Atmosphere layout dropped directly into mods/)
+    if (fs::is_directory(root / "romfs", ec)) {
+        found.push_back(root / "romfs");
     }
+
+    // Check atmosphere/contents/<title_id>/romfs
+    fs::path atmos = data_root() / "atmosphere" / "contents";
+    if (fs::is_directory(atmos, ec)) {
+        for (auto& e : fs::directory_iterator(atmos, ec)) {
+            if (e.is_directory(ec) && fs::is_directory(e.path() / "romfs", ec))
+                found.push_back(e.path() / "romfs");
+        }
+    }
+
+    // Check mods/<ModName>...
+    if (fs::is_directory(root, ec)) {
+        for (auto& e : fs::directory_iterator(root, ec)) {
+            if (!e.is_directory(ec)) continue;
+            auto u8 = e.path().filename().u8string();
+            std::string name(u8.begin(), u8.end());
+            if (name.empty() || name[0] == '.' || name[0] == '_') continue;
+            if (name == "romfs" || name == "exefs") continue;
+            if (fs::is_directory(e.path() / "romfs", ec)) {
+                found.push_back(e.path() / "romfs");
+            } else if (fs::is_directory(e.path() / "CPK", ec) || fs::is_directory(e.path() / "cpk", ec) ||
+                       fs::is_directory(e.path() / "sound", ec) || fs::is_directory(e.path() / "movie", ec) ||
+                       fs::is_directory(e.path() / "field", ec) || fs::is_directory(e.path() / "app_config", ec)) {
+                found.push_back(e.path());
+            }
+        }
+    }
+
     std::sort(found.begin(), found.end());
+    found.erase(std::unique(found.begin(), found.end()), found.end());
     g_mod_roots = std::move(found);
-    for (auto& r : g_mod_roots) log("fs: mod active: %s", r.parent_path().filename().string().c_str());
+    for (auto& r : g_mod_roots) log("fs: mod active: %s", r.string().c_str());
+
+    // Crowd removal option (NX_NO_CROWD=1): stub RESRCCROWDUNIT.BIN and activate no-crowd assets
+    if (const char* e = std::getenv("NX_NO_CROWD")) {
+        if (e[0] == '1' || std::strcmp(e, "true") == 0) {
+            log("fs: crowd removal active (NX_NO_CROWD=1): activating no-crowd assets");
+            std::string crowd_data;
+            // Check if _NoCrowdsAndroid mod folder exists on disk
+            fs::path nc_dir = root / "_NoCrowdsAndroid";
+            if (!fs::is_directory(nc_dir, ec)) nc_dir = root / "NoCrowdsAndroid";
+            if (fs::is_directory(nc_dir, ec)) {
+                fs::path nc_romfs = nc_dir / "romfs";
+                if (fs::is_directory(nc_romfs, ec)) {
+                    g_mod_roots.push_back(nc_romfs);
+                    log("fs: crowd removal: mounted %s", nc_romfs.string().c_str());
+                } else {
+                    g_mod_roots.push_back(nc_dir);
+                    log("fs: crowd removal: mounted %s", nc_dir.string().c_str());
+                }
+                // Try reading the mod's patched RESRCCROWDUNIT.BIN
+                fs::path bin = find_case_insensitive(nc_romfs, "CPK/PATCH1/BASE/RESOURCE/RESRCCROWDUNIT.BIN");
+                if (bin.empty()) bin = find_case_insensitive(nc_dir, "CPK/PATCH1/BASE/RESOURCE/RESRCCROWDUNIT.BIN");
+                if (!bin.empty() && fs::is_regular_file(bin, ec)) {
+                    if (FILE* f = plat::fopen_utf8(utf8(bin), "rb")) {
+                        char buf[4096];
+                        size_t n;
+                        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) crowd_data.append(buf, n);
+                        std::fclose(f);
+                        log("fs: crowd removal: loaded %zu bytes from %s", crowd_data.size(), bin.string().c_str());
+                    }
+                }
+            }
+            if (crowd_data.empty()) {
+                // Minimal valid RESRCCROWDUNIT.BIN header (magic 0x00290514, count 1000, 0 active entries)
+                crowd_data.assign("\x14\x05\x29\x00\x00\x00\x03\xe8\x00\x00\x00\x00\x00\x00\x00\x00", 16);
+            }
+            g_virtual[virtual_key(fs::u8path("resource/resrccrowdunit.bin"))] = crowd_data;
+            g_virtual[virtual_key(fs::u8path("base/resource/resrccrowdunit.bin"))] = crowd_data;
+            g_virtual[virtual_key(fs::u8path("cpk/patch1/base/resource/resrccrowdunit.bin"))] = crowd_data;
+            g_virtual[virtual_key(fs::u8path("patch1/base/resource/resrccrowdunit.bin"))] = crowd_data;
+            g_virtual[virtual_key(fs::u8path("resrccrowdunit.bin"))] = crowd_data;
+        }
+    }
 }
 
 bool safe_rel(const std::string& rel) {  // no ".." part: a mod path never leaves its folder
@@ -194,6 +312,8 @@ fs::path mod_file(const std::string& rel) {
     for (auto it = g_mod_roots.rbegin(); it != g_mod_roots.rend(); ++it) {
         fs::path p = *it / fs::u8path(rel);
         if (fs::is_regular_file(p, ec)) return p;
+        fs::path ci = find_case_insensitive(*it, rel);
+        if (!ci.empty() && fs::is_regular_file(ci, ec)) return ci;
     }
     return {};
 }
@@ -201,8 +321,13 @@ fs::path mod_file(const std::string& rel) {
 bool mod_has_dir(const std::string& rel) {
     if (g_mod_roots.empty() || !safe_rel(rel)) return false;
     std::error_code ec;
-    for (auto& r : g_mod_roots)
+    for (auto& r : g_mod_roots) {
         if (fs::is_directory(rel.empty() ? r : r / fs::u8path(rel), ec)) return true;
+        if (!rel.empty()) {
+            fs::path ci = find_case_insensitive(r, rel);
+            if (!ci.empty() && fs::is_directory(ci, ec)) return true;
+        }
+    }
     return false;
 }
 
@@ -309,14 +434,15 @@ void CreateDirectory(CPU& c) {
 
 void GetEntryType(CPU& c) {  // (DirectoryEntryType* out, path)
     std::lock_guard lk(g_fs);
-    fs::path p = resolve(cstr(c.x[1]));
-    if (find_virtual(p)) {
+    std::string guest = cstr(c.x[1]);
+    fs::path p = resolve(guest);
+    if (find_virtual(p) || find_virtual_str(guest)) {
         st<uint32_t>(c.x[0], 1);
         c.x[0] = kOk;
         return;
     }
-    if (std::string rel; image_rel(cstr(c.x[1]), rel)) {
-        if (!mod_file(rel).empty()) {
+    if (std::string rel; image_rel(guest, rel)) {
+        if (find_virtual_str(rel) || !mod_file(rel).empty()) {
             st<uint32_t>(c.x[0], 1);
             c.x[0] = kOk;
             return;
@@ -341,14 +467,23 @@ void OpenFile(CPU& c) {  // (FileHandle* out, path, int mode: 1 read, 2 write, 4
     std::string guest = cstr(c.x[1]);
     fs::path p = resolve(guest);
     int mode = int(c.x[2]);
-    if (const std::string* v = find_virtual(p)) {  // served from memory, through a temporary file
+    const std::string* v = find_virtual(p);
+    if (!v) v = find_virtual_str(guest);
+    if (!v) {
+        if (std::string rel; image_rel(guest, rel)) {
+            v = find_virtual_str(rel);
+        }
+    }
+    if (v) {  // served from memory, through a temporary file
         FILE* f = std::tmpfile();
         if (!f) {
             c.x[0] = kPathNotFound;
             return;
         }
-        std::fwrite(v->data(), 1, v->size(), f);
-        std::fflush(f);
+        if (!v->empty()) {
+            std::fwrite(v->data(), 1, v->size(), f);
+            std::fflush(f);
+        }
         uint64_t h = g_next++;
         g_files[h] = std::make_shared<File>(f, guest);
         st<uint64_t>(c.x[0], h);
