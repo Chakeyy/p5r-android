@@ -110,27 +110,25 @@ void bind_vertex(VkCommandBuffer cb, uint32_t binding, const Upload& u) {
 
 // Binds active vertex streams (plus binding 15 zero_stream) in contiguous batches.
 void bind_vertex_streams(VkCommandBuffer cb, uint32_t used_mask, const Upload* streams) {
-    bool need[16] = {};
+    uint32_t active_mask = (used_mask & 0xFFFFu) | (1u << 15);
+    uint32_t need_mask = 0;
     const Upload zero = zero_stream();
-    for (uint32_t s = 0; s < 16; s++) {
-        const bool active = (s == 15) ? true : (used_mask >> s & 1);
-        if (!active) continue;
+    for (uint32_t m = active_mask; m; m &= m - 1) {
+        const uint32_t s = uint32_t(__builtin_ctz(m));
         const Upload& u = (s == 15) ? zero : streams[s];
         const Upload& now = g_bound.vertex[s];
         if ((g_bound.vertex_set >> s & 1) && now.buffer == u.buffer && now.offset == u.offset) {
             g_state_kept++;
         } else {
-            need[s] = true;
+            need_mask |= 1u << s;
         }
     }
+    if (!need_mask) return;
 
-    for (uint32_t s = 0; s < 16;) {
-        if (!need[s]) {
-            s++;
-            continue;
-        }
+    while (need_mask) {
+        const uint32_t s = uint32_t(__builtin_ctz(need_mask));
         uint32_t n = 1;
-        while (s + n < 16 && need[s + n]) n++;
+        while (s + n < 16 && (need_mask >> (s + n) & 1)) n++;
         VkBuffer bufs[16];
         VkDeviceSize offs[16];
         for (uint32_t i = 0; i < n; i++) {
@@ -142,7 +140,7 @@ void bind_vertex_streams(VkCommandBuffer cb, uint32_t used_mask, const Upload* s
             g_state_set++;
         }
         p_vkCmdBindVertexBuffers(cb, s, n, bufs, offs);
-        s += n;
+        need_mask &= ~(((1u << n) - 1u) << s);
     }
 }
 
@@ -973,33 +971,49 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
     VkPipeline pipeline = VK_NULL_HANDLE;
 
-    // Fast-path bypass: if consecutive draws share the same shader programs, topology,
-    // pipeline state generation, layout, and render targets, reuse the bound graphics pipeline directly.
-    // This avoids a 704-byte memset, array copies, target format lookups, and 704-byte memcmp MRU searches.
-    static const ShaderInfo* s_cached_pipe_vs = nullptr;
-    static const ShaderInfo* s_cached_pipe_fs = nullptr;
-    static uint32_t s_cached_pipe_mode = 0;
-    static bool s_cached_pipe_indexed = false;
-    static VkPipelineLayout s_cached_pipe_layout = VK_NULL_HANDLE;
-    static uint32_t s_cached_pipe_state_version = 0;
-    static bool s_cached_pipe_textures_empty = false;
-    static VkPipeline s_cached_fast_pipeline = VK_NULL_HANDLE;
+    // 4-entry intra-pass MRU bypass: consecutive or alternating draws (e.g. character + outline, UI + text)
+    // sharing shaders, topology, state version, layout, and render pass reuse the VkPipeline directly without
+    // zeroing and populating a 704-byte PipelineKey.
+    struct PipeMru {
+        const ShaderInfo* vs = nullptr;
+        const ShaderInfo* fs = nullptr;
+        uint32_t mode = 0;
+        uint32_t state_version = 0;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        bool indexed = false;
+        bool textures_empty = false;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+    static PipeMru s_pipe_mru[4];
+    static VkCommandBuffer s_pipe_mru_cb = VK_NULL_HANDLE;
+    if (targets_changed || s_pipe_mru_cb != cb) {
+        for (auto& e : s_pipe_mru) e.pipeline = VK_NULL_HANDLE;
+        s_pipe_mru_cb = cb;
+    }
 
-    if (g_bound.pipeline != VK_NULL_HANDLE &&
-        g_bound.cb == cb &&
-        s_cached_fast_pipeline == g_bound.pipeline &&
-        vs == s_cached_pipe_vs &&
-        fs == s_cached_pipe_fs &&
-        mode == s_cached_pipe_mode &&
-        indexed == s_cached_pipe_indexed &&
-        layout.layout == s_cached_pipe_layout &&
-        replay::g_pipeline_state_version == s_cached_pipe_state_version &&
-        !targets_changed &&
-        g_textures.bindings.empty() == s_cached_pipe_textures_empty &&
-        !uw_on() &&
-        !live_flags()) {
-        pipeline = s_cached_fast_pipeline;
-    } else {
+    const bool tex_empty = g_textures.bindings.empty();
+    if (!uw_on() && !live_flags()) {
+        for (int i = 0; i < 4; i++) {
+            const PipeMru& e = s_pipe_mru[i];
+            if (e.pipeline != VK_NULL_HANDLE &&
+                e.vs == vs &&
+                e.fs == fs &&
+                e.mode == mode &&
+                e.indexed == indexed &&
+                e.layout == layout.layout &&
+                e.state_version == replay::g_pipeline_state_version &&
+                e.textures_empty == tex_empty) {
+                pipeline = e.pipeline;
+                if (i > 0) {
+                    PipeMru hit = e;
+                    for (int j = i; j > 0; j--) s_pipe_mru[j] = s_pipe_mru[j - 1];
+                    s_pipe_mru[0] = hit;
+                }
+                break;
+            }
+        }
+    }
+    if (pipeline == VK_NULL_HANDLE) {
         // Pipeline.
         PipelineKey key;
         std::memset(&key, 0, sizeof key);  // the key is compared byte for byte
@@ -1145,15 +1159,9 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 s_mru_order[0] = insert_idx;
             }
         }
-        if (pipeline != VK_NULL_HANDLE) {
-            s_cached_pipe_vs = vs;
-            s_cached_pipe_fs = fs;
-            s_cached_pipe_mode = mode;
-            s_cached_pipe_indexed = indexed;
-            s_cached_pipe_layout = layout.layout;
-            s_cached_pipe_state_version = replay::g_pipeline_state_version;
-            s_cached_pipe_textures_empty = g_textures.bindings.empty();
-            s_cached_fast_pipeline = pipeline;
+        if (pipeline != VK_NULL_HANDLE && !uw_on() && !live_flags()) {
+            for (int j = 3; j > 0; j--) s_pipe_mru[j] = s_pipe_mru[j - 1];
+            s_pipe_mru[0] = {vs, fs, mode, replay::g_pipeline_state_version, layout.layout, indexed, tex_empty, pipeline};
         }
     }
     if (!pipeline) {

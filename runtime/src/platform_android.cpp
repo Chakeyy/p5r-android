@@ -148,17 +148,69 @@ void yield() {
 void set_thread_name(const char* name) { pthread_setname_np(pthread_self(), name); }
 int64_t current_thread_id() { return gettid(); }
 
+namespace {
+struct CpuMasks {
+    long num_cores = 0;
+    cpu_set_t big{};
+    cpu_set_t little{};
+    bool valid = false;
+};
+
+const CpuMasks& get_cpu_masks() {
+    static const CpuMasks masks = [] {
+        CpuMasks m{};
+        m.num_cores = sysconf(_SC_NPROCESSORS_CONF);
+        if (m.num_cores < 8) return m;
+        int n = int(std::min<long>(m.num_cores, CPU_SETSIZE));
+        unsigned long freqs[CPU_SETSIZE] = {};
+        unsigned long min_f = ~0ul, max_f = 0;
+        bool any_freq = false;
+        for (int i = 0; i < n; ++i) {
+            char path[96];
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+            FILE* f = std::fopen(path, "r");
+            if (f) {
+                unsigned long khz = 0;
+                if (std::fscanf(f, "%lu", &khz) == 1 && khz > 0) {
+                    freqs[i] = khz;
+                    min_f = std::min(min_f, khz);
+                    max_f = std::max(max_f, khz);
+                    any_freq = true;
+                }
+                std::fclose(f);
+            }
+        }
+        CPU_ZERO(&m.big);
+        CPU_ZERO(&m.little);
+        if (any_freq && max_f > min_f) {
+            unsigned long threshold = min_f + (max_f - min_f) / 4;
+            for (int i = 0; i < n; ++i) {
+                if (freqs[i] > threshold) CPU_SET(i, &m.big);
+                else CPU_SET(i, &m.little);
+            }
+            if (CPU_COUNT(&m.big) > 0 && CPU_COUNT(&m.little) > 0) {
+                m.valid = true;
+                return m;
+            }
+        }
+        // Fallback for 6+2 8-core SoCs if sysfs frequencies are unreadable
+        CPU_ZERO(&m.big);
+        CPU_ZERO(&m.little);
+        for (int i = 0; i < 6; ++i) CPU_SET(i, &m.little);
+        CPU_SET(6, &m.big);
+        CPU_SET(7, &m.big);
+        m.valid = true;
+        return m;
+    }();
+    return masks;
+}
+}  // namespace
+
 void pin_current_thread_to_big_cores(const char* thread_name) {
-    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
-    if (num_cores < 8) return;  // Only apply on 8-core Big.LITTLE topologies
+    const CpuMasks& m = get_cpu_masks();
+    if (!m.valid) return;
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    // On 8-core MediaTek/Qualcomm SoCs, cores 6 and 7 are the Cortex-A76/A78/X-cores
-    CPU_SET(6, &cpuset);
-    CPU_SET(7, &cpuset);
-
-    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &m.big);
     if (rc != 0) {
         __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s': errno %d", thread_name, rc);
     }
@@ -179,17 +231,10 @@ void pin_current_thread_to_core(int core_id, const char* thread_name) {
 }
 
 void pin_current_thread_to_little_cores(const char* thread_name) {
-    long num_cores = sysconf(_SC_NPROCESSORS_CONF);
-    if (num_cores < 8) return;
+    const CpuMasks& m = get_cpu_masks();
+    if (!m.valid) return;
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    // On 8-core MediaTek/Qualcomm SoCs, cores 0-5 are the Cortex-A55 LITTLE cores
-    for (int i = 0; i < 6; ++i) {
-        CPU_SET(i, &cpuset);
-    }
-
-    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+    int rc = sched_setaffinity(0, sizeof(cpu_set_t), &m.little);
     if (rc != 0) {
         __android_log_print(ANDROID_LOG_WARN, "p5r", "Failed to pin thread '%s' to Little Cores: errno %d", thread_name, rc);
     }
