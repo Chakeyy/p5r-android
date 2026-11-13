@@ -44,21 +44,22 @@ namespace {
 
 bool g_rendering = false;
 bool g_render_pass = false;
+VkCommandBuffer g_pass_cb = VK_NULL_HANDLE;  // the command buffer the open pass is recorded in
 bool g_vertex_pending = false;  // a narrow pass-end barrier since the last one that covers vertex stages (G4)
 uint64_t g_pass_serial = 0, g_vertex_visible_at = 0;  // pass ends so far; the serial a full barrier covered
 uint64_t g_vertex_barriers = 0;
 
 // Narrow pass barrier: allows Mali Valhall GPUs to overlap next pass vertex binning with previous pass fragment shading.
-#if defined(__ANDROID__)
-static const bool s_narrow_pass_barrier = [] {
-    const char* e = std::getenv("NX_PASS_BARRIER_NARROW");
-    return !(e && e[0] == '0');
-}();
-#else
-static const bool s_narrow_pass_barrier = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
-#endif
 bool narrow_pass_barrier() {
-    return s_narrow_pass_barrier;
+#if defined(__ANDROID__)
+    static const bool on = [] {
+        const char* e = std::getenv("NX_PASS_BARRIER_NARROW");
+        return !(e && e[0] == '0');
+    }();
+#else
+    static const bool on = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
+#endif
+    return on;
 }
 
 // A vertex shader sampling a rendered image after a narrow pass-end barrier: the pass ends (it cannot take a barrier
@@ -229,11 +230,6 @@ void pass_census(const Targets& t, const VkRenderingAttachmentInfo* colors, cons
     e.passes++, e.load += load, e.store += store;
 }
 
-static const bool s_shadows_off = [] {
-    const char* e = std::getenv("NX_SHADOWS");
-    return e && e[0] == '0';
-}();
-
 void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     if (clears_pending_other(t)) {  // other targets' clears first, in order (NX_CLEARS_V2: only those on its images)
         if (live_clears_why()) clears_log_mismatch("pass", t);
@@ -336,6 +332,7 @@ void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     else
         p_vkCmdBeginRendering(cb, &ri);
     g_rendering = true;
+    g_pass_cb = cb;
     g_pass_written = cleared | fresh;  // as a clear inside the pass: sampling it needs it stored first
     g_pass_draws = 0;
     trace_pass("begin: cleared, fresh", t, cleared, fresh);
@@ -438,18 +435,21 @@ void vertex_read_barrier(VkCommandBuffer cb, const ShaderInfo* vs) {
 // NX_SHADOWS=0 (the launcher's "Sombras: desactivadas"): no draws into shadow maps, the square depth-only targets of
 // 512 or more (P5R: 2048 and 1024, D32). Their clears stay: the maps say "lit" everywhere.
 bool shadow_draw_skipped(const Targets& t) {
+    static const bool s_shadows_off = [] {
+        const char* e = std::getenv("NX_SHADOWS");
+        return e && e[0] == '0';
+    }();
     if (!s_shadows_off || !depth_only(t)) return false;
     const GpuImage* d = image_of(t.depth);
     return d && d->width == d->height && (d->width >= 256 || d->shadow) && !(d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
 }
 
-static const bool s_bloom_disabled = [] {
-    const char* e = std::getenv("NX_DISABLE_BLOOM");
-    return e && (e[0] == '1' || std::strcmp(e, "true") == 0);
-}();
-
 // NX_DISABLE_BLOOM=1 (the launcher's "Post-procesado: desactivado"): no draws into bloom/blur mip chains.
 bool bloom_draw_skipped(const Targets& t) {
+    static const bool s_bloom_disabled = [] {
+        const char* e = std::getenv("NX_DISABLE_BLOOM");
+        return e && (e[0] == '1' || std::strcmp(e, "true") == 0);
+    }();
     if (!s_bloom_disabled) return false;
     if (t.color_count > 0 && t.views.level[0] > 0) return true;
     return false;
@@ -468,17 +468,16 @@ enum : uint32_t {
     kLiveClearsWhy = 128,  // clears_why: the targets of a pending clear and of what flushed it (nvn_clears.cpp)
 };
 
-static const uint32_t s_live_env_flags = [] {
-    uint32_t ef = 0;
-    if (const char* e = std::getenv("NX_UI_ALWAYS"); e && e[0] == '1') ef |= kLiveUiAlways;
-    if (const char* e = std::getenv("NX_UI_NOWRITE"); e && e[0] == '1') ef |= kLiveUiNoWrite;
-    if (const char* e = std::getenv("NX_UI_RGB"); e && e[0] == '1') ef |= kLiveUiRgb;
-    if (const char* e = std::getenv("NX_UI_AMAX"); e && e[0] == '1') ef |= kLiveUiAmax;
-    if (const char* e = std::getenv("NX_UI_AONE"); e && e[0] == '1') ef |= kLiveUiAone;
-    return ef;
-}();
-
 uint32_t live_flags() {
+    static const uint32_t s_live_env_flags = [] {
+        uint32_t ef = 0;
+        if (const char* e = std::getenv("NX_UI_ALWAYS"); e && e[0] == '1') ef |= kLiveUiAlways;
+        if (const char* e = std::getenv("NX_UI_NOWRITE"); e && e[0] == '1') ef |= kLiveUiNoWrite;
+        if (const char* e = std::getenv("NX_UI_RGB"); e && e[0] == '1') ef |= kLiveUiRgb;
+        if (const char* e = std::getenv("NX_UI_AMAX"); e && e[0] == '1') ef |= kLiveUiAmax;
+        if (const char* e = std::getenv("NX_UI_AONE"); e && e[0] == '1') ef |= kLiveUiAone;
+        return ef;
+    }();
     static uint64_t next_check = 0;
     static uint32_t flags = 0;
     const uint64_t f = g_frame.load();
@@ -510,29 +509,25 @@ uint32_t live_flags() {
 
 bool live_clears_why() { return live_flags() & kLiveClearsWhy; }
 
-static const bool s_exp_no_wb_env = [] {
-    const char* e = std::getenv("NX_EXP_NO_WB");
-    return e && e[0] != '0';
-}();
-
 bool exp_no_write_backs() {
+    static const bool s_exp_no_wb_env = [] {
+        const char* e = std::getenv("NX_EXP_NO_WB");
+        return e && e[0] != '0';
+    }();
     return s_exp_no_wb_env || (live_flags() & kLiveNoWb);
 }
 
-static const int s_exp_rp_env = [] {
-    const char* e = std::getenv("NX_EXP_RP");
-    if (!e) return 0;
-    return (std::strstr(e, "noload") ? 1 : 0) | (std::strstr(e, "nostore") ? 2 : 0) | (std::strstr(e, "split") ? 4 : 0);
-}();
-
 int exp_render_pass() {
+    static const int s_exp_rp_env = [] {
+        const char* e = std::getenv("NX_EXP_RP");
+        if (!e) return 0;
+        return (std::strstr(e, "noload") ? 1 : 0) | (std::strstr(e, "nostore") ? 2 : 0) | (std::strstr(e, "split") ? 4 : 0);
+    }();
     const uint32_t live = live_flags();
     return s_exp_rp_env | (live & kLiveRpNoLoad ? 1 : 0) | (live & kLiveRpNoStore ? 2 : 0) | (live & kLiveRpSplit ? 4 : 0);
 }
 
 namespace {
-
-static const bool s_frame_draws_on = std::getenv("NX_FRAME_DRAWS") != nullptr;
 
 // NX_RESTART_STATS=1: per NVN primitive mode, the indexed draws made while restart is on, how many hold the restart
 // index, and of those how many have 32-bit indices (Vulkan would not restart at NVN's 0xFFFF there). Every 600 frames.
@@ -540,6 +535,7 @@ static const bool s_frame_draws_on = std::getenv("NX_FRAME_DRAWS") != nullptr;
 // sum, with the monotonic time (logcat's clock on Android), to line a screen recording up with what the game
 // submitted: the Yongen-Jaya pop-ins are ~80 draws the game stops sending (PROGRESO 68).
 void frame_draws(const ShaderInfo* vs, uint64_t count) {
+    static const bool s_frame_draws_on = std::getenv("NX_FRAME_DRAWS") != nullptr;
     if (!s_frame_draws_on) return;
     static uint64_t frame = 0, draws = 0, verts = 0, sum = 0;
     const uint64_t f = g_frame.load();
@@ -554,9 +550,8 @@ void frame_draws(const ShaderInfo* vs, uint64_t count) {
     sum += std::strtoull(vs->hash.substr(0, 16).c_str(), nullptr, 16);
 }
 
-static const bool s_restart_stats_on = std::getenv("NX_RESTART_STATS") != nullptr;
-
 void restart_stats(uint32_t mode, const Cmd& c) {
+    static const bool s_restart_stats_on = std::getenv("NX_RESTART_STATS") != nullptr;
     if (!s_restart_stats_on) return;
     static uint64_t draws[16] = {}, with[16] = {}, wide[16] = {}, logged = 0;
     const uint32_t m = mode & 15, count = uint32_t(c.i[0]), size = index_size(c.mask);
@@ -589,9 +584,8 @@ void restart_stats(uint32_t mode, const Cmd& c) {
 std::vector<uint64_t> g_linear_targets;  // this submit's (NVNtexture*), drawn into
 std::vector<WriteBack> g_late_write_backs;  // their copies: applied when the submit retires, never waited for
 
-static const bool s_linear_write_back_on = !(std::getenv("NX_LINEAR_WRITE_BACK") && std::getenv("NX_LINEAR_WRITE_BACK")[0] == '0');
-
 bool linear_write_back_on() {
+    static const bool s_linear_write_back_on = !(std::getenv("NX_LINEAR_WRITE_BACK") && std::getenv("NX_LINEAR_WRITE_BACK")[0] == '0');
     return s_linear_write_back_on;
 }
 
@@ -605,108 +599,96 @@ void note_linear_target(uint64_t texture) {
         g_linear_targets.push_back(texture);
 }
 
-// Static configurations hoisted out of draw() hot loop
+// Runtime configurations initialized lazily on first submit (after android_main / game::renderer_start)
 struct SnapFsBeforeConfig {
     std::string str;
     uint64_t from = 0;
     bool active = false;
 };
-static const SnapFsBeforeConfig s_snap_fs_before = [] {
-    SnapFsBeforeConfig cfg;
-    const char* e = std::getenv("NX_SNAP_FS_BEFORE");
-    if (e && e[0]) {
-        cfg.str = e;
-        size_t at = cfg.str.find('@');
-        cfg.from = (at != std::string::npos) ? std::strtoull(cfg.str.c_str() + at + 1, nullptr, 10) : 0;
-        cfg.active = true;
-    }
-    return cfg;
-}();
-static int s_snap_fs_before_taken = 0;
-
-static const char* const s_dump_draw_textures_env = std::getenv("NX_DUMP_DRAW_TEXTURES");
-static int s_dump_draw_textures_done = 0;
-static bool s_dump_draw_textures_said = false;
-
-static const bool s_targets_memcmp = std::getenv("NX_TARGETS_MEMCMP") != nullptr;
-
-static const int s_keep_hud_alpha = [] {
-    const char* keep_env = std::getenv("NX_HUD_KEEP_ALPHA");
-    return !keep_env ? 0 : keep_env[0] == '1' ? 1 : keep_env[0] == 'a' ? 2 : 0;
-}();
-
-static const bool s_prim_restart_on = !(std::getenv("NX_PRIM_RESTART") && std::getenv("NX_PRIM_RESTART")[0] == '0');
-
-static const bool s_uw_cam_patch = !(std::getenv("NX_UW_CAMERA") && std::getenv("NX_UW_CAMERA")[0] == '0');
-
-static const bool s_uw_ui_learn = [] {
-    const char* e = std::getenv("NX_UW_UI");
-    return e && std::strcmp(e, "learn") == 0;
-}();
-
 struct UwTraceConfig {
     const char* env = nullptr;
     uint64_t from = 0;
     uint64_t count = 0;
     bool active = false;
 };
-static const UwTraceConfig s_uw_trace = [] {
-    UwTraceConfig cfg;
-    cfg.env = std::getenv("NX_UW_TRACE");
-    if (cfg.env) {
-        if (std::sscanf(cfg.env, "%lu:%lu", &cfg.from, &cfg.count) == 2) {
-            cfg.active = true;
-        }
-    }
-    return cfg;
-}();
-
-static const int s_exp3d = [] {
-    const char* e = std::getenv("NX_EXP_3D");
-    return !e ? 0 : std::strcmp(e, "scissor") == 0 ? 1 : std::strcmp(e, "tri") == 0 ? 2 : std::strcmp(e, "small") == 0 ? 3 : 0;
-}();
-
 struct SnapFsConfig {
     std::string str;
     uint64_t from = 0;
     int max = 8;
     bool active = false;
 };
-static const SnapFsConfig s_snap_fs = [] {
-    SnapFsConfig cfg;
-    const char* e = std::getenv("NX_SNAP_FS");
-    if (e && e[0]) {
-        cfg.str = e;
-        size_t at = cfg.str.find('@');
-        cfg.from = (at != std::string::npos) ? std::strtoull(cfg.str.c_str() + at + 1, nullptr, 10) : 0;
-        const char* me = std::getenv("NX_SNAP_FS_MAX");
-        cfg.max = me ? std::atoi(me) : 8;
-        cfg.active = true;
-    }
-    return cfg;
-}();
-static int s_snap_fs_count = 0;
-
-static const uint64_t s_dump_target = std::getenv("NX_DUMP_ON_TARGET") ? std::strtoull(std::getenv("NX_DUMP_ON_TARGET"), nullptr, 16) : 0;
-
 struct DumpFsConfig {
     std::string str;
     uint64_t from = 0;
     bool any = false;
     bool active = false;
 };
-static const DumpFsConfig s_dump_fs = [] {
-    DumpFsConfig cfg;
-    const char* e = std::getenv("NX_DUMP_ON_FS");
-    if (e && e[0]) {
-        cfg.str = e;
-        const char* fe = std::getenv("NX_DUMP_FROM");
-        cfg.from = fe ? std::strtoull(fe, nullptr, 10) : 0;
-        cfg.any = std::getenv("NX_DUMP_ANY") != nullptr;
-        cfg.active = true;
+
+static bool s_draw_env_initialized = false;
+static SnapFsBeforeConfig s_snap_fs_before;
+static int s_snap_fs_before_taken = 0;
+static const char* s_dump_draw_textures_env = nullptr;
+static int s_dump_draw_textures_done = 0;
+static bool s_dump_draw_textures_said = false;
+static bool s_targets_memcmp = false;
+static int s_keep_hud_alpha = 0;
+static bool s_prim_restart_on = true;
+static bool s_uw_cam_patch = true;
+static bool s_uw_ui_learn = false;
+static UwTraceConfig s_uw_trace;
+static int s_exp3d = 0;
+static SnapFsConfig s_snap_fs;
+static int s_snap_fs_count = 0;
+static uint64_t s_dump_target = 0;
+static DumpFsConfig s_dump_fs;
+
+void init_draw_env_once() {
+    if (__builtin_expect(s_draw_env_initialized, 1)) return;
+    s_draw_env_initialized = true;
+    if (const char* e = std::getenv("NX_SNAP_FS_BEFORE"); e && e[0]) {
+        s_snap_fs_before.str = e;
+        size_t at = s_snap_fs_before.str.find('@');
+        s_snap_fs_before.from = (at != std::string::npos) ? std::strtoull(s_snap_fs_before.str.c_str() + at + 1, nullptr, 10) : 0;
+        s_snap_fs_before.active = true;
     }
-    return cfg;
-}();
+    s_dump_draw_textures_env = std::getenv("NX_DUMP_DRAW_TEXTURES");
+    s_targets_memcmp = std::getenv("NX_TARGETS_MEMCMP") != nullptr;
+    if (const char* keep_env = std::getenv("NX_HUD_KEEP_ALPHA")) {
+        s_keep_hud_alpha = keep_env[0] == '1' ? 1 : keep_env[0] == 'a' ? 2 : 0;
+    } else {
+        s_keep_hud_alpha = 0;
+    }
+    s_prim_restart_on = !(std::getenv("NX_PRIM_RESTART") && std::getenv("NX_PRIM_RESTART")[0] == '0');
+    s_uw_cam_patch = !(std::getenv("NX_UW_CAMERA") && std::getenv("NX_UW_CAMERA")[0] == '0');
+    if (const char* e = std::getenv("NX_UW_UI")) {
+        s_uw_ui_learn = std::strcmp(e, "learn") == 0;
+    }
+    s_uw_trace.env = std::getenv("NX_UW_TRACE");
+    if (s_uw_trace.env && std::sscanf(s_uw_trace.env, "%lu:%lu", &s_uw_trace.from, &s_uw_trace.count) == 2) {
+        s_uw_trace.active = true;
+    }
+    if (const char* e = std::getenv("NX_EXP_3D")) {
+        s_exp3d = std::strcmp(e, "scissor") == 0 ? 1 : std::strcmp(e, "tri") == 0 ? 2 : std::strcmp(e, "small") == 0 ? 3 : 0;
+    }
+    if (const char* e = std::getenv("NX_SNAP_FS"); e && e[0]) {
+        s_snap_fs.str = e;
+        size_t at = s_snap_fs.str.find('@');
+        s_snap_fs.from = (at != std::string::npos) ? std::strtoull(s_snap_fs.str.c_str() + at + 1, nullptr, 10) : 0;
+        const char* me = std::getenv("NX_SNAP_FS_MAX");
+        s_snap_fs.max = me ? std::atoi(me) : 8;
+        s_snap_fs.active = true;
+    }
+    if (const char* e = std::getenv("NX_DUMP_ON_TARGET")) {
+        s_dump_target = std::strtoull(e, nullptr, 16);
+    }
+    if (const char* e = std::getenv("NX_DUMP_ON_FS"); e && e[0]) {
+        s_dump_fs.str = e;
+        const char* fe = std::getenv("NX_DUMP_FROM");
+        s_dump_fs.from = fe ? std::strtoull(fe, nullptr, 10) : 0;
+        s_dump_fs.any = std::getenv("NX_DUMP_ANY") != nullptr;
+        s_dump_fs.active = true;
+    }
+}
 
 // Thread-local state cached for draw()
 static thread_local uint64_t s_cached_pv = UINT64_MAX, s_cached_pf = UINT64_MAX;
@@ -1411,8 +1393,10 @@ std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copi
 }
 
 void draw_begin_submit() {
+    init_draw_env_once();
     g_bound_serial = 0;
     g_rendering = false;
+    g_pass_cb = VK_NULL_HANDLE;
     g_linear_targets.clear(), g_late_write_backs.clear();
     g_vertex_pending = false, g_vertex_visible_at = g_pass_serial;  // each command buffer begins with a full barrier
     g_bound = Bound{};  // a new command buffer
@@ -1462,10 +1446,12 @@ void pass_end_only(VkCommandBuffer cb, int reason) {
     g_last_compute_pipeline = VK_NULL_HANDLE;
     if (!g_rendering) return;
     g_pass_ends[reason & 7]++, trace_pass("end: reason", g_pass, uint32_t(reason), 0);
-    if (g_render_pass)
+    if (g_render_pass) {
         p_vkCmdEndRenderPass(cb);
-    else
+        g_bound = Bound{};  // each VkRenderPass instance requires pipelines and dynamic state to be bound
+    } else {
         p_vkCmdEndRendering(cb);
+    }
     g_rendering = false;
     // What the pass wrote is read by what follows (sampled, copied, loaded by the next pass), and what it sampled may
     // be rendered over next. The images stay GENERAL, so transition() records no barrier. Metal (MoltenVK) and the
@@ -1501,6 +1487,15 @@ void draw_end_rendering(VkCommandBuffer cb, int reason) {  // and the pending cl
     clears_flush(cb);
 }
 bool pass_open() { return g_rendering; }
+// A layout change (and the clear or upload after it) about to be recorded while a pass is open in the same command
+// buffer: Vulkan allows neither inside a render pass instance (VUID-vkCmdPipelineBarrier-None-07889,
+// VUID-vkCmdClearColorImage-renderpass). The pass ends first; the draw begins a new one.
+void pass_end_for_transfer(VkCommandBuffer cb) {
+    if (!g_rendering || cb != g_pass_cb) return;
+    static uint64_t n = 0;
+    if (n++ < 8) log("nvn/vk: a layout change inside a pass (%llu so far): the pass ends first", (unsigned long long)n);
+    draw_end_rendering(cb, 5);
+}
 bool pass_open_on(const Targets& t) { return g_rendering && targets_same(g_pass, t); }
 VkExtent2D pass_extent() { return g_pass_extent; }
 void pass_begin(VkCommandBuffer cb, const Targets& t) { begin_rendering(cb, t); }

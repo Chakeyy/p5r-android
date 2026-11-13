@@ -1004,8 +1004,8 @@ extern "C" void android_main(android_app* app) {
                 if (line.rfind("NX_", 0) == 0 && eq != std::string::npos) {
                     const std::string key = line.substr(0, eq);
                     const std::string value = line.substr(eq + 1);
-                    // Launcher and NativeActivity share a process: update stretch even if a previous launch set it to "1".
-                    setenv(key.c_str(), value.c_str(), key == "NX_STRETCH" ? 1 : 0);
+                    // Launcher and NativeActivity share a process: update NX_* keys from config.txt across launches.
+                    setenv(key.c_str(), value.c_str(), 1);
                 }
                 if (eq != std::string::npos && line.substr(0, eq) == "resolution")
                     setenv("NX_RES", line.substr(eq + 1).c_str(), 0);

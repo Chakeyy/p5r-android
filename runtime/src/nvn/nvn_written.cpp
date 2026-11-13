@@ -469,11 +469,11 @@ void write_back_log(uint64_t frames) {
             double(ns) / 1e6 / double(frames));
 }
 
-static const bool s_wb_whole = std::getenv("NX_WRITE_BACK_WHOLE") != nullptr;
-static const bool s_wb_bulk = !(std::getenv("NX_WB_BULK") && std::getenv("NX_WB_BULK")[0] == '0');
 static thread_local std::vector<uint8_t> s_wb_copy;
 
 void apply_write_back(const WriteBack& w) {
+    static const bool s_wb_whole = std::getenv("NX_WRITE_BACK_WHOLE") != nullptr;
+    static const bool s_wb_bulk = !(std::getenv("NX_WB_BULK") && std::getenv("NX_WB_BULK")[0] == '0');
     const uint64_t t0 = plat::monotonic_ns();
     g_wb_count++, g_wb_bytes += w.size;
     if (s_wb_whole || !w.before || w.before->size() < w.size) {

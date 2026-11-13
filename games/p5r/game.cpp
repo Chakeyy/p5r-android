@@ -489,7 +489,7 @@ void cull_job_hook(CPU& c) {
 
     static const bool dist_cull_on = [] {
         const char* e = std::getenv("NX_P5R_DIST_CULL");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     static const float dist_cull_scale = [] {
         const char* e = std::getenv("NX_P5R_DIST_SCALE");
@@ -712,13 +712,15 @@ void game::after_init() {
     const LoadedModule* m = module_at(find_symbol("nnMain"));
     if (m && (g_interval_setter = hook_function(m->base + 0x1048ee0, interval_setter_hook))) {
         g_main_base = m->base;
-        if (!(g_cull_job = hook_function(m->base + 0xab0f50, cull_job_hook)))
+        const char* dc = std::getenv("NX_P5R_DIST_CULL");
+        if ((std::getenv("NX_P5R_CULL_CHECK") || (dc && dc[0] == '1')) &&
+            !(g_cull_job = hook_function(m->base + 0xab0f50, cull_job_hook)))
             log("p5r: the culling job could not be hooked");
     } else {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r76";
+static constexpr const char* kPerfBuildTag = "renderopt-r85";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
