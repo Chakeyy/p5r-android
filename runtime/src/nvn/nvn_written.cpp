@@ -172,6 +172,22 @@ void written_count_bind() { g_binds++; }
 
 Upload written_bind(VkCommandBuffer cb, const uint8_t* p, uint64_t size, uint64_t padded) {
     g_binds++;
+    if (p && size && !g_regions.empty() && p < g_regions_hi && p + size > g_regions_lo) {
+        It upper = g_regions.upper_bound(p);
+        if (upper != g_regions.begin()) {
+            It prev = std::prev(upper);
+            if (!prev->second.taken && prev->first <= p && prev->first + prev->second.size >= p + size &&
+                (upper == g_regions.end() || upper->first >= p + size)) {
+                uint64_t off = uint64_t(p - prev->first);
+                if (off + padded <= prev->second.cap &&
+                    (prev->second.up.offset + off) % std::clamp<uint64_t>(bind_align(), 1, bind_align()) == 0) {
+                    write_after_read(cb);
+                    g_shared++;
+                    return at(prev, off);
+                }
+            }
+        }
+    }
     std::vector<It> old = overlapping(p, size);
     if (It it = containing(p, size, padded, bind_align(), old, true); it != g_regions.end()) {
         write_after_read(cb);

@@ -30,6 +30,7 @@ std::vector<std::shared_ptr<CmdList>> g_cmdlist_pool;
 
 void reset_cmdlist(CmdList& l) {
     l.cmds.clear();
+    l.blob_bytes.clear();
     l.blobs.clear();
     l.handle = 0;
     l.epoch = 0;
@@ -450,8 +451,10 @@ void record(uint64_t guest, Cmd cmd, const void* blob, size_t size) {
     }
     if (blob) {
         cmd.blob = uint32_t(cb->recording->blobs.size());
+        uint32_t off = uint32_t(cb->recording->blob_bytes.size());
+        cb->recording->blobs.push_back({off, uint32_t(size)});
         auto* p = static_cast<const uint8_t*>(blob);
-        cb->recording->blobs.emplace_back(p, p + size);
+        cb->recording->blob_bytes.insert(cb->recording->blob_bytes.end(), p, p + size);
     }
     cb->recording->cmds.push_back(cmd);
 }

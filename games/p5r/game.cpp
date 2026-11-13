@@ -720,12 +720,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r85";
+static constexpr const char* kPerfBuildTag = "renderopt-r86";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (set0/1/2/3 descriptor & UBO/SSBO slot caching, g_regions bounds fast-path, 4-entry index/layout MRU)",
+    log("p5r perf build: %s (O(log N) dedup_invalidate max_end, flat CmdList blob arena, gather_textures O(1) fast-path, selective copy clear flush)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:
@@ -740,6 +740,10 @@ void game::renderer_start() {
     //   via g_regions (nvn_written.cpp), while CPU occlusion culling uses s.late_write_backs.
     //   Saves ~3.0 ms/frame of r.before snapshot + write-combined readback on CPU.
     setenv("NX_EXP_NO_WB", "1", 0);
+    // - Disable mid-submit 150-draw chunking by default: P5R already issues 3 submits/frame
+    //   with 2 pipelined submits in flight (fence wait ~0.01 ms), and chunking adds 3-4 extra
+    //   vkQueueSubmit kernel ioctls + VkCommandBuffer state resets per frame.
+    setenv("NX_SUBMIT_CHUNK_DRAWS", "0", 0);
     // - NOTE: Do NOT enable NX_MALI_FP16 globally in P5R! P5R shaders use packed bitfields,
     //   integer-as-float encodings, and high-range lighting/skinning math in fragment shaders
     //   that overflow IEEE754 fp16 (max 65504), causing severe black/corrupted screen glitches.

@@ -60,6 +60,7 @@ extern State g_state;
 extern Stats g_stats;
 extern uint32_t g_pipeline_state_version;
 extern uint32_t g_attrib_state_version;
+extern uint32_t g_tex_state_version;
 extern bool g_hud_target;  // NX_HUD_1080: this draw's target is a 1920x1080 image of a 1280x720 texture (nvn_vk.h)
 extern bool g_low_3d_target;  // NX_LOW_3D: this draw's target is a 720x405 image of a 960x540 texture (nvn_vk.h)
 
@@ -141,6 +142,7 @@ bool draw_slow(uint32_t what);
 struct ResolvedTexture {
     uint64_t texture = 0;  // guest NVNtexture*; 0: nothing behind the binding (the dummy)
     Texture* object = nullptr;
+    GpuImage* gpu_image = nullptr;
     SamplerInfo sampler;
     ViewInfo view;
     VkSampler vk_sampler = VK_NULL_HANDLE;  // sampler_for(sampler, shadow) when the handle cache has it

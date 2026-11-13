@@ -14,12 +14,13 @@ using namespace replay;
 namespace replay {
 uint32_t g_pipeline_state_version = 1;
 uint32_t g_attrib_state_version = 1;
+uint32_t g_tex_state_version = 1;
 }
 
 void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const Targets& targets) {
     State& s = g_state;
     auto blob = [&](size_t size) -> const uint8_t* {
-        return c.blob < list.blobs.size() && list.blobs[c.blob].size() >= size ? list.blobs[c.blob].data() : nullptr;
+        return list.blob_ptr(c.blob, size);
     };
     switch (c.op) {
         case Cmd::SetViewport:
@@ -42,6 +43,7 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 16) {
                 if (s.images[c.i[0]][c.i[1]] != c.a[0]) {
                     s.images[c.i[0]][c.i[1]] = c.a[0];
+                    g_tex_state_version++;
                 }
             }
             break;
@@ -92,8 +94,14 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                                                                             : ld<uint64_t>(c.a[0] + 8 * at);
                 };
                 int slot = c.i[1] + int(k);
-                if (c.mask == 0 && slot >= 0 && slot < 32) s.textures[st][slot] = value(0);
-                if (c.mask == 1 && slot >= 0 && slot < 16) s.images[st][slot] = value(0);
+                if (c.mask == 0 && slot >= 0 && slot < 32) {
+                    uint64_t v0 = value(0);
+                    if (s.textures[st][slot] != v0) s.textures[st][slot] = v0, g_tex_state_version++;
+                }
+                if (c.mask == 1 && slot >= 0 && slot < 16) {
+                    uint64_t v0 = value(0);
+                    if (s.images[st][slot] != v0) s.images[st][slot] = v0, g_tex_state_version++;
+                }
                 if (c.mask == 2 && slot >= 0 && slot < 18) s.uniforms[st][slot] = {value(0), value(1)};
                 if (c.mask == 3 && slot >= 0 && slot < 16) s.storage[st][slot] = {value(0), value(1)};
             }
@@ -101,7 +109,10 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
         }
         case Cmd::BindTexture:
             if (c.i[0] >= 0 && c.i[0] < kStages && c.i[1] >= 0 && c.i[1] < 32) {
-                s.textures[c.i[0]][c.i[1]] = c.a[0];
+                if (s.textures[c.i[0]][c.i[1]] != c.a[0]) {
+                    s.textures[c.i[0]][c.i[1]] = c.a[0];
+                    g_tex_state_version++;
+                }
             }
             break;
         case Cmd::BindVertexBuffer:
@@ -109,8 +120,12 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
                 s.vertex_buffers[c.i[0]] = {c.a[0], c.a[1]};
             }
             break;
-        case Cmd::SetTexturePool: s.texture_pool = c.a[0]; break;
-        case Cmd::SetSamplerPool: s.sampler_pool = c.a[0]; break;
+        case Cmd::SetTexturePool:
+            if (s.texture_pool != c.a[0]) s.texture_pool = c.a[0], g_tex_state_version++;
+            break;
+        case Cmd::SetSamplerPool:
+            if (s.sampler_pool != c.a[0]) s.sampler_pool = c.a[0], g_tex_state_version++;
+            break;
         case Cmd::BindVertexAttribs:
             if (auto* p = blob(c.n * sizeof(VertexAttrib))) {
                 s.attribs.assign(reinterpret_cast<const VertexAttrib*>(p), reinterpret_cast<const VertexAttrib*>(p) + c.n);
@@ -182,18 +197,23 @@ void draw_command(VkCommandBuffer cb, const Cmd& c, const CmdList& list, const T
             static const uint64_t uub_from = uub ? std::strtoull(uub, nullptr, 10) : 0;
             static int uub_n = 0;
             if (uub && g_stats.done >= uub_from && uub_n++ < 1500 && c.blob < list.blobs.size()) {
-                const auto& b = list.blobs[c.blob];
+                const uint8_t* b_ptr = list.blob_ptr(c.blob);
+                const size_t b_sz = list.blob_size(c.blob);
                 float f[8] = {};
-                std::memcpy(f, b.data(), std::min<size_t>(b.size(), sizeof f));
+                if (b_ptr) std::memcpy(f, b_ptr, std::min<size_t>(b_sz, sizeof f));
                 log("uub before draw %llu: buffer %llx size %llu offset %llu data %zu bytes: %g %g %g %g | %g %g %g %g",
                     (unsigned long long)g_stats.done, (unsigned long long)c.a[0], (unsigned long long)c.a[1],
-                    (unsigned long long)off, b.size(), f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+                    (unsigned long long)off, b_sz, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
             }
             if (c.blob < list.blobs.size())
                 if (uint8_t* p = const_cast<uint8_t*>(guest_bytes(c.a[0] + off))) {
-                    std::memcpy(p, list.blobs[c.blob].data(), list.blobs[c.blob].size());
-                    dedup_invalidate(p, list.blobs[c.blob].size());
-                    written_cpu_write(p, list.blobs[c.blob].size());
+                    const uint8_t* b_ptr = list.blob_ptr(c.blob);
+                    const size_t b_sz = list.blob_size(c.blob);
+                    if (b_ptr && b_sz) {
+                        std::memcpy(p, b_ptr, b_sz);
+                        dedup_invalidate(p, b_sz);
+                        written_cpu_write(p, b_sz);
+                    }
                 }
             break;
         }

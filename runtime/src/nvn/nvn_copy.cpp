@@ -124,9 +124,9 @@ uint64_t g_same_image = 0, g_same_overlap = 0;
 void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
     static const bool off = std::getenv("NX_NO_COPY") != nullptr;  // debug: skip texture copies
     if (off) return;
-    if (c.blob >= list.blobs.size() || list.blobs[c.blob].size() != sizeof(CopyInfo)) return;
+    if (c.blob >= list.blobs.size() || list.blob_size(c.blob) != sizeof(CopyInfo)) return;
     CopyInfo info;
-    std::memcpy(&info, list.blobs[c.blob].data(), sizeof info);
+    std::memcpy(&info, list.blob_ptr(c.blob, sizeof(CopyInfo)), sizeof info);
     GpuImage* src = ensure_contents(cb, c.a[0]);
     GpuImage* dst = ensure_contents(cb, c.a[1]);
     if (!src || !dst) return;
@@ -225,9 +225,9 @@ void replay_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
 }
 
 void replay_buffer_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
-    if (c.blob >= list.blobs.size() || list.blobs[c.blob].size() != sizeof(BufferCopyInfo)) return;
+    if (c.blob >= list.blobs.size() || list.blob_size(c.blob) != sizeof(BufferCopyInfo)) return;
     BufferCopyInfo info;
-    std::memcpy(&info, list.blobs[c.blob].data(), sizeof info);
+    std::memcpy(&info, list.blob_ptr(c.blob, sizeof(BufferCopyInfo)), sizeof info);
     static uint64_t copies = 0, failed = 0;
     Texture* t = get<Texture>(c.a[1]);
     const uint8_t* src = replay::guest_bytes(c.a[0]);
@@ -248,9 +248,9 @@ void replay_buffer_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
 }
 
 void replay_clear_texture(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
-    if (c.blob >= list.blobs.size() || list.blobs[c.blob].size() != sizeof(ClearTextureInfo)) return;
+    if (c.blob >= list.blobs.size() || list.blob_size(c.blob) != sizeof(ClearTextureInfo)) return;
     ClearTextureInfo info;
-    std::memcpy(&info, list.blobs[c.blob].data(), sizeof info);
+    std::memcpy(&info, list.blob_ptr(c.blob, sizeof(ClearTextureInfo)), sizeof info);
     Texture* t = get<Texture>(c.a[0]);
     GpuImage* img = t ? fill_target(cb, c.a[0]) : nullptr;
     if (!img) return;

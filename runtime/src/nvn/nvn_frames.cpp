@@ -493,7 +493,9 @@ size_t frame_plan_split(const std::vector<std::shared_ptr<CmdList>>& lists) {
     g_plan_dispatches = g_seen_dispatches = 0;
     g_chunking = g_chunk_draws && g_current, g_chunk_from = UINT64_MAX;  // not with the profile (not called then)
     // NX_COMPUTE_SEPARATE's write-backs are not counted by written_bind_count(): such a submit is waited for whole.
-    if (!pipelined() || off || !g_current || replay::written_separate()) return SIZE_MAX;
+    // When exp_no_write_backs() is active, s.write_backs is always cleared, so splitting after the last dispatch is
+    // pure overhead (extra vkQueueSubmit + command buffer state reset).
+    if (!pipelined() || off || exp_no_write_backs() || !g_current || replay::written_separate()) return SIZE_MAX;
     size_t last = SIZE_MAX;
     for (size_t k = 0; k < lists.size(); k++)
         if (uint32_t n = count_dispatches(*lists[k], 0)) g_plan_dispatches += n, last = k;
@@ -526,7 +528,7 @@ VkCommandBuffer frame_chunk(VkCommandBuffer cb, uint64_t draws, bool pass_open) 
     // Default to only splitting at natural render pass boundaries unless
     // NX_CHUNK_IN_PASS=1 is explicitly set.
     static const bool in_pass = std::getenv("NX_CHUNK_IN_PASS") && env_int("NX_CHUNK_IN_PASS") > 0;
-    if (since < g_chunk_draws || (pass_open && (!in_pass || since < 2 * g_chunk_draws))) return cb;
+    if (since < g_chunk_draws || (pass_open && !in_pass)) return cb;
     g_stats.chunks++;
     return next_part(*s);
 }

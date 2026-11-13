@@ -621,12 +621,13 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     };
     // The written ranges first (nvn_written.cpp): two bindings of one dispatch that meet get one copy, and bindings
     // that read what the dispatch writes see it, as on the GPU.
-    for (const ShaderInfo* s : shaders) {
-        if (s->stage != ShaderStage::Compute) continue;
+    if (shaders.size() == 1 && shaders[0]->stage == ShaderStage::Compute) {
+        const ShaderInfo* s = shaders[0];
         for (const DescriptorBinding& b : s->refl.bindings) {
+            if (b.set >= 2) break;
             const uint8_t* p;
             uint64_t size;
-            if (b.set < 2 && b.nvn.source == NvnSource::StorageBuffer && storage(s, b, api_stage(s->stage), p, size) &&
+            if (b.nvn.source == NvnSource::StorageBuffer && storage(s, b, 5, p, size) &&
                 p && size && !written_separate())
                 written_bind(cb, p, size, std::max<uint64_t>((size + 15) & ~15ull, pad_min(0x10000)));
         }
@@ -634,7 +635,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     for (const ShaderInfo* s : shaders) {
         int st = api_stage(s->stage);
         for (const DescriptorBinding& b : s->refl.bindings) {
-            if (b.set >= 2) continue;
+            if (b.set >= 2) break;  // bindings are sorted by (set, binding)
             VkDescriptorBufferInfo info{};
             switch (b.nvn.source) {
                 case NvnSource::SupportBuffer: info = support(); break;
@@ -753,7 +754,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
             auto [s, b] = t.bindings[k];
             ResolvedTexture& r = g_textures.resolved[k];
             VkDescriptorImageInfo ii{};
-            GpuImage* cur = set2_reuse_on() && r.texture ? image_of(r.texture) : nullptr;
+            GpuImage* cur = set2_reuse_on() && r.texture ? (r.gpu_image ? r.gpu_image : image_of(r.texture)) : nullptr;
             const VkImageLayout want_now = cur ? (cur->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                                                : VK_IMAGE_LAYOUT_UNDEFINED;
             if (cur && r.ready_cached && r.vk_view != VK_NULL_HANDLE && r.vk_image == cur->image &&
@@ -765,7 +766,8 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                 ii.imageView = r.texture ? sampled_view(cb, r.texture, b->image, &r.view, &ii.imageLayout)
                                          : dummy_view(cb, b->image);
                 if (r.ready_cached && r.texture) {
-                    GpuImage* made = image_of(r.texture);
+                    GpuImage* made = r.gpu_image ? r.gpu_image : image_of(r.texture);
+                    r.gpu_image = made;
                     r.vk_view = made ? ii.imageView : VK_NULL_HANDLE;
                     r.vk_image = made ? made->image : VK_NULL_HANDLE;
                     r.vk_layout = ii.imageLayout;
@@ -906,6 +908,11 @@ static thread_local uint32_t s_cached_need_break = 0;
 static thread_local bool s_cached_biased = false;
 static thread_local uint64_t s_cached_tex_pool = 0;
 static thread_local uint64_t s_cached_smp_pool = 0;
+static thread_local bool s_cached_has_uniform_handle = false;
+static thread_local bool s_cached_all_fast_ready = false;
+static thread_local uint32_t s_cached_tex_version = 0;
+static thread_local uint64_t s_cached_pass_serial = UINT64_MAX;
+static thread_local uint32_t s_cached_pass_written = UINT32_MAX;
 
 // Set 2 reuse, cached image views and the fast readiness check are opt-in (NX_SET2_REUSE=1): they showed flickering
 // black and missing textures when a texture's image or view changed behind an unchanged handle.
@@ -922,15 +929,32 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
 
     const bool shaders_same = (n_sh == s_cached_sh_count && sh0 == s_cached_sh0 && sh1 == s_cached_sh1 && s_cached_sh_count > 0);
     const bool pools_same = (g_state.texture_pool == s_cached_tex_pool && g_state.sampler_pool == s_cached_smp_pool);
+    const bool biased_changed = (biased != s_cached_biased);
+    const uint64_t pass_ser = current_pass_serial();
+    const uint32_t pass_wrt = current_pass_written();
+
+    if (shaders_same && pools_same && !biased_changed && reuse && !draw_slow(kSlowScratch) &&
+        !s_cached_has_uniform_handle && s_cached_all_fast_ready &&
+        g_tex_state_version == s_cached_tex_version &&
+        pass_ser == s_cached_pass_serial && pass_wrt == s_cached_pass_written) {
+        t.set2_unchanged = true;
+        return 0;
+    }
+
     s_cached_tex_pool = g_state.texture_pool;
     s_cached_smp_pool = g_state.sampler_pool;
+    s_cached_biased = biased;
 
     if (!shaders_same || draw_slow(kSlowScratch)) {
         t.bindings.clear();
         s_cached_need_break = 0;
+        s_cached_has_uniform_handle = false;
         for (const ShaderInfo* s : shaders)
             for (const DescriptorBinding& b : s->refl.bindings) {
-                if (b.set == 2) t.bindings.push_back({s, &b});
+                if (b.set == 2) {
+                    t.bindings.push_back({s, &b});
+                    if (b.nvn.source == NvnSource::HandleInUniform) s_cached_has_uniform_handle = true;
+                }
                 if (b.set == 3) s_cached_need_break |= kNeedBreak;  // storage images change layout
             }
         s_cached_sh0 = sh0;
@@ -942,9 +966,8 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
 
     uint32_t out = s_cached_need_break;
     const uint64_t submit_ns = submit_start_ns();
-    const bool biased_changed = (biased != s_cached_biased);
-    s_cached_biased = biased;
     bool any_changed = !shaders_same || !pools_same || biased_changed;
+    bool all_fast_ready = (out == 0);
 
     for (size_t k = 0; k < t.bindings.size(); k++) {
         auto [s, b] = t.bindings[k];
@@ -990,12 +1013,13 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
             }
             r.texture = texture;
             r.object = obj;
+            r.gpu_image = obj ? obj->image.get() : nullptr;
             r.vk_view = VK_NULL_HANDLE;
             r.ready_cached = false;
         }
 
         if (r.texture) {
-            Texture* tx = reuse ? get<Texture>(r.texture) : nullptr;  // looked up, never a kept pointer
+            Texture* tx = reuse ? (r.object ? r.object : get<Texture>(r.texture)) : nullptr;
             GpuImage* img = tx ? tx->image.get() : nullptr;
             bool fast_ready = false;
             if (tx && img && !tx->stride) {
@@ -1008,30 +1032,39 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
                 out |= kNeedBreak;
                 r.ready_cached = false;
                 any_changed = true;
+                all_fast_ready = false;
             } else {
                 r.ready_cached = true;
+                if (!fast_ready) all_fast_ready = false;
             }
             if (!img) img = image_of(r.texture);
+            r.gpu_image = img;
             // Sampling one of the open pass's targets (a depth buffer read back by the character lighting) needs what
             // was rendered stored first: a fresh pass. SetRenderTargets used to end every pass, which did this by chance
             // (docs/nvn/DEBUG.md #35). Only when a draw of this pass wrote it (pass_wrote, nvn_draw.cpp).
             // These need sampled_view's transition (and pending clear) in build_sets: never the cached view.
-            if (pass_wrote(img)) out |= kNeedBreak, any_changed = true, r.ready_cached = false;
-            if (clears_pending_image(img)) out |= kNeedBreak | kSampledPending, any_changed = true, r.ready_cached = false;
+            if (pass_wrote(img)) out |= kNeedBreak, any_changed = true, r.ready_cached = false, all_fast_ready = false;
+            if (clears_pending_image(img)) out |= kNeedBreak | kSampledPending, any_changed = true, r.ready_cached = false, all_fast_ready = false;
             if (img) {
                 VkImageLayout want_layout = img->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 if (r.vk_view == VK_NULL_HANDLE || r.vk_layout != want_layout || r.vk_image != img->image) {
                     any_changed = true;
+                    all_fast_ready = false;
                     if (r.vk_image != img->image) r.vk_view = VK_NULL_HANDLE;
                 }
             }
         } else {
-            if (!dummy_ready(b->image)) out |= kNeedBreak, any_changed = true;
+            if (!dummy_ready(b->image)) out |= kNeedBreak, any_changed = true, all_fast_ready = false;
             r.ready_cached = false;
+            all_fast_ready = false;
         }
     }
     if (any_changed) t.serial++;
     t.set2_unchanged = reuse && !any_changed && !(out & (kNeedBreak | kSampledPending));
+    s_cached_all_fast_ready = all_fast_ready && t.set2_unchanged;
+    s_cached_tex_version = g_tex_state_version;
+    s_cached_pass_serial = pass_ser;
+    s_cached_pass_written = pass_wrt;
     return out;
 }
 
@@ -1138,6 +1171,9 @@ void sets_begin_submit() {
     s_cached_need_break = 0;
     s_cached_tex_pool = 0;
     s_cached_smp_pool = 0;
+    s_cached_all_fast_ready = false;
+    s_cached_pass_serial = UINT64_MAX;
+    s_cached_pass_written = UINT32_MAX;
     s_last_set2 = VK_NULL_HANDLE;
     s_last_set2_layout = VK_NULL_HANDLE;
     s_last_set2_gen = 0;

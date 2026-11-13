@@ -393,12 +393,22 @@ void dispatch(VkCommandBuffer cb, const Cmd& c) {
     if (!gpu_args && (!x || !y || !z)) return;
     trace_compute_once(cs, x, y, z);  // 0, 0, 0 for GPU arguments
     trace_nan_dispatch(cs);
-    std::vector<const ShaderInfo*> stages{cs};
-    const ProgramLayout& layout = program_layout(stages);
-    VkPipeline pipeline = compute_pipeline(cs, layout);
+    static thread_local std::vector<const ShaderInfo*> stages(1);
+    static thread_local const ShaderInfo* s_last_cs = nullptr;
+    static thread_local const ProgramLayout* s_last_cs_layout = nullptr;
+    static thread_local VkPipeline s_last_cs_pipe = VK_NULL_HANDLE;
+    stages[0] = cs;
+    if (cs != s_last_cs || !s_last_cs_layout || !s_last_cs_pipe) {
+        s_last_cs = cs;
+        s_last_cs_layout = &program_layout(stages);
+        s_last_cs_pipe = compute_pipeline(cs, *s_last_cs_layout);
+    }
+    const ProgramLayout& layout = *s_last_cs_layout;
+    VkPipeline pipeline = s_last_cs_pipe;
     if (!pipeline) return;
-    draw_end_rendering(cb, 2);
-    gather_textures(stages);
+    pass_end_only(cb, 2);
+    uint32_t gathered = gather_textures(stages);
+    if (gathered & kSampledPending) clears_flush_reason(2), clears_flush(cb);
     build_sets(cb, stages, layout);
     if (pipeline != g_last_compute_pipeline) {
         p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
@@ -432,6 +442,8 @@ void vertex_read_barrier(VkCommandBuffer cb, const ShaderInfo* vs) {
     g_vertex_pending = false, g_vertex_barriers++, g_vertex_visible_at = g_pass_serial;
 }
 
+}  // namespace
+
 // NX_SHADOWS=0 (the launcher's "Sombras: desactivadas"): no draws into shadow maps, the square depth-only targets of
 // 512 or more (P5R: 2048 and 1024, D32). Their clears stay: the maps say "lit" everywhere.
 bool shadow_draw_skipped(const Targets& t) {
@@ -454,6 +466,11 @@ bool bloom_draw_skipped(const Targets& t) {
     if (t.color_count > 0 && t.views.level[0] > 0) return true;
     return false;
 }
+
+uint64_t current_pass_serial() { return g_pass_serial; }
+uint32_t current_pass_written() { return g_pass_written; }
+
+namespace {
 
 // Live experiments while playing (debugging HUD glitches without a restart): a file named live_flags in the data
 // folder holds words, read about once a second while it exists (removing it turns them off). ui_always: draws into a

@@ -24,6 +24,7 @@ namespace {
 struct Entry {
     uint64_t size = 0, padded = 0;
     Upload upload;
+    const uint8_t* max_end = nullptr;
 };
 // By host address; several sizes of one address are rare, so the latest one is kept.
 std::map<const uint8_t*, Entry> g_copies;
@@ -106,24 +107,33 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
         return e->upload;
     }
     frame_guest_read(p, size);  // deferred write-backs over these bytes land first (nvn_frames.cpp)
-    Upload u;
-    if (g_upload_kind != kUploadOther && cache_upload(p, size, padded, align, u)) {  // nvn_buffer_cache.cpp
-        g_copies[p] = {size, padded, u};
-        f = {p, g_generation, {size, padded, u}};
+    auto record_entry = [&](const Upload& u) {
+        Entry ent{size, padded, u, p + size};
+        auto [it, inserted] = g_copies.insert_or_assign(p, ent);
+        const uint8_t* me = p + size;
+        if (it != g_copies.begin()) {
+            const uint8_t* prev_me = std::prev(it)->second.max_end;
+            if (prev_me > me) me = prev_me;
+        }
+        it->second.max_end = me;
+        for (auto nxt = std::next(it); nxt != g_copies.end() && nxt->second.max_end < me; ++nxt) {
+            nxt->second.max_end = me;
+        }
+        f = {p, g_generation, it->second};
         s_last_dedup_p = p;
         s_last_dedup_gen = g_generation;
-        s_last_dedup_entry = {size, padded, u};
+        s_last_dedup_entry = it->second;
+    };
+    Upload u;
+    if (g_upload_kind != kUploadOther && cache_upload(p, size, padded, align, u)) {  // nvn_buffer_cache.cpp
+        record_entry(u);
         return u;
     }
     u = upload_alloc(padded, align);
     plat::fast_memcpy(u.ptr, p, size);
     if (padded > size) std::memset(u.ptr + size, 0, padded - size);
     if (upload_stats_on()) count_copy(p, size);
-    g_copies[p] = {size, padded, u};
-    f = {p, g_generation, {size, padded, u}};
-    s_last_dedup_p = p;
-    s_last_dedup_gen = g_generation;
-    s_last_dedup_entry = {size, padded, u};
+    record_entry(u);
     g_copied += padded;
     return u;
 }
@@ -142,14 +152,12 @@ void dedup_invalidate(const uint8_t* p, uint64_t size) {
     index_cache_invalidate(p, size);
     sets_invalidate_range(p, size);
     s_last_dedup_p = nullptr;
-    // Entries starting before p may still reach into it: look back over the few that can.
+    // Entries starting before p may still reach into it: augmented max_end stops at the first non-reaching prefix.
     auto it = g_copies.lower_bound(p + size);
     while (it != g_copies.begin()) {
         --it;
-        if (it->first + it->second.size <= p) {
-            if (p - it->first > (64ll << 20)) break;  // nothing larger than 64 MB is copied
-            continue;
-        }
+        if (it->second.max_end <= p) break;
+        if (it->first + it->second.size <= p) continue;
         if (Front& f = front_of(it->first); f.p == it->first) f.generation = 0;
         it = g_copies.erase(it);
     }

@@ -256,7 +256,12 @@ uint32_t clears_apply(const Targets& t, VkRenderingAttachmentInfo* colors, VkRen
                       VkRenderingAttachmentInfo& stencil);
 void clears_flush(VkCommandBuffer cb);  // outside a pass: the pending clears in a pass of their own
 void clears_flush_other(VkCommandBuffer cb, const Targets& t);  // before a pass on t (NX_CLEARS_V2)
-bool clears_keep_pending();  // NX_CLEARS_V2
+void clears_flush_image(VkCommandBuffer cb, uint64_t guest_texture);  // before a copy/transfer touching guest_texture
+bool clears_keep_pending();
+bool shadow_draw_skipped(const Targets& t);
+bool bloom_draw_skipped(const Targets& t);
+uint64_t current_pass_serial();
+uint32_t current_pass_written();  // NX_CLEARS_V2
 void clears_begin_submit();
 void clears_log();
 bool pass_open();
