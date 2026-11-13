@@ -190,10 +190,12 @@ HandleSlot* handle_slot(uint64_t handle) {
             return &s;
         }
         s = HandleSlot{};
-        s.generation = g_handle_generation, s.handle = handle, s.texture_pool = tp, s.sampler_pool = sp;
+        s.handle = handle, s.texture_pool = tp, s.sampler_pool = sp;
         lookup_handle(handle, s.texture, s.sampler, &s.view, &s.has_sampler);
         s.object = s.texture ? get<Texture>(s.texture) : nullptr;
-        g_handle_used++, g_handle_misses++;
+        s.generation = s.object ? g_handle_generation : 0;
+        if (s.object) g_handle_used++;
+        g_handle_misses++;
         return &s;
     }
 }
@@ -1197,12 +1199,24 @@ void sets_begin_submit() {
     std::memset(s_ssbo_cache, 0, sizeof s_ssbo_cache);
     s_support_cache.gen = 0;
     s_const_data_cache[0].gen = s_const_data_cache[1].gen = 0;
-    handles_reset();
-    g_handle_mark = t_replay_mark;
-    g_handle_epoch = current_epoch();
+    uint64_t mark = t_replay_mark, epoch = current_epoch();
+    if (!mark || mark != g_handle_mark || epoch != g_handle_epoch || g_handle_used > kHandleSlots / 2) {
+        handles_reset();
+        g_handle_mark = mark;
+        g_handle_epoch = epoch;
+    }
     sets_invalidate_bound();
-    if (g_set_arena.capacity() < 65536) g_set_arena.reserve(65536);
-    g_set_generation++, g_set_used = 0, g_set_arena.clear();
+    static uint64_t s_last_vf_serial = 0;
+    static uint64_t s_last_desc_epoch = 0;
+    const uint64_t vf_ser = view_forget_serial();
+    const bool force_rotate = (vf_ser != s_last_vf_serial) || (g_set_used >= kSetSlots / 2);
+    const uint64_t desc_epoch = frame_descriptor_epoch(force_rotate);
+    if (desc_epoch != s_last_desc_epoch) {
+        if (g_set_arena.capacity() < 65536) g_set_arena.reserve(65536);
+        g_set_generation++, g_set_used = 0, g_set_arena.clear();
+        s_last_desc_epoch = desc_epoch;
+        s_last_vf_serial = vf_ser;
+    }
     g_support_used = g_constants_used = 0;
 }
 

@@ -35,7 +35,7 @@ constexpr uint64_t kBlock = 16ull << 20;  // bytes per memory block
 constexpr uint64_t kAlign = 256;          // every copy: the largest buffer offset alignment Vulkan allows
 constexpr uint64_t kMaxCopy = 4ull << 20; // larger ranges stay in the ring (one copy per submit)
 constexpr uint64_t kStaleSubmits = 3600;  // keep resident across camera turns (~1200 frames)
-constexpr uint32_t kStableSeen = 2;       // the same bytes this many times in a row before they get a copy here
+constexpr uint32_t kStableSeen = 4;       // survive across a 3-submit frame boundary before entering g_entries
 constexpr uint64_t kSeenGap = 24;         // tolerate temporary frustum-cull intervals (~8 frames)
 constexpr uint32_t kClasses = 15;         // copy sizes 256 B << class, up to 4 MB
 
@@ -210,10 +210,10 @@ void cache_begin_submit() {
 
 bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
     if (!on() || !p || !size || padded > kMaxCopy || align > kAlign) return false;
-    // Small per-draw uniform/storage blocks (< 4 KB) come from P5R's dynamic ring buffer:
+    // Small per-draw uniform/storage blocks (<= 4 KB) come from P5R's dynamic ring buffer:
     // intra-submit repeats are already handled in O(1) by dedup_upload (g_front), while
     // probing g_entries + g_seen across submits caused 1.46M "not stable" map lookups/600f.
-    if (g_upload_kind == kUploadBlock && size < 4096) return false;
+    if (g_upload_kind == kUploadBlock && size <= 4096) return false;
 
     static const bool time_hash = std::getenv("NX_BUFFER_CACHE_STATS") != nullptr;
 
@@ -271,6 +271,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     // Not cached: check if this buffer changes frequently (volatile dynamic uniform/constant blocks)
     Seen& seen = g_seen[p];
     if (seen.skip_until > g_submits) {
+        seen.submit = g_submits;
         g_stats_cache.unstable++;
         return false;  // Bypass hashing entirely for volatile dynamic buffers
     }
@@ -288,8 +289,9 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
         seen.count = 1;
         seen.unstable_streak++;
         if (seen.unstable_streak >= 2) {
-            // Unstable across consecutive checks: back off for 30 submits (~10 frames)
-            seen.skip_until = g_submits + 30;
+            // Progressive backoff up to 480 submits (~160 frames) for volatile dynamic buffers
+            const uint32_t shift = std::min<uint32_t>(seen.unstable_streak - 2, 4);
+            seen.skip_until = g_submits + (30ull << shift);
         }
     }
     seen.size = size, seen.hash = h, seen.submit = g_submits;

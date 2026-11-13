@@ -185,6 +185,7 @@ uint64_t frame_ring_size();  // the slots' upload ring (0: synchronous submits, 
 uint64_t frame_completed();  // the serial of the last retired submit (for free_retired_images)
 Upload frame_upload_alloc(uint64_t size, uint64_t align);
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);
+uint64_t frame_descriptor_epoch(bool force_rotate = false);
 // Pipelined: a submit with dispatches is split after the last one; its first part is queued at once and carries the
 // write-backs. frame_plan_split counts the submit's DispatchCompute commands and returns the last top-level list that
 // has one (SIZE_MAX: no split). frame_split ends the first part and returns the command buffer of the rest (once per
