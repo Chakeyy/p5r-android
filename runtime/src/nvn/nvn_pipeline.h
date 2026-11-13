@@ -155,6 +155,7 @@ VkImageView attachment_view(GpuImage& img, uint32_t level, uint32_t layer, VkFor
 VkFormat view_format(const GpuImage& img, uint32_t nvn);
 // Destroys the cached views of an image about to be freed.
 void forget_image_views(const GpuImage& img);
+uint64_t view_forget_serial();
 // True when sampled_view() would need no transfer or layout change (it can then be called inside a render pass).
 bool sampled_ready(uint64_t texture);
 void pipeline_begin_submit();  // per-submit state (the content checks of pitch-linear textures)

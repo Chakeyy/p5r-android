@@ -149,6 +149,7 @@ struct ResolvedTexture {
     VkImageView vk_view = VK_NULL_HANDLE;
     VkImage vk_image = VK_NULL_HANDLE;  // the image vk_view was made for: a texture given a new image drops the view
     VkImageLayout vk_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    uint64_t vk_view_serial = 0;
     bool ready_cached = false;
 };
 struct DrawTextures {

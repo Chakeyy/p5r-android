@@ -63,15 +63,31 @@ struct Seen {
 std::unordered_map<const uint8_t*, Seen> g_seen;
 
 struct Entry {
-    uint64_t size = 0, padded = 0, hash = 0;
+    uint64_t size = 0, padded = 0, hash = 0, sample_hash = 0;
     uint32_t block = 0;
     uint64_t offset = 0;
     uint32_t size_class = 0;  // the allocation: one slot of that class
+    uint32_t verified_streak = 0;
     uint64_t serial = 0;             // the last submit that bound it (frees wait for it to retire)
     uint64_t seen = 0;               // g_submits then (copies unbound for kStaleSubmits are freed)
     uint64_t last_verified_submit = 0;  // the last submit that hashed guest memory
 };
 std::unordered_map<const uint8_t*, Entry> g_entries;
+
+uint64_t fast_sample_hash(const uint8_t* p, uint64_t size) {
+    if (size <= 4096) {
+        uint64_t h = hash_memory(p, size);
+        for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+        return h;
+    }
+    constexpr uint64_t kChunk = 128;
+    const uint64_t mid = (size / 2) & ~7ull;
+    const uint64_t tail = (size - kChunk) & ~7ull;
+    uint64_t h = hash_memory(p, kChunk);
+    h ^= hash_memory(p + mid, kChunk) * 0x9E3779B97F4A7C15ull;
+    h ^= hash_memory(p + tail, size - tail) * 0xC2B2AE3D27D4EB4Full;
+    return h;
+}
 
 struct Retired {
     uint64_t serial;
@@ -219,11 +235,21 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
         }
 
         const uint64_t t0 = time_hash ? plat::monotonic_ns() : 0;
-        uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
-        for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+        const bool can_sample = (size > 4096 && (g_upload_kind == kUploadVertex || g_upload_kind == kUploadIndex) &&
+                                 e.verified_streak >= 6 && ((g_submits + (uintptr_t(p) >> 8)) & 15) != 0);
+        bool match = false;
+        if (can_sample) {
+            uint64_t sh = fast_sample_hash(p, size);
+            match = (e.size == size && e.padded == padded && e.sample_hash == sh);
+        } else {
+            uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
+            for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+            match = (e.size == size && e.padded == padded && e.hash == h);
+            if (match && e.verified_streak < 1000) e.verified_streak++;
+        }
         if (time_hash) g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
 
-        if (e.size == size && e.padded == padded && e.hash == h) {
+        if (match) {
             e.last_verified_submit = g_submits;
             // NX_BUFFER_CACHE_VERIFY=1: every hit compared with the guest bytes (slow: the copy is uncached memory).
             static const bool verify = std::getenv("NX_BUFFER_CACHE_VERIFY") != nullptr;
@@ -283,7 +309,8 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     frame_guest_read(p, size);
     plat::fast_memcpy(dst, p, size);
     if (padded > size) std::memset(dst + size, 0, padded - size);
-    g_entries[p] = {size, padded, h, slot.block, slot.offset, c, serial, g_submits, g_submits};
+    const uint64_t sh = size > 4096 ? fast_sample_hash(p, size) : h;
+    g_entries[p] = {size, padded, h, sh, slot.block, slot.offset, c, 1, serial, g_submits, g_submits};
     g_stats_cache.misses++, g_stats_cache.miss_bytes += padded;
     out = {g_blocks[slot.block].buffer, slot.offset, dst};
     return true;

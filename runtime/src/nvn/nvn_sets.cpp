@@ -360,11 +360,14 @@ uint64_t handle_bits(H h) {
 }
 
 static bool set2_reuse_on() {
-    static const bool v = [] {
+    static int s_state = -1;
+    int st = s_state;
+    if (__builtin_expect(st < 0, 0)) {
         const char* e = std::getenv("NX_SET2_REUSE");
-        return e && e[0] == '1';
-    }();
-    return v;
+        st = (e && e[0] == '0') ? 0 : 1;
+        s_state = st;
+    }
+    return st != 0;
 }
 
 static thread_local VkDescriptorSetLayout s_last_set2_layout = VK_NULL_HANDLE;
@@ -750,6 +753,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
         s_last_set2_serial == t.serial && !draw_slow(kSlowScratch)) {
         d.sets[2] = s_last_set2;
     } else {
+        const uint64_t vf_ser = view_forget_serial();
         for (size_t k = 0; k < t.bindings.size(); k++) {
             auto [s, b] = t.bindings[k];
             ResolvedTexture& r = g_textures.resolved[k];
@@ -758,19 +762,26 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
             const VkImageLayout want_now = cur ? (cur->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                                                : VK_IMAGE_LAYOUT_UNDEFINED;
             if (cur && r.ready_cached && r.vk_view != VK_NULL_HANDLE && r.vk_image == cur->image &&
-                cur->layout == want_now) {
+                r.vk_view_serial == vf_ser && cur->layout == want_now) {
                 ii.imageView = r.vk_view;
-                ii.imageLayout = cur->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                ii.imageLayout = want_now;
             } else {
                 ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 ii.imageView = r.texture ? sampled_view(cb, r.texture, b->image, &r.view, &ii.imageLayout)
                                          : dummy_view(cb, b->image);
-                if (r.ready_cached && r.texture) {
+                if (r.texture) {
                     GpuImage* made = r.gpu_image ? r.gpu_image : image_of(r.texture);
                     r.gpu_image = made;
-                    r.vk_view = made ? ii.imageView : VK_NULL_HANDLE;
-                    r.vk_image = made ? made->image : VK_NULL_HANDLE;
-                    r.vk_layout = ii.imageLayout;
+                    if (made && ii.imageView != VK_NULL_HANDLE) {
+                        r.vk_view = ii.imageView;
+                        r.vk_image = made->image;
+                        r.vk_layout = ii.imageLayout;
+                        r.vk_view_serial = view_forget_serial();
+                        r.ready_cached = true;
+                    } else {
+                        r.vk_view = VK_NULL_HANDLE;
+                        r.ready_cached = false;
+                    }
                 }
             }
             ii.sampler = r.vk_sampler ? r.vk_sampler : sampler_for(r.sampler, b->image.depth, g_state.depth.depth_test);
@@ -913,9 +924,9 @@ static thread_local bool s_cached_all_fast_ready = false;
 static thread_local uint32_t s_cached_tex_version = 0;
 static thread_local uint64_t s_cached_pass_serial = UINT64_MAX;
 static thread_local uint32_t s_cached_pass_written = UINT32_MAX;
+static thread_local uint64_t s_cached_vf_serial = 0;
 
-// Set 2 reuse, cached image views and the fast readiness check are opt-in (NX_SET2_REUSE=1): they showed flickering
-// black and missing textures when a texture's image or view changed behind an unchanged handle.
+// Set 2 reuse, cached image views and the fast readiness check (NX_SET2_REUSE=0 disables).
 uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
     DrawTextures& t = g_textures;
     const bool reuse = set2_reuse_on();
@@ -932,11 +943,13 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
     const bool biased_changed = (biased != s_cached_biased);
     const uint64_t pass_ser = current_pass_serial();
     const uint32_t pass_wrt = current_pass_written();
+    const uint64_t vf_ser = view_forget_serial();
 
     if (shaders_same && pools_same && !biased_changed && reuse && !draw_slow(kSlowScratch) &&
-        !s_cached_has_uniform_handle && s_cached_all_fast_ready &&
+        !s_cached_has_uniform_handle && s_cached_all_fast_ready && pass_open() &&
         g_tex_state_version == s_cached_tex_version &&
-        pass_ser == s_cached_pass_serial && pass_wrt == s_cached_pass_written) {
+        pass_ser == s_cached_pass_serial && pass_wrt == s_cached_pass_written &&
+        vf_ser == s_cached_vf_serial) {
         t.set2_unchanged = true;
         return 0;
     }
@@ -1047,10 +1060,11 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
             if (clears_pending_image(img)) out |= kNeedBreak | kSampledPending, any_changed = true, r.ready_cached = false, all_fast_ready = false;
             if (img) {
                 VkImageLayout want_layout = img->rendered ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                if (r.vk_view == VK_NULL_HANDLE || r.vk_layout != want_layout || r.vk_image != img->image) {
+                if (r.vk_view == VK_NULL_HANDLE || r.vk_layout != want_layout || r.vk_image != img->image ||
+                    r.vk_view_serial != vf_ser) {
                     any_changed = true;
                     all_fast_ready = false;
-                    if (r.vk_image != img->image) r.vk_view = VK_NULL_HANDLE;
+                    if (r.vk_image != img->image || r.vk_view_serial != vf_ser) r.vk_view = VK_NULL_HANDLE;
                 }
             }
         } else {
@@ -1065,6 +1079,7 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
     s_cached_tex_version = g_tex_state_version;
     s_cached_pass_serial = pass_ser;
     s_cached_pass_written = pass_wrt;
+    s_cached_vf_serial = vf_ser;
     return out;
 }
 
@@ -1182,12 +1197,9 @@ void sets_begin_submit() {
     std::memset(s_ssbo_cache, 0, sizeof s_ssbo_cache);
     s_support_cache.gen = 0;
     s_const_data_cache[0].gen = s_const_data_cache[1].gen = 0;
-    uint64_t mark = t_replay_mark, epoch = current_epoch();
-    if (!mark || mark != g_handle_mark || epoch != g_handle_epoch || g_handle_used > kHandleSlots / 2) {
-        handles_reset();
-        g_handle_mark = mark;
-        g_handle_epoch = epoch;
-    }
+    handles_reset();
+    g_handle_mark = t_replay_mark;
+    g_handle_epoch = current_epoch();
     sets_invalidate_bound();
     if (g_set_arena.capacity() < 65536) g_set_arena.reserve(65536);
     g_set_generation++, g_set_used = 0, g_set_arena.clear();

@@ -1269,7 +1269,11 @@ VkImageView storage_view(VkCommandBuffer cb, uint64_t texture, const ImageShape&
     return d.view;
 }
 
+static uint64_t g_view_forget_serial = 1;
+uint64_t view_forget_serial() { return g_view_forget_serial; }
+
 void forget_image_views(const GpuImage& img) {
+    g_view_forget_serial++;
     // The caches are ordered by image first: its views are one run from the smallest key with that image (this was
     // a scan of every cached view per destroyed texture, a visible share of the replay time).
     auto drop = [&](auto& cache, auto lowest) {
