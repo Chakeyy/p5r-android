@@ -336,6 +336,12 @@ std::vector<SetWrite> g_set_arena;
 uint64_t g_set_generation = 1, g_set_hits = 0, g_set_misses = 0;
 uint32_t g_set_used = 0;
 
+constexpr uint32_t kSet1Slots = 8192;  // separate Set 1 (SSBO) cache so compute skinning ring churn never wipes Set 0 / Set 2
+CachedSet g_set1_cache[kSet1Slots];
+std::vector<SetWrite> g_set1_arena;
+uint64_t g_set1_generation = 1;
+uint32_t g_set1_used = 0;
+
 static inline uint64_t hash_step(uint64_t h, uint64_t v) {
 #if defined(HAS_ARM_CRC32)
     uint32_t lo = __crc32cd(static_cast<uint32_t>(h), v);
@@ -381,7 +387,7 @@ struct LastResolvedSet {
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     uint64_t gen = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
-    std::vector<SetWrite> key;
+    uint32_t arena_at = 0, arena_n = 0;
 };
 static thread_local LastResolvedSet s_last_resolved[4];
 
@@ -476,10 +482,19 @@ void resolve_sets(const ProgramLayout& layout) {
         }
 
         if (d.key.empty()) continue;
+        const bool is_set1 = (k == 1);
+        const uint64_t cur_set_gen = is_set1 ? g_set1_generation : g_set_generation;
+        CachedSet* const cache_table = is_set1 ? g_set1_cache : g_set_cache;
+        const uint32_t cache_mask = (is_set1 ? kSet1Slots : kSetSlots) - 1;
+        const uint32_t cache_limit = (is_set1 ? kSet1Slots : kSetSlots) / 2;
+        uint32_t& cache_used = is_set1 ? g_set1_used : g_set_used;
+        std::vector<SetWrite>& cache_arena = is_set1 ? g_set1_arena : g_set_arena;
+
         LastResolvedSet& last_r = s_last_resolved[k];
-        if (last_r.gen == g_set_generation && last_r.layout == layout.sets[k] &&
-            last_r.set != VK_NULL_HANDLE && last_r.key.size() == d.key.size() &&
-            std::memcmp(last_r.key.data(), d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
+        if (last_r.gen == cur_set_gen && last_r.layout == layout.sets[k] &&
+            last_r.set != VK_NULL_HANDLE && last_r.arena_n == d.key.size() &&
+            last_r.arena_at + last_r.arena_n <= cache_arena.size() &&
+            std::memcmp(&cache_arena[last_r.arena_at], d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
             d.sets[k] = last_r.set;
             g_set_hits++;
             continue;
@@ -492,26 +507,25 @@ void resolve_sets(const ProgramLayout& layout) {
         }
 
         CachedSet* slot = nullptr;
+        uint32_t hit_at = 0, hit_n = 0;
         for (uint32_t probe = uint32_t(h >> 32);; probe++) {
-            CachedSet& c = g_set_cache[probe & (kSetSlots - 1)];
-            if (c.generation != g_set_generation) {
+            CachedSet& c = cache_table[probe & cache_mask];
+            if (c.generation != cur_set_gen) {
                 slot = &c;
                 break;
             }
             if (c.hash == h && c.layout == layout.sets[k] && c.n == d.key.size() &&
-                std::memcmp(&g_set_arena[c.at], d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
-                d.sets[k] = c.set, g_set_hits++;
+                std::memcmp(&cache_arena[c.at], d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
+                d.sets[k] = c.set, hit_at = c.at, hit_n = c.n, g_set_hits++;
                 break;
             }
         }
         if (d.sets[k]) {
-            last_r.gen = g_set_generation;
-            last_r.layout = layout.sets[k];
-            last_r.set = d.sets[k];
-            last_r.key.assign(d.key.begin(), d.key.end());
+            last_r = {layout.sets[k], cur_set_gen, d.sets[k], hit_at, hit_n};
             continue;
         }
-        d.sets[k] = descriptor_set(layout.sets[k]), g_set_misses++;
+        d.sets[k] = is_set1 ? ssbo_descriptor_set(layout.sets[k]) : descriptor_set(layout.sets[k]);
+        g_set_misses++;
 
         if (!overflow) {
             for (uint8_t j = 0; j < set_counts[k]; j++)
@@ -521,16 +535,13 @@ void resolve_sets(const ProgramLayout& layout) {
                 if (d.set_index[i] == k) d.writes[i].dstSet = d.sets[k];
         }
 
-        if (d.sets[k]) {
-            last_r.gen = g_set_generation;
-            last_r.layout = layout.sets[k];
-            last_r.set = d.sets[k];
-            last_r.key.assign(d.key.begin(), d.key.end());
-        }
-        if (!d.sets[k] || g_set_used >= kSetSlots / 2) continue;
-        *slot = {g_set_generation, h, layout.sets[k], uint32_t(g_set_arena.size()), uint32_t(d.key.size()), d.sets[k]};
-        g_set_arena.insert(g_set_arena.end(), d.key.begin(), d.key.end());
-        g_set_used++;
+        if (!d.sets[k] || cache_used >= cache_limit) continue;
+        const uint32_t new_at = uint32_t(cache_arena.size());
+        const uint32_t new_n = uint32_t(d.key.size());
+        *slot = {cur_set_gen, h, layout.sets[k], new_at, new_n, d.sets[k]};
+        cache_arena.insert(cache_arena.end(), d.key.begin(), d.key.end());
+        cache_used++;
+        last_r = {layout.sets[k], cur_set_gen, d.sets[k], new_at, new_n};
     }
     if (d.sets[2] != VK_NULL_HANDLE) {
         s_last_set2 = d.sets[2];
@@ -568,11 +579,14 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
         d.writes.clear(), d.set_index.clear(), d.buffers.clear(), d.images.clear();
     d.dynamic = 0;
     const bool every_set = draw_slow(kSlowEmptySets), shared = !draw_slow(kSlowUploads), cached = set_cache_on();
-    for (int k = 0; k < 4; k++) d.sets[k] = every_set ? descriptor_set(layout.sets[k]) : VK_NULL_HANDLE;
+    auto alloc_set_k = [&](uint32_t k) {
+        return k == 1 ? ssbo_descriptor_set(layout.sets[k]) : descriptor_set(layout.sets[k]);
+    };
+    for (int k = 0; k < 4; k++) d.sets[k] = every_set ? alloc_set_k(uint32_t(k)) : VK_NULL_HANDLE;
     auto set_of = [&](uint32_t k) {  // with the set cache, made (or found) in bind_sets
         d.set_index.push_back(uint8_t(k));
         if (cached) return VkDescriptorSet(VK_NULL_HANDLE);
-        if (!d.sets[k]) d.sets[k] = descriptor_set(layout.sets[k]);
+        if (!d.sets[k]) d.sets[k] = alloc_set_k(k);
         return d.sets[k];
     };
     auto& writes = d.writes;
@@ -1208,6 +1222,7 @@ void sets_begin_submit() {
     sets_invalidate_bound();
     static uint64_t s_last_vf_serial = 0;
     static uint64_t s_last_desc_epoch = 0;
+    static uint64_t s_last_ssbo_epoch = 0;
     const uint64_t vf_ser = view_forget_serial();
     const bool force_rotate = (vf_ser != s_last_vf_serial) || (g_set_used >= kSetSlots / 2);
     const uint64_t desc_epoch = frame_descriptor_epoch(force_rotate);
@@ -1216,6 +1231,13 @@ void sets_begin_submit() {
         g_set_generation++, g_set_used = 0, g_set_arena.clear();
         s_last_desc_epoch = desc_epoch;
         s_last_vf_serial = vf_ser;
+    }
+    const bool force_ssbo_rotate = (g_set1_used >= kSet1Slots / 2);
+    const uint64_t ssbo_epoch = frame_ssbo_descriptor_epoch(force_ssbo_rotate);
+    if (ssbo_epoch != s_last_ssbo_epoch) {
+        if (g_set1_arena.capacity() < 32768) g_set1_arena.reserve(32768);
+        g_set1_generation++, g_set1_used = 0, g_set1_arena.clear();
+        s_last_ssbo_epoch = ssbo_epoch;
     }
     g_support_used = g_constants_used = 0;
 }

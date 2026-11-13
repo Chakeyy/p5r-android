@@ -130,6 +130,7 @@ Upload upload(const void* data, uint64_t size, uint64_t align);
 
 // Descriptor sets for this submit (freed when it completes).
 VkDescriptorSet descriptor_set(VkDescriptorSetLayout layout);
+VkDescriptorSet ssbo_descriptor_set(VkDescriptorSetLayout layout);
 VkDescriptorPool make_descriptor_pool();
 bool descriptor_layout_counts(VkDescriptorSetLayout layout, uint32_t (&by_type)[16]);  // descriptors of a layout, by VkDescriptorType (nvn_pipeline.cpp)
 
@@ -186,6 +187,8 @@ uint64_t frame_completed();  // the serial of the last retired submit (for free_
 Upload frame_upload_alloc(uint64_t size, uint64_t align);
 VkDescriptorSet frame_descriptor_set(VkDescriptorSetLayout layout);
 uint64_t frame_descriptor_epoch(bool force_rotate = false);
+VkDescriptorSet frame_ssbo_descriptor_set(VkDescriptorSetLayout layout);
+uint64_t frame_ssbo_descriptor_epoch(bool force_rotate = false);
 // Pipelined: a submit with dispatches is split after the last one; its first part is queued at once and carries the
 // write-backs. frame_plan_split counts the submit's DispatchCompute commands and returns the last top-level list that
 // has one (SIZE_MAX: no split). frame_split ends the first part and returns the command buffer of the rest (once per

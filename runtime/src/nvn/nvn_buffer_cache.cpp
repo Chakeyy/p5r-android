@@ -62,6 +62,18 @@ struct Seen {
 };
 std::unordered_map<const uint8_t*, Seen> g_seen;
 
+struct UnstableSlot {
+    const uint8_t* p = nullptr;
+    uint64_t skip_until = 0;
+};
+constexpr uint32_t kUnstableSlots = 4096;
+UnstableSlot g_unstable_front[kUnstableSlots];
+
+inline uint32_t unstable_slot_index(const uint8_t* p) {
+    uint64_t v = reinterpret_cast<uintptr_t>(p);
+    return uint32_t(((v >> 4) ^ (v >> 16)) & (kUnstableSlots - 1));
+}
+
 struct Entry {
     uint64_t size = 0, padded = 0, hash = 0, sample_hash = 0;
     uint32_t block = 0;
@@ -204,7 +216,10 @@ void cache_begin_submit() {
     if (++g_submits % 64 == 0) {
         evict_stale();
         for (auto it = g_seen.begin(); it != g_seen.end();)  // candidates not seen lately
-            it = it->second.submit + std::max<uint64_t>(kSeenGap * 2, 64) < g_submits ? g_seen.erase(it) : std::next(it);
+            it = (it->second.skip_until <= g_submits &&
+                  it->second.submit + std::max<uint64_t>(kSeenGap * 2, 64) < g_submits)
+                     ? g_seen.erase(it)
+                     : std::next(it);
     }
 }
 
@@ -214,6 +229,15 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     // intra-submit repeats are already handled in O(1) by dedup_upload (g_front), while
     // probing g_entries + g_seen across submits caused 1.46M "not stable" map lookups/600f.
     if (g_upload_kind == kUploadBlock && size <= 4096) return false;
+
+    const uint32_t u_idx = unstable_slot_index(p);
+    if (g_unstable_front[u_idx].p == p) {
+        if (g_unstable_front[u_idx].skip_until > g_submits) {
+            g_stats_cache.unstable++;
+            return false;
+        }
+        g_unstable_front[u_idx].p = nullptr;
+    }
 
     static const bool time_hash = std::getenv("NX_BUFFER_CACHE_STATS") != nullptr;
 
@@ -292,6 +316,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
             // Progressive backoff up to 480 submits (~160 frames) for volatile dynamic buffers
             const uint32_t shift = std::min<uint32_t>(seen.unstable_streak - 2, 4);
             seen.skip_until = g_submits + (30ull << shift);
+            g_unstable_front[u_idx] = {p, seen.skip_until};
         }
     }
     seen.size = size, seen.hash = h, seen.submit = g_submits;
@@ -306,6 +331,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
         return false;  // the ring then, as before
     }
     g_seen.erase(p);
+    if (g_unstable_front[u_idx].p == p) g_unstable_front[u_idx].p = nullptr;
     g_used += class_bytes(c);
     uint8_t* dst = g_blocks[slot.block].ptr + slot.offset;
     frame_guest_read(p, size);
