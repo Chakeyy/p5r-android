@@ -84,18 +84,6 @@ inline uint32_t page_churn_index(const uint8_t* p) {
     return uint32_t((reinterpret_cast<uintptr_t>(p) >> 16) & (kPageSlots - 1));
 }
 
-inline void record_page_churn(PageChurn& pc) {
-    const uint32_t win = uint32_t(g_submits >> 4);
-    if (pc.last_window != win) {
-        pc.last_window = win;
-        pc.unstable_count = 0;
-    }
-    if (++pc.unstable_count >= 12) {
-        pc.skip_until = g_submits + 90;
-        pc.unstable_count = 0;
-    }
-}
-
 struct UnstableSlot {
     const uint8_t* p = nullptr;
     uint64_t skip_until = 0;
@@ -161,6 +149,18 @@ std::vector<Retired> g_retired;
 uint64_t g_used = 0;     // bytes allocated
 uint64_t g_submits = 0;  // cache_begin_submit calls
 uint64_t g_budget = 0;
+
+inline void record_page_churn(PageChurn& pc) {
+    const uint32_t win = uint32_t(g_submits >> 4);
+    if (pc.last_window != win) {
+        pc.last_window = win;
+        pc.unstable_count = 0;
+    }
+    if (++pc.unstable_count >= 12) {
+        pc.skip_until = g_submits + 90;
+        pc.unstable_count = 0;
+    }
+}
 
 struct {
     uint64_t hits = 0, hit_bytes = 0, misses = 0, miss_bytes = 0, hash_ns = 0, full = 0, evicted = 0, wrong = 0;
