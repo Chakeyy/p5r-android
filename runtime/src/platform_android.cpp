@@ -106,6 +106,9 @@ struct ThreadStart {
 };
 
 static void* thread_entry(void* p) {
+    if (const char* e = getenv("NX_MALLOC_TUNE"); !(e && e[0] == '0')) {
+        mallopt(M_BIONIC_ZERO_INIT, 1);
+    }
     nx::plat::place_fast_cores();
     ThreadStart s = *static_cast<ThreadStart*>(p);
     delete static_cast<ThreadStart*>(p);
@@ -1035,15 +1038,15 @@ extern "C" void android_main(android_app* app) {
     // memset under each allocation and madvise churn (docs/nvn/android-perf/PLAN.md, phase 2). NX_MALLOC_TUNE=0: as
     // the system set it.
     if (const char* e = getenv("NX_MALLOC_TUNE"); !(e && e[0] == '0')) {
-        int zero = mallopt(M_BIONIC_ZERO_INIT, 0), decay = mallopt(M_DECAY_TIME, 1);
+        int zero = mallopt(M_BIONIC_ZERO_INIT, 1), decay = mallopt(M_DECAY_TIME, 1);
 #ifndef M_CACHE_COUNT_MAX
 #define M_CACHE_COUNT_MAX (-200)
 #endif
 #ifndef M_CACHE_SIZE_MAX
 #define M_CACHE_SIZE_MAX (-201)
 #endif
-        int cache_cnt = mallopt(M_CACHE_COUNT_MAX, 64);
-        int cache_sz = mallopt(M_CACHE_SIZE_MAX, 4 << 20);
+        int cache_cnt = mallopt(M_CACHE_COUNT_MAX, 256);
+        int cache_sz = mallopt(M_CACHE_SIZE_MAX, 16 << 20);
         nx::log("heap: zero-fill off (%d), page release delayed (%d), scudo cache (%d, %d)",
                 zero, decay, cache_cnt, cache_sz);
     }

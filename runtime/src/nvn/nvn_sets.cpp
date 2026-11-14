@@ -213,11 +213,14 @@ struct ConstantsBlock {
     int hw = 0;         // the key: the Maxwell stage (vertex 0, fragment 4) and the stage's storage bindings,
     Range storage[16];  // all driver_constants reads outside compute
     std::array<uint8_t, 0x1000> bytes;
+    uint64_t upload_gen = 0;
+    VkDescriptorBufferInfo upload_info{};
 };
-constexpr size_t kBlocks = 32;  // more distinct ones in a submit: copied per draw, as before
+constexpr size_t kBlocks = 256;  // was 32: prevents >32 skinned vertex SSBO states in a submit from falling back to 4 KB/draw copies
 std::vector<std::unique_ptr<SupportBlock>> g_support;
 std::vector<std::unique_ptr<ConstantsBlock>> g_constants;
 size_t g_support_used = 0, g_constants_used = 0;
+static thread_local ConstantsBlock* s_last_const_block[2] = {};
 
 const SupportBuffer* support_block(float width, float height, float scale) {
     for (size_t k = 0; k < g_support_used; k++)
@@ -233,20 +236,30 @@ const SupportBuffer* support_block(float width, float height, float scale) {
     return &b.sb;
 }
 
-const uint8_t* constants_block(ShaderStage stage, int st) {
+ConstantsBlock* constants_block_obj(ShaderStage stage, int st) {
     if (stage == ShaderStage::Compute) return nullptr;  // its table also lists the uniform blocks; a few per frame
     int hw = stage == ShaderStage::Fragment ? 4 : 0;
     const Range* key = g_state.storage[st];
-    for (size_t k = 0; k < g_constants_used; k++)
-        if (g_constants[k]->hw == hw && std::memcmp(g_constants[k]->storage, key, sizeof g_constants[k]->storage) == 0)
-            return g_constants[k]->bytes.data();
+    if (st >= 0 && st < 2 && s_last_const_block[st] &&
+        s_last_const_block[st]->hw == hw &&
+        std::memcmp(s_last_const_block[st]->storage, key, sizeof(s_last_const_block[st]->storage)) == 0) {
+        return s_last_const_block[st];
+    }
+    for (size_t k = 0; k < g_constants_used; k++) {
+        if (g_constants[k]->hw == hw && std::memcmp(g_constants[k]->storage, key, sizeof g_constants[k]->storage) == 0) {
+            if (st >= 0 && st < 2) s_last_const_block[st] = g_constants[k].get();
+            return g_constants[k].get();
+        }
+    }
     if (g_constants_used == kBlocks) return nullptr;
     if (g_constants_used == g_constants.size()) g_constants.push_back(std::make_unique<ConstantsBlock>());
     ConstantsBlock& b = *g_constants[g_constants_used++];
     b.hw = hw;
     std::memcpy(b.storage, key, sizeof b.storage);
     b.bytes = driver_constants(stage, st);
-    return b.bytes.data();
+    b.upload_gen = 0;
+    if (st >= 0 && st < 2) s_last_const_block[st] = &b;
+    return &b;
 }
 
 // The buffer a descriptor points to: `bytes` copied into the upload buffer (at least 16 bytes, zero padded).
@@ -314,6 +327,9 @@ struct Descriptors {
     std::vector<VkDescriptorBufferInfo> buffers;
     std::vector<VkDescriptorImageInfo> images;
     std::vector<SetWrite> key;  // scratch for the set cache
+    SetWrite set_keys[4][64];
+    uint8_t set_counts[4] = {};
+    bool direct_keys = false;
     uint64_t dynamic = 0;              // set 0 bindings given a dynamic offset (ProgramLayout::dynamic)
     uint32_t dynamic_offset[64] = {};  // their ring offsets, by binding
     uint64_t dynamic_ssbo = 0;         // set 1 bindings given a dynamic offset (ProgramLayout::dynamic_ssbo)
@@ -367,6 +383,29 @@ uint64_t handle_bits(H h) {
     uint64_t v = 0;
     std::memcpy(&v, &h, sizeof h < sizeof v ? sizeof h : sizeof v);
     return v;
+}
+
+template <typename H>
+H bits_handle(uint64_t v) {
+    H h{};
+    std::memcpy(&h, &v, sizeof h < sizeof v ? sizeof h : sizeof v);
+    return h;
+}
+
+void append_write_from_key(Descriptors& d, uint32_t k, const SetWrite& sw, VkDescriptorSet dst_set) {
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = dst_set;
+    w.dstBinding = sw.binding;
+    w.descriptorCount = 1;
+    w.descriptorType = VkDescriptorType(sw.type);
+    if (k < 2) {
+        d.buffers.push_back({bits_handle<VkBuffer>(sw.a), sw.b, sw.c});
+        w.pBufferInfo = &d.buffers.back();
+    } else {
+        d.images.push_back({bits_handle<VkSampler>(sw.b), bits_handle<VkImageView>(sw.a), VkImageLayout(sw.c)});
+        w.pImageInfo = &d.images.back();
+    }
+    d.writes.push_back(w);
 }
 
 static bool set2_reuse_on() {
@@ -423,24 +462,26 @@ static thread_local ConstDataCache s_const_data_cache[2]{};
 // d.sets from the cache or newly made, the writes of the cached ones dropped and the rest pointed at their new sets.
 void resolve_sets(const ProgramLayout& layout) {
     Descriptors& d = g_sets;
-    if (d.writes.empty()) {
-        for (uint32_t k = 0; k < 4; k++) {
-            if (k == 2 && d.sets[2] != VK_NULL_HANDLE) continue;
-            d.sets[k] = VK_NULL_HANDLE;
-        }
-        return;
-    }
     uint16_t set_indices[4][64];
-    uint8_t set_counts[4] = {};
+    uint8_t legacy_counts[4] = {};
     bool overflow = false;
-    for (size_t i = 0; i < d.writes.size(); i++) {
-        uint8_t s = d.set_index[i];
-        if (s < 4) {
-            if (set_counts[s] < 64) {
-                set_indices[s][set_counts[s]++] = static_cast<uint16_t>(i);
-            } else {
-                overflow = true;
-                break;
+    if (!d.direct_keys) {
+        if (d.writes.empty()) {
+            for (uint32_t k = 0; k < 4; k++) {
+                if (k == 2 && d.sets[2] != VK_NULL_HANDLE) continue;
+                d.sets[k] = VK_NULL_HANDLE;
+            }
+            return;
+        }
+        for (size_t i = 0; i < d.writes.size(); i++) {
+            uint8_t s = d.set_index[i];
+            if (s < 4) {
+                if (legacy_counts[s] < 64) {
+                    set_indices[s][legacy_counts[s]++] = static_cast<uint16_t>(i);
+                } else {
+                    overflow = true;
+                    break;
+                }
             }
         }
     }
@@ -450,28 +491,16 @@ void resolve_sets(const ProgramLayout& layout) {
             continue;
         }
         d.sets[k] = VK_NULL_HANDLE;
-        if (!overflow && !set_counts[k]) continue;
-
-        d.key.clear();
-        if (!overflow) d.key.reserve(set_counts[k]);
-
-        if (!overflow) {
-            for (uint8_t j = 0; j < set_counts[k]; j++) {
-                size_t i = set_indices[k][j];
-                const VkWriteDescriptorSet& w = d.writes[i];
-                SetWrite e;
-                e.binding = w.dstBinding, e.type = uint32_t(w.descriptorType);
-                if (w.pBufferInfo)
-                    e.a = handle_bits(w.pBufferInfo->buffer), e.b = w.pBufferInfo->offset, e.c = w.pBufferInfo->range;
-                else if (w.pImageInfo)
-                    e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
-                    e.c = uint64_t(w.pImageInfo->imageLayout);
-                d.key.push_back(e);
-            }
+        const SetWrite* key_ptr = nullptr;
+        uint32_t key_n = 0;
+        if (d.direct_keys) {
+            key_n = d.set_counts[k];
+            if (!key_n) continue;
+            key_ptr = d.set_keys[k];
         } else {
-            for (size_t i = 0; i < d.writes.size(); i++) {
-                if (d.set_index[i] != k) continue;
-                const VkWriteDescriptorSet& w = d.writes[i];
+            if (!overflow && !legacy_counts[k]) continue;
+            d.key.clear();
+            auto push_from_write = [&](const VkWriteDescriptorSet& w) {
                 SetWrite e;
                 e.binding = w.dstBinding, e.type = uint32_t(w.descriptorType);
                 if (w.pBufferInfo)
@@ -480,10 +509,19 @@ void resolve_sets(const ProgramLayout& layout) {
                     e.a = handle_bits(w.pImageInfo->imageView), e.b = handle_bits(w.pImageInfo->sampler),
                     e.c = uint64_t(w.pImageInfo->imageLayout);
                 d.key.push_back(e);
+            };
+            if (!overflow) {
+                d.key.reserve(legacy_counts[k]);
+                for (uint8_t j = 0; j < legacy_counts[k]; j++) push_from_write(d.writes[set_indices[k][j]]);
+            } else {
+                for (size_t i = 0; i < d.writes.size(); i++)
+                    if (d.set_index[i] == k) push_from_write(d.writes[i]);
             }
+            if (d.key.empty()) continue;
+            key_ptr = d.key.data();
+            key_n = uint32_t(d.key.size());
         }
 
-        if (d.key.empty()) continue;
         const bool is_set1 = (k == 1);
         const uint64_t cur_set_gen = is_set1 ? g_set1_generation : g_set_generation;
         CachedSet* const cache_table = is_set1 ? g_set1_cache : g_set_cache;
@@ -494,16 +532,17 @@ void resolve_sets(const ProgramLayout& layout) {
 
         LastResolvedSet& last_r = s_last_resolved[k];
         if (last_r.gen == cur_set_gen && last_r.layout == layout.sets[k] &&
-            last_r.set != VK_NULL_HANDLE && last_r.arena_n == d.key.size() &&
+            last_r.set != VK_NULL_HANDLE && last_r.arena_n == key_n &&
             last_r.arena_at + last_r.arena_n <= cache_arena.size() &&
-            std::memcmp(&cache_arena[last_r.arena_at], d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
+            std::memcmp(&cache_arena[last_r.arena_at], key_ptr, key_n * sizeof(SetWrite)) == 0) {
             d.sets[k] = last_r.set;
             g_set_hits++;
             continue;
         }
 
         uint64_t h = handle_bits(layout.sets[k]) * 0x9E3779B97F4A7C15ull;
-        for (const SetWrite& e : d.key) {
+        for (uint32_t j = 0; j < key_n; j++) {
+            const SetWrite& e = key_ptr[j];
             for (uint64_t v : {uint64_t(e.binding) << 32 | e.type, e.a, e.b, e.c})
                 h = hash_step(h, v);
         }
@@ -516,8 +555,8 @@ void resolve_sets(const ProgramLayout& layout) {
                 slot = &c;
                 break;
             }
-            if (c.hash == h && c.layout == layout.sets[k] && c.n == d.key.size() &&
-                std::memcmp(&cache_arena[c.at], d.key.data(), d.key.size() * sizeof(SetWrite)) == 0) {
+            if (c.hash == h && c.layout == layout.sets[k] && c.n == key_n &&
+                std::memcmp(&cache_arena[c.at], key_ptr, key_n * sizeof(SetWrite)) == 0) {
                 d.sets[k] = c.set, hit_at = c.at, hit_n = c.n, g_set_hits++;
                 break;
             }
@@ -529,8 +568,15 @@ void resolve_sets(const ProgramLayout& layout) {
         d.sets[k] = is_set1 ? ssbo_descriptor_set(layout.sets[k]) : descriptor_set(layout.sets[k]);
         g_set_misses++;
 
-        if (!overflow) {
-            for (uint8_t j = 0; j < set_counts[k]; j++)
+        if (d.direct_keys) {
+            if (d.sets[k]) {
+                if (d.buffers.capacity() < 256) d.buffers.reserve(256);
+                if (d.images.capacity() < 256) d.images.reserve(256);
+                if (d.writes.capacity() < 512) d.writes.reserve(512);
+                for (uint32_t j = 0; j < key_n; j++) append_write_from_key(d, k, key_ptr[j], d.sets[k]);
+            }
+        } else if (!overflow) {
+            for (uint8_t j = 0; j < legacy_counts[k]; j++)
                 d.writes[set_indices[k][j]].dstSet = d.sets[k];
         } else {
             for (size_t i = 0; i < d.writes.size(); i++)
@@ -539,11 +585,10 @@ void resolve_sets(const ProgramLayout& layout) {
 
         if (!d.sets[k] || cache_used >= cache_limit) continue;
         const uint32_t new_at = uint32_t(cache_arena.size());
-        const uint32_t new_n = uint32_t(d.key.size());
-        *slot = {cur_set_gen, h, layout.sets[k], new_at, new_n, d.sets[k]};
-        cache_arena.insert(cache_arena.end(), d.key.begin(), d.key.end());
+        *slot = {cur_set_gen, h, layout.sets[k], new_at, key_n, d.sets[k]};
+        cache_arena.insert(cache_arena.end(), key_ptr, key_ptr + key_n);
         cache_used++;
-        last_r = {layout.sets[k], cur_set_gen, d.sets[k], new_at, new_n};
+        last_r = {layout.sets[k], cur_set_gen, d.sets[k], new_at, key_n};
     }
     if (d.sets[2] != VK_NULL_HANDLE) {
         s_last_set2 = d.sets[2];
@@ -551,10 +596,12 @@ void resolve_sets(const ProgramLayout& layout) {
         s_last_set2_gen = g_set_generation;
         s_last_set2_serial = g_textures.serial;
     }
-    size_t kept = 0;  // the writes of new sets only
-    for (size_t i = 0; i < d.writes.size(); i++)
-        if (d.writes[i].dstSet) d.writes[kept++] = d.writes[i];
-    d.writes.resize(kept);
+    if (!d.direct_keys) {
+        size_t kept = 0;  // the writes of new sets only
+        for (size_t i = 0; i < d.writes.size(); i++)
+            if (d.writes[i].dstSet) d.writes[kept++] = d.writes[i];
+        d.writes.resize(kept);
+    }
 }
 
 }  // namespace
@@ -579,9 +626,11 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
         d = Descriptors{};
     else
         d.writes.clear(), d.set_index.clear(), d.buffers.clear(), d.images.clear();
+    d.set_counts[0] = d.set_counts[1] = d.set_counts[2] = d.set_counts[3] = 0;
     d.dynamic = 0;
     d.dynamic_ssbo = 0;
     const bool every_set = draw_slow(kSlowEmptySets), shared = !draw_slow(kSlowUploads), cached = set_cache_on();
+    d.direct_keys = cached && !every_set;
     auto alloc_set_k = [&](uint32_t k) {
         return k == 1 ? ssbo_descriptor_set(layout.sets[k]) : descriptor_set(layout.sets[k]);
     };
@@ -595,7 +644,17 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     auto& writes = d.writes;
     auto& buffers = d.buffers;
     auto& images = d.images;
-    buffers.reserve(1024), images.reserve(1024), writes.reserve(2048);  // pointers into them are kept
+    if (!d.direct_keys) buffers.reserve(1024), images.reserve(1024), writes.reserve(2048);  // pointers into them are kept
+    auto materialize_fallback = [&]() {
+        if (!d.direct_keys) return;
+        d.direct_keys = false;
+        buffers.reserve(1024), images.reserve(1024), writes.reserve(2048);
+        for (uint32_t sk = 0; sk < 4; sk++) {
+            for (uint8_t j = 0; j < d.set_counts[sk]; j++)
+                append_write_from_key(d, sk, d.set_keys[sk][j], set_of(sk));
+            d.set_counts[sk] = 0;
+        }
+    };
     VkExtent2D pe = pass_extent();
     float fallback_w = g_low_3d_target ? (pe.width ? float(pe.width) : 720.0f) : 1280.0f;
     float fallback_h = g_low_3d_target ? (pe.height ? float(pe.height) : 405.0f) : 720.0f;
@@ -740,9 +799,13 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                     break;
                 }
                 case NvnSource::DriverConstants: {
-                    if (const uint8_t* block = shared ? constants_block(s->stage, st) : nullptr) {
-                        Upload u = dedup_upload(block, 0x1000, 0x1000, 256);
-                        info = {u.buffer, u.offset, 0x1000};
+                    if (ConstantsBlock* cb_blk = shared ? constants_block_obj(s->stage, st) : nullptr) {
+                        if (cb_blk->upload_gen != cur_gen) {
+                            Upload u = dedup_upload(cb_blk->bytes.data(), 0x1000, 0x1000, 256);
+                            cb_blk->upload_info = {u.buffer, u.offset, 0x1000};
+                            cb_blk->upload_gen = cur_gen;
+                        }
+                        info = cb_blk->upload_info;
                         break;
                     }
                     auto c0 = driver_constants(s->stage, st);
@@ -759,16 +822,38 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                 d.dynamic_ssbo |= 1ull << b.binding, d.dynamic_ssbo_offset[b.binding] = uint32_t(info.offset);
                 info.offset = 0, type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
             }
-            buffers.push_back(info);
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstSet = set_of(b.set);
-            w.dstBinding = b.binding;
-            w.descriptorCount = 1;
-            w.descriptorType = type;
-            w.pBufferInfo = &buffers.back();
-            writes.push_back(w);
+            if (d.direct_keys && b.set < 4 && d.set_counts[b.set] < 64) {
+                d.set_keys[b.set][d.set_counts[b.set]++] = {
+                    b.binding, uint32_t(type), handle_bits(info.buffer), info.offset, info.range};
+            } else {
+                materialize_fallback();
+                buffers.push_back(info);
+                VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w.dstSet = set_of(b.set);
+                w.dstBinding = b.binding;
+                w.descriptorCount = 1;
+                w.descriptorType = type;
+                w.pBufferInfo = &buffers.back();
+                writes.push_back(w);
+            }
         }
     }
+    auto push_image_write = [&](uint32_t set_k, uint32_t binding, VkDescriptorType type, const VkDescriptorImageInfo& ii) {
+        if (d.direct_keys && d.set_counts[set_k] < 64) {
+            d.set_keys[set_k][d.set_counts[set_k]++] = {
+                binding, uint32_t(type), handle_bits(ii.imageView), handle_bits(ii.sampler), uint64_t(ii.imageLayout)};
+        } else {
+            materialize_fallback();
+            images.push_back(ii);
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = set_of(set_k);
+            w.dstBinding = binding;
+            w.descriptorCount = 1;
+            w.descriptorType = type;
+            w.pImageInfo = &images.back();
+            writes.push_back(w);
+        }
+    };
     const DrawTextures& t = g_textures;
     if (cached && !every_set && t.set2_unchanged && !t.bindings.empty() &&
         s_last_set2 != VK_NULL_HANDLE && s_last_set2_layout == layout.sets[2] && s_last_set2_gen == g_set_generation &&
@@ -807,14 +892,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                 }
             }
             ii.sampler = r.vk_sampler ? r.vk_sampler : sampler_for(r.sampler, b->image.depth, g_state.depth.depth_test);
-            images.push_back(ii);
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstSet = set_of(2);
-            w.dstBinding = b->binding;
-            w.descriptorCount = 1;
-            w.descriptorType = VkDescriptorType(b->type);
-            w.pImageInfo = &images.back();
-            writes.push_back(w);
+            push_image_write(2, b->binding, VkDescriptorType(b->type), ii);
         }
     }
     if (layout.sets[3] != VK_NULL_HANDLE) {
@@ -832,14 +910,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                 VkDescriptorImageInfo ii{};
                 ii.imageView = storage_view(cb, texture, b.image, texture ? &view : nullptr);
                 ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-                images.push_back(ii);
-                VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                w.dstSet = set_of(3);
-                w.dstBinding = b.binding;
-                w.descriptorCount = 1;
-                w.descriptorType = VkDescriptorType(b.type);
-                w.pImageInfo = &images.back();
-                writes.push_back(w);
+                push_image_write(3, b.binding, VkDescriptorType(b.type), ii);
             }
         }
     }
@@ -967,6 +1038,7 @@ static thread_local uint64_t s_cached_tex_pool = 0;
 static thread_local uint64_t s_cached_smp_pool = 0;
 static thread_local bool s_cached_has_uniform_handle = false;
 static thread_local bool s_cached_all_fast_ready = false;
+static thread_local uint64_t s_cached_fast_ready_frame = 0;
 static thread_local uint32_t s_cached_tex_version = 0;
 static thread_local uint64_t s_cached_pass_serial = UINT64_MAX;
 static thread_local uint32_t s_cached_pass_written = UINT32_MAX;
@@ -990,10 +1062,11 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
     const uint64_t pass_ser = current_pass_serial();
     const uint32_t pass_wrt = current_pass_written();
     const uint64_t vf_ser = view_forget_serial();
+    const uint64_t cur_frame_id = g_frame.load(std::memory_order_relaxed) + 1;
 
     if (shaders_same && pools_same && !biased_changed && reuse && !draw_slow(kSlowScratch) &&
-        !s_cached_has_uniform_handle && s_cached_all_fast_ready && pass_open() &&
-        g_tex_state_version == s_cached_tex_version &&
+        !s_cached_has_uniform_handle && s_cached_all_fast_ready && s_cached_fast_ready_frame == cur_frame_id &&
+        pass_open() && g_tex_state_version == s_cached_tex_version &&
         pass_ser == s_cached_pass_serial && pass_wrt == s_cached_pass_written &&
         vf_ser == s_cached_vf_serial) {
         t.set2_unchanged = true;
@@ -1080,13 +1153,15 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
         if (r.texture) {
             Texture* tx = reuse ? (r.object ? r.object : get<Texture>(r.texture)) : nullptr;
             GpuImage* img = tx ? tx->image.get() : nullptr;
-            bool fast_ready = false;
-            if (tx && img && !tx->stride) {
-                fast_ready = !(tx->dirty.load(std::memory_order_relaxed) && !img->rendered) &&
-                             !tx->has_writes.load(std::memory_order_relaxed) &&
-                             (img->rendered ? img->layout == VK_IMAGE_LAYOUT_GENERAL
-                                            : (img->uploaded && img->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-            }
+            auto check_tx_fast_ready = [&](Texture* t_obj, GpuImage* g_img) -> bool {
+                if (!t_obj || !g_img) return false;
+                if (t_obj->stride && !g_img->rendered && t_obj->hashed_submit != cur_frame_id) return false;
+                return !(t_obj->dirty.load(std::memory_order_relaxed) && !g_img->rendered) &&
+                       !t_obj->has_writes.load(std::memory_order_relaxed) &&
+                       (g_img->rendered ? g_img->layout == VK_IMAGE_LAYOUT_GENERAL
+                                        : (g_img->uploaded && g_img->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+            };
+            bool fast_ready = check_tx_fast_ready(tx, img);
             if (!fast_ready && !sampled_ready(r.texture)) {
                 out |= kNeedBreak;
                 r.ready_cached = false;
@@ -1094,7 +1169,10 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
                 all_fast_ready = false;
             } else {
                 r.ready_cached = true;
-                if (!fast_ready) all_fast_ready = false;
+                if (!fast_ready) {
+                    if (!img && tx) img = tx->image.get();
+                    if (!check_tx_fast_ready(tx, img)) all_fast_ready = false;
+                }
             }
             if (!img) img = image_of(r.texture);
             r.gpu_image = img;
@@ -1122,6 +1200,7 @@ uint32_t gather_textures(const std::vector<const ShaderInfo*>& shaders) {
     if (any_changed) t.serial++;
     t.set2_unchanged = reuse && !any_changed && !(out & (kNeedBreak | kSampledPending));
     s_cached_all_fast_ready = all_fast_ready && t.set2_unchanged;
+    s_cached_fast_ready_frame = cur_frame_id;
     s_cached_tex_version = g_tex_state_version;
     s_cached_pass_serial = pass_ser;
     s_cached_pass_written = pass_wrt;
@@ -1233,12 +1312,14 @@ void sets_begin_submit() {
     s_cached_tex_pool = 0;
     s_cached_smp_pool = 0;
     s_cached_all_fast_ready = false;
+    s_cached_fast_ready_frame = 0;
     s_cached_pass_serial = UINT64_MAX;
     s_cached_pass_written = UINT32_MAX;
     s_last_set2 = VK_NULL_HANDLE;
     s_last_set2_layout = VK_NULL_HANDLE;
     s_last_set2_gen = 0;
     for (int k = 0; k < 4; k++) s_last_resolved[k].gen = 0, s_last_resolved[k].set = VK_NULL_HANDLE;
+    s_last_const_block[0] = s_last_const_block[1] = nullptr;
     std::memset(s_ubo_cache, 0, sizeof s_ubo_cache);
     std::memset(s_ssbo_cache, 0, sizeof s_ssbo_cache);
     s_support_cache.gen = 0;
