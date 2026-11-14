@@ -35,20 +35,21 @@ struct DedupSpan {
 std::vector<DedupSpan> g_copies;
 uint64_t g_saved = 0, g_copied = 0;
 
-// Direct-mapped front cache per address hash. A slot of the current generation holds the submit's latest entry
-// for that address; dedup_invalidate clears matching slots and dedup_reset advances the generation.
+// Open-addressed front hash table (linear probing) per address hash. Slots of the current generation hold active
+// entries or tombstones (p == nullptr) from dedup_invalidate; dedup_reset advances the generation in O(1).
 struct Front {
     const uint8_t* p = nullptr;
     uint64_t generation = 0;
     Entry entry;
 };
-constexpr size_t kFrontSlots = 32768;
+constexpr size_t kFrontSlots = 65536;
+constexpr uint32_t kMaxProbe = 8;
 Front g_front[kFrontSlots];
 uint64_t g_generation = 1;
 static uint64_t s_dedup_inval = 1;
 inline uint32_t front_index_of(const uint8_t* p) {
     const uintptr_t v = uintptr_t(p);
-    return uint32_t(((v >> 4) ^ (v >> 13) ^ (v >> 22)) & (kFrontSlots - 1));
+    return uint32_t(((v >> 4) ^ (v >> 12) ^ (v >> 21) ^ (v >> 30)) & (kFrontSlots - 1));
 }
 
 // NX_UPLOAD_STATS: bytes copied per kind, and of those the bytes equal to the last copy of the same address and size.
@@ -95,25 +96,49 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
             return s_last_dedup_entry.upload;
         }
     }
-    const uint32_t f_idx = front_index_of(p);
-    Front& f = g_front[f_idx];
-    const Entry* e = (!off && f.generation == g_generation && f.p == p) ? &f.entry : nullptr;
-    if (e && e->size == size && e->padded == padded && e->upload.offset % align == 0) {
-        g_saved += padded;
-        s_last_dedup_p = p;
-        s_last_dedup_gen = g_generation;
-        s_last_dedup_entry = *e;
-        return e->upload;
+    const uint32_t base_idx = front_index_of(p);
+    uint32_t target_idx = kFrontSlots;
+    bool existing = false;
+    uint64_t prev_size = 0;
+    if (!off) {
+        for (uint32_t step = 0; step < kMaxProbe; step++) {
+            const uint32_t idx = (base_idx + step) & (kFrontSlots - 1);
+            const Front& f = g_front[idx];
+            if (f.generation != g_generation) {
+                if (target_idx == kFrontSlots) target_idx = idx;
+                break;
+            }
+            if (f.p == nullptr) {
+                if (target_idx == kFrontSlots) target_idx = idx;
+                continue;
+            }
+            if (f.p == p) {
+                target_idx = idx;
+                existing = true;
+                prev_size = f.entry.size;
+                if (f.entry.size == size && f.entry.padded == padded && f.entry.upload.offset % align == 0) {
+                    g_saved += padded;
+                    s_last_dedup_p = p;
+                    s_last_dedup_gen = g_generation;
+                    s_last_dedup_entry = f.entry;
+                    return f.entry.upload;
+                }
+                break;
+            }
+        }
     }
+    if (target_idx == kFrontSlots) target_idx = base_idx;
     frame_guest_read(p, size);  // deferred write-backs over these bytes land first (nvn_frames.cpp)
     auto record_entry = [&](const Upload& u) {
         Entry ent{size, padded, u};
-        f = {p, g_generation, ent};
+        g_front[target_idx] = {p, g_generation, ent};
         s_last_dedup_p = p;
         s_last_dedup_gen = g_generation;
         s_last_dedup_entry = ent;
-        if (g_copies.capacity() < 1024) g_copies.reserve(1024);
-        g_copies.push_back({p, size, f_idx});
+        if (!existing || size > prev_size) {
+            if (g_copies.capacity() < 1024) g_copies.reserve(1024);
+            g_copies.push_back({p, size, target_idx});
+        }
     };
     Upload u;
     if (g_upload_kind != kUploadOther && cache_upload(p, size, padded, align, u)) {  // nvn_buffer_cache.cpp
@@ -150,7 +175,7 @@ void dedup_invalidate(const uint8_t* p, uint64_t size) {
         const DedupSpan& span = g_copies[i];
         if (span.p < end && span.p + span.size > p) {
             Front& f = g_front[span.front_idx];
-            if (f.p == span.p) f.generation = 0;
+            if (f.generation == g_generation && f.p == span.p) f.p = nullptr;
         } else {
             g_copies[kept++] = span;
         }

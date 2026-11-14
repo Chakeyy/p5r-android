@@ -720,12 +720,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "renderopt-r93";
+static constexpr const char* kPerfBuildTag = "renderopt-r94";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (flat dedup_upload span tracking, kUploadBlock buffer-cache bypass + 8192-slot EntryFront + per-frame verification, persistent dynamic stencil/depth-bias across pipeline switches)",
+    log("p5r perf build: %s (65K linear-probing dedup_upload, flat g_seen_slots + 64KB page churn filter, idle condition_variable movie pump)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:

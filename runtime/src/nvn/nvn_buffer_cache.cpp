@@ -54,15 +54,47 @@ struct Slot {
 };
 std::vector<Slot> g_free[kClasses];  // free slots per size class
 
-// Bytes not cached yet: how many submits in a row they were the same (address -> size, hash, count).
-struct Seen {
+// Bytes not cached yet: fixed flat slot table in BSS + per-64KB-page churn tracker (no per-address heap nodes).
+struct SeenSlot {
+    const uint8_t* p = nullptr;
     uint64_t size = 0, hash = 0;
     uint32_t count = 0;
     uint32_t unstable_streak = 0;
     uint64_t skip_until = 0;
     uint64_t submit = 0;  // g_submits when last seen
 };
-std::unordered_map<const uint8_t*, Seen> g_seen;
+constexpr uint32_t kSeenSlots = 16384;
+SeenSlot g_seen_slots[kSeenSlots];
+
+inline uint32_t seen_slot_index(const uint8_t* p) {
+    uint64_t v = reinterpret_cast<uintptr_t>(p);
+    return uint32_t(((v >> 4) ^ (v >> 14) ^ (v >> 24)) & (kSeenSlots - 1));
+}
+
+struct PageChurn {
+    uint16_t cached_count = 0;
+    uint16_t unstable_count = 0;
+    uint32_t last_window = 0;
+    uint64_t skip_until = 0;
+};
+constexpr uint32_t kPageSlots = 65536;
+PageChurn g_page_churn[kPageSlots];
+
+inline uint32_t page_churn_index(const uint8_t* p) {
+    return uint32_t((reinterpret_cast<uintptr_t>(p) >> 16) & (kPageSlots - 1));
+}
+
+inline void record_page_churn(PageChurn& pc) {
+    const uint32_t win = uint32_t(g_submits >> 4);
+    if (pc.last_window != win) {
+        pc.last_window = win;
+        pc.unstable_count = 0;
+    }
+    if (++pc.unstable_count >= 12) {
+        pc.skip_until = g_submits + 90;
+        pc.unstable_count = 0;
+    }
+}
 
 struct UnstableSlot {
     const uint8_t* p = nullptr;
@@ -197,6 +229,8 @@ void evict_stale() {
         if (it->second.seen + kStaleSubmits < g_submits) {
             retire(it->second);
             g_stats_cache.evicted++;
+            PageChurn& pc = g_page_churn[page_churn_index(it->first)];
+            if (pc.cached_count > 0) pc.cached_count--;
             it = g_entries.erase(it);
             erased = true;
         } else {
@@ -235,23 +269,16 @@ void cache_begin_submit() {
             g_retired[kept++] = r;
         }
     g_retired.resize(kept);
-    if (++g_submits % 64 == 0) {
-        evict_stale();
-        for (auto it = g_seen.begin(); it != g_seen.end();)  // candidates not seen lately
-            it = (it->second.skip_until <= g_submits &&
-                  it->second.submit + std::max<uint64_t>(kSeenGap * 2, 64) < g_submits)
-                     ? g_seen.erase(it)
-                     : std::next(it);
-    }
+    if (++g_submits % 64 == 0) evict_stale();
 }
 
 bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t align, Upload& out) {
     if (!on() || !p || !size || padded > kMaxCopy || align > kAlign) return false;
-    // Uniform/storage blocks are sub-allocated from volatile per-frame guest rings (intra-submit repeats are already
-    // answered in O(1) by dedup_upload / g_front, while cross-submit caching mostly churned g_seen with dynamic
-    // blocks > 4 KB). Allow overriding with NX_CACHE_BLOCKS=1 for experiments.
+    // Small uniform/storage blocks are sub-allocated from volatile per-frame guest rings (intra-submit repeats are
+    // already answered in O(1) by dedup_upload / g_front); bypass <= 4 KB blocks unless NX_CACHE_BLOCKS=1, while
+    // allowing larger (> 4 KB) static blocks to cache unless their 64 KB guest page exhibits ring-buffer churn.
     static const bool cache_blocks = std::getenv("NX_CACHE_BLOCKS") != nullptr;
-    if (g_upload_kind == kUploadBlock && !cache_blocks) return false;
+    if (g_upload_kind == kUploadBlock && size <= 4096 && !cache_blocks) return false;
 
     const uint32_t u_idx = unstable_slot_index(p);
     if (g_unstable_front[u_idx].p == p) {
@@ -266,14 +293,22 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     static const bool verify = std::getenv("NX_BUFFER_CACHE_VERIFY") != nullptr;
     const uint64_t cur_frame = g_frame.load(std::memory_order_relaxed) + 1;
 
-    // Check if this buffer is already cached (via O(1) direct-mapped front cache before g_entries hash map lookup)
+    PageChurn& pc = g_page_churn[page_churn_index(p)];
+
+    // Check if this buffer is already cached (via O(1) direct-mapped front cache before page-churn & g_entries)
     EntryFront& ef = g_entry_front[entry_front_index(p)];
     Entry* found_entry = nullptr;
     if (ef.gen == g_entry_front_gen && ef.p == p) {
         found_entry = ef.entry;
-    } else if (auto it = g_entries.find(p); it != g_entries.end()) {
-        found_entry = &it->second;
-        ef = {p, found_entry, g_entry_front_gen};
+    } else {
+        if (pc.cached_count == 0 && pc.skip_until > g_submits) {
+            g_stats_cache.unstable++;
+            return false;
+        }
+        if (auto it = g_entries.find(p); it != g_entries.end()) {
+            found_entry = &it->second;
+            ef = {p, found_entry, g_entry_front_gen};
+        }
     }
 
     if (found_entry) {
@@ -323,13 +358,14 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
             return true;
         }
         retire(e);  // read by the submits up to e.serial: freed after them
+        if (pc.cached_count > 0) pc.cached_count--;
         g_entries.erase(p);
         g_entry_front_gen++;
     }
 
-    // Not cached: track candidate stability with fast_sample_hash until promoted to kStableSeen.
-    Seen& seen = g_seen[p];
-    if (seen.skip_until > g_submits) {
+    // Not cached: track candidate stability in a flat zero-allocation slot table until promoted to kStableSeen.
+    SeenSlot& seen = g_seen_slots[seen_slot_index(p)];
+    if (seen.p == p && seen.skip_until > g_submits) {
         seen.submit = g_submits;
         g_stats_cache.unstable++;
         return false;
@@ -340,12 +376,17 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     if (time_hash) g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
 
     const uint64_t serial = frame_recording_serial();
-    if (seen.submit == 0) {
-        seen.count = 1;
-        seen.unstable_streak = 0;
+    if (seen.p != p) {
+        if (seen.submit != 0 && seen.submit + 4 >= g_submits && seen.count == 1 && pc.cached_count == 0) {
+            record_page_churn(pc);
+        }
+        seen = {p, size, sh, 1, 0, 0, g_submits};
     } else if (seen.size == size && seen.hash == sh && seen.submit + kSeenGap >= g_submits) {
         seen.count++;
         seen.unstable_streak = 0;
+        seen.size = size;
+        seen.hash = sh;
+        seen.submit = g_submits;
     } else {
         seen.count = 1;
         if (seen.size != size || seen.hash != sh) {
@@ -354,9 +395,12 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
             const uint32_t shift = std::min<uint32_t>(seen.unstable_streak - 1, 4);
             seen.skip_until = g_submits + (30ull << shift);
             g_unstable_front[u_idx] = {p, seen.skip_until};
+            if (pc.cached_count == 0) record_page_churn(pc);
         }
+        seen.size = size;
+        seen.hash = sh;
+        seen.submit = g_submits;
     }
-    seen.size = size, seen.hash = sh, seen.submit = g_submits;
     if (seen.count < kStableSeen) {
         g_stats_cache.unstable++;
         return false;  // the ring
@@ -367,7 +411,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
         g_stats_cache.full++;
         return false;  // the ring then, as before
     }
-    g_seen.erase(p);
+    seen = {};
     if (g_unstable_front[u_idx].p == p) g_unstable_front[u_idx].p = nullptr;
     const uint64_t t1 = (time_hash && size > 4096) ? plat::monotonic_ns() : 0;
     const uint64_t h = size > 4096 ? full_hash_memory(p, size) : sh;
@@ -379,6 +423,11 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     if (padded > size) std::memset(dst + size, 0, padded - size);
     auto [ins_it, inserted] = g_entries.insert_or_assign(
         p, Entry{size, padded, h, sh, slot.block, slot.offset, c, 1, serial, g_submits, g_submits, cur_frame});
+    if (inserted && pc.cached_count < UINT16_MAX) {
+        pc.cached_count++;
+        pc.skip_until = 0;
+        pc.unstable_count = 0;
+    }
     ef = {p, &ins_it->second, g_entry_front_gen};
     g_stats_cache.misses++, g_stats_cache.miss_bytes += padded;
     out = {g_blocks[slot.block].buffer, slot.offset, dst};

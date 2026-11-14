@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -379,6 +380,7 @@ void ev_trace(const char* what, int index, int extra = -1) {
 }
 
 std::mutex g_lock;
+std::condition_variable g_pump_cv;
 std::unordered_map<uint64_t, std::unique_ptr<Decoder>> g_decoders;
 uint64_t g_next_id = 1;
 
@@ -471,6 +473,14 @@ void DecoderGetOutputFormat(CPU& c) {
 void movie_pump_thread(CPU& c) {
     log("movie: pump thread running");
     for (;;) {
+        {
+            std::unique_lock lk(g_lock);
+            g_pump_cv.wait(lk, [] {
+                for (const auto& [id, d] : g_decoders)
+                    if (d->started) return true;
+                return false;
+            });
+        }
         plat::sleep_ns(2'000'000);
         std::vector<uint64_t> events;
         bool dump = false;
@@ -543,11 +553,13 @@ void start_pump_thread(CPU& c) {
 // Status Start(), Stop(), Reset(), Flush()
 void DecoderStart(CPU& c) {
     uint64_t input_event = 0;
+    bool notify_pump = false;
     {
         std::lock_guard lk(g_lock);
         if (Decoder* d = decoder(c.x[0])) {
             d->reset_queues();
             d->started = true;
+            notify_pump = true;
             input_event = d->events[kInputAvailable];
 #if defined(__ANDROID__)
             if (d->codec && AMediaCodec_start(d->codec) != AMEDIA_OK) {
@@ -558,6 +570,7 @@ void DecoderStart(CPU& c) {
 #endif
         }
     }
+    if (notify_pump) g_pump_cv.notify_all();
 #if defined(__ANDROID__)
     start_pump_thread(c);
 #endif
