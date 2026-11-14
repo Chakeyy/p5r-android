@@ -100,6 +100,13 @@ public class Launcher extends Activity {
 
     String label(Option o) { return t(o.labelsEs[o.pick], o.labelsEn[o.pick]); }
 
+    Option findOption(String key) {
+        for (Option o : options) {
+            if (key.equals(o.key)) return o;
+        }
+        return null;
+    }
+
     static File dataDir() { return new File(Environment.getExternalStorageDirectory(), DATA); }
 
     static final class Api30Helper {
@@ -311,11 +318,15 @@ public class Launcher extends Activity {
                         "Italiano", "日本語", "한국어", "简体中文", "繁體中文"},
                 new String[] {"Automatic (device language)", "English", "Español", "Français", "Deutsch", "Italiano",
                         "日本語", "한국어", "简体中文", "繁體中文"}, 0));
-        options.add(new Option("RESOLUTION", "Resolución", "Resolution",
-                new String[] {"360p", "480p", "720p", "1080p"},
-                new String[] {"360p", "480p", "720p", "1080p"},
-                new String[] {"360p", "480p", "720p", "1080p"}, 2));
+        options.add(new Option("resolution", "Resolución", "Resolution",
+                new String[] {"360", "480", "540", "720", "1080"},
+                new String[] {"360p", "480p", "540p (3D a 405p - máxima fluidez)", "720p (portátil)", "1080p (sobremesa)"},
+                new String[] {"360p", "480p", "540p (3D 405p - Max Performance)", "720p (Handheld)", "1080p (Docked)"}, 3));
         options.add(new Option("NX_STRETCH", "Pantalla completa (estirar)", "Fullscreen (stretch)",
+                new String[] {"0", "1"},
+                new String[] {"Desactivada", "Activada"},
+                new String[] {"Off", "On"}, 0));
+        options.add(new Option("NX_FSR", "Superresolución (FSR 1.0)", "Super resolution (FSR 1.0)",
                 new String[] {"0", "1"},
                 new String[] {"Desactivada", "Activada"},
                 new String[] {"Off", "On"}, 0));
@@ -328,6 +339,14 @@ public class Launcher extends Activity {
                 new String[] {"30 fps", "60 fps (experimental)"}, new String[] {"30 fps", "60 fps (experimental)"}, 0));
         options.add(new Option("NX_SHADOWS", "Sombras", "Shadows", new String[] {"0", "1"},
                 new String[] {"Desactivadas", "Activadas"}, new String[] {"Off", "On"}, 0));
+        options.add(new Option("NX_MALI_LOW_SHADOWS", "Calidad de sombras", "Shadow quality",
+                new String[] {"1", "0"},
+                new String[] {"Baja (0.5x - mejor rendimiento)", "Original (1.0x)"},
+                new String[] {"Low (0.5x - best performance)", "Original (1.0x)"}, 0));
+        options.add(new Option("NX_GAMEPAD_LAYOUT", "Disposición del mando", "Controller layout",
+                new String[] {"auto", "xbox", "nintendo"},
+                new String[] {"Automática (Xbox/8BitDo/Switch)", "Xbox / Estándar (A=Abajo, B=Derecha)", "Nintendo Switch (B=Abajo, A=Derecha)"},
+                new String[] {"Auto-detect (Xbox/8BitDo/Switch)", "Xbox / Standard (A=Bottom, B=Right)", "Nintendo Switch (B=Bottom, A=Right)"}, 0));
         options.add(new Option("NX_SHOW_FPS", "Contador de FPS", "FPS counter", new String[] {"0", "1"},
                 new String[] {"Desactivado", "Activado"}, new String[] {"Off", "On"}, 0));
         options.add(new Option("NX_TOUCH_SHOW", "Controles táctiles", "On-screen controls", new String[] {"1", "0"},
@@ -346,10 +365,6 @@ public class Launcher extends Activity {
                 new String[] {"0", "1"},
                 new String[] {"Activado (normal)", "Desactivado (más FPS)"},
                 new String[] {"Enabled (normal)", "Disabled (more FPS)"}, 0));
-        options.add(new Option("NX_GAMEPAD_LAYOUT", "Botones del mando físico", "Physical gamepad buttons",
-                new String[] {"0", "1"},
-                new String[] {"Nintendo (A dcha, B abajo)", "Xbox / PC (A abajo, B dcha)"},
-                new String[] {"Nintendo (A right, B down)", "Xbox / PC (A down, B right)"}, 0));
         options.add(new Option("NX_STICK_SENSITIVITY", "Sensibilidad palanca táctil", "Touch stick sensitivity",
                 new String[] {"50", "75", "100", "125", "150", "200"},
                 new String[] {"50%", "75%", "100%", "125%", "150%", "200%"},
@@ -427,6 +442,7 @@ public class Launcher extends Activity {
                     o.pick = (o.pick + 1) % o.values.length;
                     value.setText(label(o));
                     save();
+                    updateButtons(getWindow().getDecorView());
                 }
             });
             value.setTag(o);
@@ -607,6 +623,7 @@ public class Launcher extends Activity {
                     else if (!prepared()) prepare();
                     else if (openGameForRuntime()) {
                         save();
+                        setupRuntimeEnvironment();
                         startActivity(new Intent(Launcher.this, android.app.NativeActivity.class));
                     } else {
                         tell(t("No se pudo abrir el juego", "The game could not be opened"), gameName());
@@ -622,6 +639,7 @@ public class Launcher extends Activity {
                     return;
                 }
                 save();
+                setupRuntimeEnvironment();
                 startActivity(new Intent(Launcher.this, android.app.NativeActivity.class));
             }
         });
@@ -635,15 +653,19 @@ public class Launcher extends Activity {
         load();
         for (Option o : options) {
             String v = config.get(o.key);
-            if ("RESOLUTION".equals(o.key) && v == null) {
-                String hh = config.get("NX_HANDHELD");
-                if ("0".equals(hh)) v = "1080p";
-                else {
-                    String r = config.get("resolution");
-                    if (r != null && r.contains("360")) v = "360p";
-                    else if (r != null && r.contains("480")) v = "480p";
-                    else v = "720p";
+            if ("resolution".equals(o.key)) {
+                if (v == null) {
+                    String hh = config.get("NX_HANDHELD");
+                    if ("0".equals(hh)) v = "1080";
+                    else if ("1".equals(hh)) v = "720";
+                } else {
+                    if (v.contains("360")) v = "360";
+                    else if (v.contains("480")) v = "480";
+                    else if (v.contains("540")) v = "540";
+                    else if (v.contains("1080")) v = "1080";
+                    else if (v.contains("720")) v = "720";
                 }
+                if ("1".equals(config.get("NX_LOW_3D"))) v = "540";
             }
             for (int k = 0; v != null && k < o.values.length; k++)
                 if (o.values[k].equals(v)) o.pick = k;
@@ -686,7 +708,17 @@ public class Launcher extends Activity {
     void updateButtons(View v) {
         if (v instanceof Button && v.getTag() instanceof Option) {
             Option o = (Option) v.getTag();
-            ((Button) v).setText(label((Option) v.getTag()));
+            Button b = (Button) v;
+            b.setText(label(o));
+            if ("NX_MALI_LOW_SHADOWS".equals(o.key)) {
+                Option shadows = findOption("NX_SHADOWS");
+                boolean enabled = shadows != null && "1".equals(shadows.values[shadows.pick]);
+                b.setEnabled(enabled);
+                b.setAlpha(enabled ? 1.0f : 0.4f);
+                if (b.getParent() instanceof View) {
+                    ((View) b.getParent()).setAlpha(enabled ? 1.0f : 0.4f);
+                }
+            }
         } else if (v instanceof android.view.ViewGroup) {
             android.view.ViewGroup g = (android.view.ViewGroup) v;
             for (int k = 0; k < g.getChildCount(); k++) updateButtons(g.getChildAt(k));
@@ -844,32 +876,53 @@ public class Launcher extends Activity {
         if (!dataDir().isDirectory()) return;
         load();
         for (Option o : options) config.put(o.key, o.values[o.pick]);
-        final String res = config.get("RESOLUTION");
-        if ("360p".equals(res)) {
-            config.put("NX_HANDHELD", "1");
-            config.put("resolution", "360p");
-            config.put("NX_RENDER_RES", "360p");
-            config.put("NX_RES", "360p");
-        } else if ("480p".equals(res)) {
-            config.put("NX_HANDHELD", "1");
-            config.put("resolution", "480p");
-            config.put("NX_RENDER_RES", "480p");
-            config.put("NX_RES", "480p");
-        } else if ("1080p".equals(res)) {
-            config.put("NX_HANDHELD", "0");
-            config.put("resolution", "1080p");
-            config.put("NX_RENDER_RES", "1080p");
-            config.put("NX_RES", "1080p");
-        } else {
-            config.put("NX_HANDHELD", "1");
-            config.put("resolution", "720p");
-            config.put("NX_RENDER_RES", "720p");
-            config.put("NX_RES", "720p");
+        String res = config.get("resolution");
+        if (res != null) {
+            if (res.contains("360")) res = "360";
+            else if (res.contains("480")) res = "480";
+            else if (res.contains("540")) res = "540";
+            else if (res.contains("1080")) res = "1080";
+            else if (res.contains("720")) res = "720";
         }
-        for (String k : new String[] {"RENDER_SCALE", "NX_ANISO_MAX", "NX_LOD_BIAS"}) config.remove(k);
+        if ("1080".equals(res)) {
+            config.put("resolution", "1080");
+            config.put("NX_HANDHELD", "0");
+            config.remove("NX_LOW_3D");
+        } else if ("540".equals(res)) {
+            config.put("resolution", "540");
+            config.put("NX_HANDHELD", "1");
+            config.put("NX_LOW_3D", "1");
+        } else if ("480".equals(res)) {
+            config.put("resolution", "480");
+            config.put("NX_HANDHELD", "1");
+            config.remove("NX_LOW_3D");
+        } else if ("360".equals(res)) {
+            config.put("resolution", "360");
+            config.put("NX_HANDHELD", "1");
+            config.remove("NX_LOW_3D");
+        } else {
+            config.put("resolution", "720");
+            config.put("NX_HANDHELD", "1");
+            config.remove("NX_LOW_3D");
+        }
+        if ("1".equals(config.get("NX_FSR"))) {
+            config.put("NX_FSR_SHARP", "0.2");
+        } else {
+            config.remove("NX_FSR");
+            config.remove("NX_FSR_SHARP");
+        }
+        // GRAPHICS is the launcher's own key: the preset's switches are written with it (and removed for "high").
+        // RENDER_SCALE (the old option), NX_RENDER_RES and NX_ANISO_MAX are dropped: P5R sizes its targets from the
+        // console mode, not from the reported resolution, and never asks for anisotropic filtering.
+        for (String k : new String[] {"RENDER_SCALE", "NX_RENDER_RES", "NX_ANISO_MAX", "NX_LOD_BIAS", "NX_MAX_ANISO", "RESOLUTION", "NX_RES"}) config.remove(k);
         final String preset = config.get("GRAPHICS");
-        if ("low".equals(preset)) config.put("NX_LOD_BIAS", "1");
-        else if ("medium".equals(preset)) config.put("NX_LOD_BIAS", "0.5");
+        if ("low".equals(preset)) {
+            config.put("NX_LOD_BIAS", "1");
+            config.put("NX_MAX_ANISO", "1");
+        } else if ("medium".equals(preset)) {
+            config.put("NX_LOD_BIAS", "0.5");
+            config.put("NX_MAX_ANISO", "2");
+        }
         writeConfig(new File(dataDir(), "config.txt"), config);
     }
 
@@ -893,6 +946,17 @@ public class Launcher extends Activity {
             return line == null ? "" : line.trim();
         } catch (Exception e) {
             return "";
+        }
+    }
+
+    void setupRuntimeEnvironment() {
+        try {
+            String act = activeDriver();
+            Os.setenv("NX_GPU_DRIVER_DIR", driverDir().getAbsolutePath(), true);
+            Os.setenv("NX_GPU_DRIVER_NAME", act, true);
+            Os.setenv("NX_INTERNAL_DIR", getFilesDir().getAbsolutePath(), true);
+            Os.setenv("NX_STRETCH", "1".equals(config.get("NX_STRETCH")) ? "1" : "0", true);
+        } catch (Exception ignored) {
         }
     }
 
@@ -937,11 +1001,20 @@ public class Launcher extends Activity {
                             byte[] buf = new byte[8192];
                             int n;
                             while ((n = zin.read(buf)) > 0) bo.write(buf, 0, n);
+                            byte[] metaBytes = bo.toByteArray();
+                            File metaFile = new File(dir, "meta.json");
+                            try (FileOutputStream metaOut = new FileOutputStream(metaFile)) {
+                                metaOut.write(metaBytes);
+                            }
+                            metaFile.setReadable(true, false);
                             java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"libraryName\"\\s*:\\s*\"([^\"]+)\"")
-                                    .matcher(bo.toString("UTF-8"));
+                                    .matcher(new String(metaBytes, "UTF-8"));
                             if (m.find()) wanted = m.group(1);
                         } else if (base.endsWith(".so")) {
-                            copy(zin, new File(dir, base));
+                            File soFile = new File(dir, base);
+                            copy(zin, soFile);
+                            soFile.setReadable(true, false);
+                            soFile.setExecutable(true, false);
                             if (soEntry == null) soEntry = base;
                         }
                     }
@@ -951,13 +1024,18 @@ public class Launcher extends Activity {
                 libName = picked.endsWith(".so") ? picked : picked + ".so";
                 try (InputStream in = getContentResolver().openInputStream(uri)) {
                     if (in == null) throw new java.io.IOException("Cannot open selected file");
-                    copy(in, new File(dir, libName));
+                    File soFile = new File(dir, libName);
+                    copy(in, soFile);
+                    soFile.setReadable(true, false);
+                    soFile.setExecutable(true, false);
                 }
             }
             if (libName == null) throw new java.io.IOException(t("No hay ningun .so dentro", "No .so file inside"));
-            try (FileWriter w = new FileWriter(new File(dir, "active.txt"))) {
+            File activeFile = new File(dir, "active.txt");
+            try (FileWriter w = new FileWriter(activeFile)) {
                 w.write(libName + "\n");
             }
+            activeFile.setReadable(true, false);
             showDriver();
             tell(t("Driver importado", "Driver imported"),
                     Lang.f("%s\n\nCierra el juego por completo y abrelo otra vez. Para volver al driver del sistema pulsa Quitar.",

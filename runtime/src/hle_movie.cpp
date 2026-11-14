@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -476,6 +478,7 @@ void ev_trace(const char* what, int index, int extra = -1) {
 }
 
 std::mutex g_lock;
+std::condition_variable g_pump_cv;
 std::unordered_map<uint64_t, std::unique_ptr<Decoder>> g_decoders;
 uint64_t g_next_id = 1;
 
@@ -570,11 +573,29 @@ void DecoderGetOutputFormat(CPU& c) {
 void movie_pump_thread(CPU& c) {
     log("movie: pump thread running");
     for (;;) {
-        plat::sleep_ns(2'000'000);
         std::vector<uint64_t> events;
         bool dump = false;
         {
-            std::lock_guard lk(g_lock);
+            std::unique_lock lk(g_lock);
+            g_pump_cv.wait_for(lk, std::chrono::milliseconds(16), [] {
+                for (const auto& [id, d] : g_decoders)
+                    if (d->started && !d->codec_eos) return true;
+                return false;
+            });
+            bool any_active = false;
+            for (const auto& [id, d] : g_decoders)
+                if (d->started && !d->codec_eos) { any_active = true; break; }
+            if (!any_active) {
+                g_pump_cv.wait(lk, [] {
+                    for (const auto& [id, d] : g_decoders)
+                        if (d->started && !d->codec_eos) return true;
+                    return false;
+                });
+            } else {
+                lk.unlock();
+                plat::sleep_ns(2'000'000);
+                lk.lock();
+            }
             const uint64_t now = plat::monotonic_ns();
             for (auto& [id, d] : g_decoders) {
                 if (d->started && d->codec && pump(*d, 0)) events.push_back(d->events[kOutputAvailable]);
@@ -657,6 +678,7 @@ void DecoderStart(CPU& c) {
                 d->codec = nullptr;
             }
 #endif
+            g_pump_cv.notify_all();
         }
     }
 #if defined(__ANDROID__)
@@ -754,6 +776,7 @@ void DecoderSendInputBufferForDecode(CPU& c) {
             diag::movie_send_wait(t1 - t0, t1);
             d->win.sent++;
             d->last_sent_ns = plat::monotonic_ns(), d->starve_logged = false, d->last_sent_pts = pts;
+            g_pump_cv.notify_all();
         } else
 #endif
             d->emit(pts, flags & kEndOfStream);

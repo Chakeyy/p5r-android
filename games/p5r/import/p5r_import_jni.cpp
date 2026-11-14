@@ -23,12 +23,6 @@
 
 namespace {
 
-static std::string tid_str(uint64_t t) {
-    char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016llX", (unsigned long long)t);
-    return buf;
-}
-
 bool is_supported_title(uint64_t t) {
     uint64_t base = t & ~0xFFFull;
     return base == 0x01005CA01580E000ull  // US
@@ -48,6 +42,12 @@ bool is_supported_build(const char* id) {
         if (std::strcmp(id, k) == 0) return true;
     }
     return false;
+}
+
+std::string tid_str(uint64_t t) {
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llX", (unsigned long long)t);
+    return buf;
 }
 
 std::atomic<int> g_phase{0}, g_done{0}, g_total{0};

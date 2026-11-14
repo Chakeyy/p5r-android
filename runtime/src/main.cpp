@@ -162,6 +162,7 @@ void boot() {
     // read in place (game_image.h), else from the data folder's exefs/.
     nce::init();
     static std::vector<std::unique_ptr<nce::NsoModule>> nso;
+    nso.clear();
     const std::string exefs = plat::data_root() + "/exefs";
     const nxi::GameImage* image = game_image();
 
@@ -194,15 +195,13 @@ void boot() {
             if (m) nso.push_back(std::move(m));
             else log("nce: error loading mod %s: %s", mod_file.c_str(), error.c_str());
         } else if (name == "main" || name == "sdk") {
-            // Only main and sdk come from base game. Base game subsdk0 is the Switch Tegra NVN driver and must not be loaded.
+            // Only base game modules (main and sdk) are loaded from the game image/exefs folder.
+            // subsdk* modules in the game image (e.g. subsdk0/nn::movie) are not recompiled and are handled via HLE.
             if (image) {
                 auto it = image->exefs().find(name);
-                if (it != image->exefs().end()) {
-                    auto m = nce::load_nso_bytes(it->second, std::string("ExeFS/") + name, name, base, error);
-                    if (m) nso.push_back(std::move(m));
-                } else {
-                    fatal("the game file's ExeFS has no %s", name.c_str());
-                }
+                if (it == image->exefs().end()) fatal("the game file's ExeFS has no %s", name.c_str());
+                auto m = nce::load_nso_bytes(it->second, std::string("ExeFS/") + name, name, base, error);
+                if (m) nso.push_back(std::move(m));
             } else {
                 std::error_code ec;
                 if (fs::is_regular_file(fs::u8path(exefs) / fs::u8path(name), ec)) {

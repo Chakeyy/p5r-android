@@ -129,6 +129,14 @@ struct Pass {
     VkFramebuffer inter_fb = VK_NULL_HANDLE;
     uint32_t inter_w = 0, inter_h = 0;
     bool fsr_logged = false;
+    struct PresentSetEntry {
+        uint64_t epoch = 0;
+        VkImageView view = VK_NULL_HANDLE;
+        VkBuffer ubo_buf = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
+    PresentSetEntry set_cache[8] = {};
+    uint32_t set_cache_next = 0;
 } g;
 
 bool fsr_on() {
@@ -202,6 +210,33 @@ void destroy_targets() {
     if (g.inter_memory) p_vkFreeMemory(d, g.inter_memory, nullptr);
     g.inter_fb = VK_NULL_HANDLE, g.inter_view = VK_NULL_HANDLE, g.inter = VK_NULL_HANDLE;
     g.inter_memory = VK_NULL_HANDLE, g.inter_w = g.inter_h = 0;
+    std::memset(g.set_cache, 0, sizeof g.set_cache);
+    g.set_cache_next = 0;
+}
+
+VkDescriptorSet get_present_set(VkImageView view, VkBuffer ubo_buf) {
+    const uint64_t ep = async_gpu() ? frame_descriptor_epoch(false) : 0;
+    if (ep) {
+        for (const auto& c : g.set_cache) {
+            if (c.epoch == ep && c.view == view && c.ubo_buf == ubo_buf && c.set != VK_NULL_HANDLE)
+                return c.set;
+        }
+    }
+    VkDescriptorSet set = descriptor_set(g.set_layout);
+    if (!set) return VK_NULL_HANDLE;
+    VkDescriptorImageInfo ii{g.sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorBufferInfo bi{ubo_buf, 0, kOverlayBytes};
+    VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    w[0].dstSet = set, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &ii;
+    w[1].dstSet = set, w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    w[1].pBufferInfo = &bi;
+    p_vkUpdateDescriptorSets(vk_device(), 2, w, 0, nullptr);
+    if (ep) {
+        g.set_cache[g.set_cache_next & 7] = {ep, view, ubo_buf, set};
+        g.set_cache_next++;
+    }
+    return set;
 }
 
 // A full-target triangle drawn with the fragment shader `code` in render pass `pass` (g.layout). With `vertex`: that
@@ -243,7 +278,7 @@ bool build_pipeline(VkRenderPass pass, const uint32_t* code, size_t bytes, VkPip
     gp.pVertexInputState = &vin, gp.pInputAssemblyState = &ia, gp.pViewportState = &vp;
     gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pColorBlendState = &cb, gp.pDynamicState = &ds;
     gp.layout = g.layout, gp.renderPass = pass;
-    VkResult r = p_vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &gp, nullptr, out);
+    VkResult r = p_vkCreateGraphicsPipelines(d, pipeline_cache(), 1, &gp, nullptr, out);
     p_vkDestroyShaderModule(d, vs, nullptr);
     p_vkDestroyShaderModule(d, fs, nullptr);
     return r == VK_SUCCESS;
@@ -318,7 +353,7 @@ bool make_pipeline(VkFormat format) {
     if (p_vkCreateSampler(d, &si, nullptr, &g.sampler) != VK_SUCCESS) return false;
     VkDescriptorSetLayoutBinding b[2] = {
         {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, &g.sampler},
-        {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+        {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = 2, dli.pBindings = b;
     if (p_vkCreateDescriptorSetLayout(d, &dli, nullptr, &g.set_layout) != VK_SUCCESS) return false;
@@ -400,21 +435,6 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
         src.view_type != VK_IMAGE_VIEW_TYPE_2D || !(src.aspect & VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     transition(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    // The set and the circles' uniform data come from this submit's slot (descriptor pool and upload ring, reset when
-    // the slot is retired): nothing a frame still in flight reads is written. Per swapchain image they were not safe
-    // (MAILBOX can hand an image back before the frame that last drew into it finished; review of DEBUG-2.md #88).
-    VkDescriptorSet set = descriptor_set(g.set_layout);
-    Upload ubo = upload_alloc(kOverlayBytes, 256);
-    std::memset(ubo.ptr, 0, kOverlayBytes);
-    std::memcpy(static_cast<uint8_t*>(ubo.ptr) + 16 * kOverlayMax, kFont, sizeof kFont);
-    VkDescriptorImageInfo ii{g.sampler, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkDescriptorBufferInfo bi{ubo.buffer, ubo.offset, kOverlayBytes};
-    VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-    w[0].dstSet = set, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w[0].pImageInfo = &ii;
-    w[1].dstSet = set, w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    w[1].pBufferInfo = &bi;
-    p_vkUpdateDescriptorSets(vk_device(), 2, w, 0, nullptr);
 
     Push p{};
     // Host uv -> upright uv, undoing the clockwise turn the display applies (as vk_present.cpp).
@@ -462,10 +482,19 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
         uint32_t label = (plat::kGlyphDigit0 + v / 10) | (plat::kGlyphDigit0 + v % 10) << 5;
         shapes[count++] = {0.20f, 0.05f, 0.035f, 0.0f, label};
     }
-    auto* dst = reinterpret_cast<float*>(ubo.ptr);
-    for (size_t k = 0; k < count; k++)
-        dst[4 * k] = shapes[k].x, dst[4 * k + 1] = shapes[k].y, dst[4 * k + 2] = shapes[k].r,
-        dst[4 * k + 3] = std::clamp(shapes[k].alpha, 0.0f, 1.0f) + 4.0f * float(shapes[k].label);  // overlay.frag
+    // The set is cached per (descriptor epoch, view, upload buffer) while dynamic UBO offsets change per frame.
+    Upload ubo = upload_alloc(kOverlayBytes, 256);
+    if (count) {
+        std::memset(ubo.ptr, 0, kOverlayBytes);
+        std::memcpy(static_cast<uint8_t*>(ubo.ptr) + 16 * kOverlayMax, kFont, sizeof kFont);
+        auto* dst = reinterpret_cast<float*>(ubo.ptr);
+        for (size_t k = 0; k < count; k++)
+            dst[4 * k] = shapes[k].x, dst[4 * k + 1] = shapes[k].y, dst[4 * k + 2] = shapes[k].r,
+            dst[4 * k + 3] = std::clamp(shapes[k].alpha, 0.0f, 1.0f) + 4.0f * float(shapes[k].label);  // overlay.frag
+    }
+    VkDescriptorSet set = get_present_set(src.view, ubo.buffer);
+    if (!set) return false;
+    uint32_t dyn_off = uint32_t(ubo.offset);
     p.off[3] = tw / th;
 
     // FSR 1: upscale the shown part into `inter` (the picture's size on the target), then sharpen it in the main pass.
@@ -487,16 +516,12 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
         p_vkCmdSetViewport(cb, 0, 1, &ev);
         p_vkCmdSetScissor(cb, 0, 1, &es);
         p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.easu);
-        p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
+        p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 1, &dyn_off);
         p_vkCmdPushConstants(cb, g.layout, kPushStages, 0, sizeof e, &e);
         p_vkCmdDraw(cb, 3, 1, 0, 0);
         p_vkCmdEndRenderPass(cb);
-        rcas_set = descriptor_set(g.set_layout);
-        VkDescriptorImageInfo ri{g.sampler, g.inter_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet rw[2] = {w[0], w[1]};
-        rw[0].dstSet = rcas_set, rw[0].pImageInfo = &ri;
-        rw[1].dstSet = rcas_set;
-        p_vkUpdateDescriptorSets(vk_device(), 2, rw, 0, nullptr);
+        rcas_set = get_present_set(g.inter_view, ubo.buffer);
+        if (!rcas_set) return false;
         p.crop[0] = float(out_w), p.crop[1] = float(out_h), p.crop[2] = std::exp2(-fsr_sharpness()), p.crop[3] = 0;
     }
 
@@ -509,7 +534,7 @@ bool present_pass_record(VkCommandBuffer cb, GpuImage& src, const int32_t* crop,
     p_vkCmdSetScissor(cb, 0, 1, &sc);
     p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rcas_set ? g.rcas : g.pipeline);
     VkDescriptorSet main_set = rcas_set ? rcas_set : set;
-    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &main_set, 0, nullptr);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &main_set, 1, &dyn_off);
     p_vkCmdPushConstants(cb, g.layout, kPushStages, 0, sizeof p, &p);
     p_vkCmdDraw(cb, 3, 1, 0, 0);
     if (count && g.overlay) {  // the touch controls: a quad per circle, blended over the picture (overlay.frag)

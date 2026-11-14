@@ -44,7 +44,7 @@ placed in `Internal storage/Persona 5 Royal/mods/<ModName>/romfs/...` (see [docs
 
 ### Options
 
-Text language, resolution (360p, 480p, 720p, or 1080p), interface resolution, graphics (texture detail), frame rate
+Text language, resolution (360p, 480p, 540p, 720p, or 1080p), interface resolution, graphics (texture detail), frame rate
 cap (30, or 60 experimental), shadows, FPS counter, **Fullscreen (stretch)**, **Crowd NPCs** (toggle off to boost FPS in busy areas like Shibuya), **Post-processing / Bloom** (toggle off for lighter GPU load), **Touch controls** (show, size, opacity, L3/R3 buttons, and custom layout editor), **Touch stick & camera sensitivity** (50% to 250%), **Physical gamepad layout** (Nintendo vs Xbox/Android A/B and X/Y swap), **Import CPK** (for fan translations / language packs), and **Export logs** (generate and share debug logs directly from the device).
 
 ## Requirements
