@@ -53,6 +53,9 @@ struct ProgramLayout {
     // Set 0 bindings (< 64) that are UNIFORM_BUFFER_DYNAMIC: their ring offset goes with vkCmdBindDescriptorSets, so
     // the set depends only on which buffers and sizes it names (the set cache, nvn_sets.cpp). NX_DYNAMIC_UBO=0: none.
     uint64_t dynamic = 0;
+    // Set 1 bindings (< 64) that are STORAGE_BUFFER_DYNAMIC: their ring offset goes with vkCmdBindDescriptorSets, so
+    // compute skinning ring churn does not invalidate Set 1 descriptor sets across frames. NX_DYNAMIC_SSBO=0: none.
+    uint64_t dynamic_ssbo = 0;
 };
 const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages);
 

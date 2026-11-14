@@ -876,7 +876,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             GpuImage* dimg = image_of(t.depth);
             bool sampled = false;
             for (const ResolvedTexture& r : g_textures.resolved) {
-                if (r.texture && image_of(r.texture) == dimg) {
+                if (r.texture && (r.gpu_image ? r.gpu_image : image_of(r.texture)) == dimg) {
                     sampled = true;
                     break;
                 }
@@ -893,7 +893,7 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
             if (pimg && !clears_pending_image(pimg)) {
                 bool sampled = false;
                 for (const ResolvedTexture& r : g_textures.resolved) {
-                    if (r.texture && image_of(r.texture) == pimg) {
+                    if (r.texture && (r.gpu_image ? r.gpu_image : image_of(r.texture)) == pimg) {
                         sampled = true;
                         break;
                     }

@@ -316,6 +316,8 @@ struct Descriptors {
     std::vector<SetWrite> key;  // scratch for the set cache
     uint64_t dynamic = 0;              // set 0 bindings given a dynamic offset (ProgramLayout::dynamic)
     uint32_t dynamic_offset[64] = {};  // their ring offsets, by binding
+    uint64_t dynamic_ssbo = 0;         // set 1 bindings given a dynamic offset (ProgramLayout::dynamic_ssbo)
+    uint32_t dynamic_ssbo_offset[64] = {};
 };
 Descriptors g_sets;
 
@@ -336,7 +338,7 @@ std::vector<SetWrite> g_set_arena;
 uint64_t g_set_generation = 1, g_set_hits = 0, g_set_misses = 0;
 uint32_t g_set_used = 0;
 
-constexpr uint32_t kSet1Slots = 8192;  // separate Set 1 (SSBO) cache so compute skinning ring churn never wipes Set 0 / Set 2
+constexpr uint32_t kSet1Slots = 32768;  // separate Set 1 (SSBO) cache so compute skinning ring churn never wipes Set 0 / Set 2
 CachedSet g_set1_cache[kSet1Slots];
 std::vector<SetWrite> g_set1_arena;
 uint64_t g_set1_generation = 1;
@@ -578,6 +580,7 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
     else
         d.writes.clear(), d.set_index.clear(), d.buffers.clear(), d.images.clear();
     d.dynamic = 0;
+    d.dynamic_ssbo = 0;
     const bool every_set = draw_slow(kSlowEmptySets), shared = !draw_slow(kSlowUploads), cached = set_cache_on();
     auto alloc_set_k = [&](uint32_t k) {
         return k == 1 ? ssbo_descriptor_set(layout.sets[k]) : descriptor_set(layout.sets[k]);
@@ -752,6 +755,9 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
             if (b.set == 0 && b.binding < 64 && layout.dynamic >> b.binding & 1) {  // the offset goes with the bind
                 d.dynamic |= 1ull << b.binding, d.dynamic_offset[b.binding] = uint32_t(info.offset);
                 info.offset = 0, type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            } else if (b.set == 1 && b.binding < 64 && layout.dynamic_ssbo >> b.binding & 1) {
+                d.dynamic_ssbo |= 1ull << b.binding, d.dynamic_ssbo_offset[b.binding] = uint32_t(info.offset);
+                info.offset = 0, type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
             }
             buffers.push_back(info);
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -848,6 +854,8 @@ struct BoundSets {
     VkDescriptorSet sets[4] = {};
     uint32_t dynamic_offsets[64] = {};
     uint32_t dynamic_count = 0;
+    uint32_t dynamic_ssbo_offsets[64] = {};
+    uint32_t dynamic_ssbo_count = 0;
 };
 BoundSets g_bound_sets[2] = {};  // 0: graphics, 1: compute
 uint64_t g_sets_bind_calls = 0, g_sets_bound = 0, g_sets_bind_skipped = 0;
@@ -864,15 +872,20 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
         p_vkUpdateDescriptorSets(vk_device(), uint32_t(d.writes.size()), d.writes.data(), 0, nullptr);
         d.writes.clear();
     }
-    // Set 0's dynamic offsets, in binding order (every dynamic binding of the layout; one no stage wrote: 0).
-    uint32_t offsets[64];
-    uint32_t noff = 0;
+    // Set 0 and Set 1 dynamic offsets, in binding order (every dynamic binding of the layout; one no stage wrote: 0).
+    uint32_t offsets[128];
+    uint32_t noff0 = 0;
     for (uint64_t m = layout.dynamic; m; m &= m - 1) {
         uint32_t b = uint32_t(__builtin_ctzll(m));
-        offsets[noff++] = d.dynamic >> b & 1 ? d.dynamic_offset[b] : 0;
+        offsets[noff0++] = d.dynamic >> b & 1 ? d.dynamic_offset[b] : 0;
+    }
+    uint32_t noff1 = 0;
+    for (uint64_t m = layout.dynamic_ssbo; m; m &= m - 1) {
+        uint32_t b = uint32_t(__builtin_ctzll(m));
+        offsets[noff0 + noff1++] = d.dynamic_ssbo >> b & 1 ? d.dynamic_ssbo_offset[b] : 0;
     }
     if (draw_slow(kSlowEmptySets) || draw_slow(kSlowState)) {
-        p_vkCmdBindDescriptorSets(cb, point, layout.layout, 0, 4, d.sets, noff, offsets);
+        p_vkCmdBindDescriptorSets(cb, point, layout.layout, 0, 4, d.sets, noff0 + noff1, offsets);
         return;
     }
 
@@ -886,6 +899,7 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
         b.layout = layout.layout;
         for (int k = 0; k < 4; k++) b.sets[k] = VK_NULL_HANDLE;
         b.dynamic_count = 0;
+        b.dynamic_ssbo_count = 0;
     }
 
     bool need[4] = {};
@@ -896,8 +910,11 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
             continue;
         }
         if (k == 0) {
-            need[0] = (b.sets[0] != d.sets[0] || b.dynamic_count != noff ||
-                       std::memcmp(b.dynamic_offsets, offsets, noff * sizeof(uint32_t)) != 0);
+            need[0] = (b.sets[0] != d.sets[0] || b.dynamic_count != noff0 ||
+                       std::memcmp(b.dynamic_offsets, offsets, noff0 * sizeof(uint32_t)) != 0);
+        } else if (k == 1) {
+            need[1] = (b.sets[1] != d.sets[1] || b.dynamic_ssbo_count != noff1 ||
+                       std::memcmp(b.dynamic_ssbo_offsets, offsets + noff0, noff1 * sizeof(uint32_t)) != 0);
         } else {
             need[k] = (b.sets[k] != d.sets[k]);
         }
@@ -912,15 +929,28 @@ void bind_sets(VkCommandBuffer cb, VkPipelineBindPoint point, const ProgramLayou
         }
         uint32_t n = 1;
         while (k + n < 4 && need[k + n]) n++;
-        p_vkCmdBindDescriptorSets(cb, point, layout.layout, k, n, d.sets + k, k == 0 ? noff : 0, offsets);
+        uint32_t dyn_count = 0;
+        const uint32_t* dyn_ptr = nullptr;
+        if (k == 0) {
+            dyn_count = (n >= 2) ? (noff0 + noff1) : noff0;
+            dyn_ptr = offsets;
+        } else if (k == 1) {
+            dyn_count = noff1;
+            dyn_ptr = offsets + noff0;
+        }
+        p_vkCmdBindDescriptorSets(cb, point, layout.layout, k, n, d.sets + k, dyn_count, dyn_ptr);
         if (gpu_profile_on()) gpu_profile_count(2);
         for (uint32_t i = 0; i < n; i++) {
             b.sets[k + i] = d.sets[k + i];
             g_sets_bound++;
         }
         if (k == 0) {
-            b.dynamic_count = noff;
-            std::memcpy(b.dynamic_offsets, offsets, noff * sizeof(uint32_t));
+            b.dynamic_count = noff0;
+            std::memcpy(b.dynamic_offsets, offsets, noff0 * sizeof(uint32_t));
+        }
+        if (k <= 1 && k + n > 1) {
+            b.dynamic_ssbo_count = noff1;
+            std::memcpy(b.dynamic_ssbo_offsets, offsets + noff0, noff1 * sizeof(uint32_t));
         }
         k += n;
     }

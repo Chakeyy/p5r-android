@@ -317,6 +317,27 @@ const ProgramLayout& program_layout(const std::vector<const ShaderInfo*>& stages
             if (n < 64 && dynamic >> n & 1) b.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         pl.dynamic = dynamic;
     }
+    static const uint32_t max_dynamic_ssbo = [] {
+        const char* e = std::getenv("NX_DYNAMIC_SSBO");
+#if defined(__ANDROID__)
+        if (e && e[0] == '0') return 0u;
+#else
+        if (!e || e[0] != '1') return 0u;
+#endif
+        VkPhysicalDeviceProperties p{};
+        p_vkGetPhysicalDeviceProperties(vk_physical(), &p);
+        log("nvn/vk: storage buffers bound with dynamic offsets (up to %u per layout)",
+            p.limits.maxDescriptorSetStorageBuffersDynamic);
+        return p.limits.maxDescriptorSetStorageBuffersDynamic;
+    }();
+    uint64_t dynamic_ssbo = 0;
+    for (auto& [n, b] : sets[1])
+        if (b.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && b.descriptorCount == 1 && n < 64) dynamic_ssbo |= 1ull << n;
+    if (dynamic_ssbo && uint32_t(__builtin_popcountll(dynamic_ssbo)) <= max_dynamic_ssbo) {
+        for (auto& [n, b] : sets[1])
+            if (n < 64 && dynamic_ssbo >> n & 1) b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        pl.dynamic_ssbo = dynamic_ssbo;
+    }
     for (int k = 0; k < 4; k++) {
         std::vector<VkDescriptorSetLayoutBinding> v;
         for (auto& [n, b] : sets[k]) v.push_back(b);

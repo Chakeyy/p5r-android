@@ -442,7 +442,7 @@ void frame_init(VkCommandPool pool, uint32_t family, VkBuffer ring, uint8_t* rin
     for (uint32_t k = 0; k < g_slot_count; k++) {
         if (g_slot_pools) {
             VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-            pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            pci.flags = 0;
             pci.queueFamilyIndex = family;
             g_slot_pools = p_vkCreateCommandPool(d, &pci, nullptr, &g_slots[k].pool) == VK_SUCCESS;
         }
@@ -643,10 +643,11 @@ void frame_log(uint64_t frames) {
         log("nvn/vk: the game's waits (syncs, finish, pool invalidate/finalize): %llu blocked, %.2f ms per frame",
             (unsigned long long)waits, double(g_game_wait_ns.exchange(0)) / 1e6 / double(frames));
     if (g_peak_sets) {
-        log("nvn/vk: descriptor pool peak per submit: %u sets, ubo %u, ubo dynamic %u, ssbo %u, sampler %u, storage image %u, "
-            "texel %u+%u (pool: 32768 sets, 65536 / 65536 / 65536 / 65536 / 4096 / 1024+1024)",
+        log("nvn/vk: descriptor pool peak per submit: %u sets, ubo %u, ubo dynamic %u, ssbo %u, ssbo dynamic %u, sampler %u, storage image %u, "
+            "texel %u+%u (pool: 32768 sets, 65536 / 65536 / 65536 / 65536 / 65536 / 4096 / 1024+1024)",
             g_peak_sets, g_peak_descs[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER], g_peak_descs[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC],
-            g_peak_descs[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER], g_peak_descs[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER],
+            g_peak_descs[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER], g_peak_descs[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC],
+            g_peak_descs[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER],
             g_peak_descs[VK_DESCRIPTOR_TYPE_STORAGE_IMAGE], g_peak_descs[VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER],
             g_peak_descs[VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER]);
         g_peak_sets = 0, std::fill(std::begin(g_peak_descs), std::end(g_peak_descs), 0u);
@@ -699,6 +700,7 @@ uint64_t frame_descriptor_epoch(bool force_rotate) {
                            b.descs_used[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER] >= 49152 ||
                            b.descs_used[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC] >= 49152 ||
                            b.descs_used[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER] >= 49152 ||
+                           b.descs_used[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC] >= 49152 ||
                            b.descs_used[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER] >= 49152 ||
                            b.descs_used[VK_DESCRIPTOR_TYPE_STORAGE_IMAGE] >= 3072;
     if (force_rotate || near_full) {
@@ -718,7 +720,8 @@ uint64_t frame_ssbo_descriptor_epoch(bool force_rotate) {
     if (!async_gpu()) return ++g_ssbo_desc_epoch;
     DescBank& b = g_ssbo_desc_banks[g_active_ssbo_bank];
     const bool near_full = b.sets_used >= 24576 ||
-                           b.descs_used[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER] >= 49152;
+                           b.descs_used[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER] >= 49152 ||
+                           b.descs_used[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC] >= 49152;
     if (force_rotate || near_full) {
         g_active_ssbo_bank = (g_active_ssbo_bank + 1) % kDescBanks;
         DescBank& next = g_ssbo_desc_banks[g_active_ssbo_bank];
