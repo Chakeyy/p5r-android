@@ -8,8 +8,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <unordered_map>
+#include <vector>
 
 #include "nvn_draw_state.h"
 
@@ -24,15 +24,19 @@ namespace {
 struct Entry {
     uint64_t size = 0, padded = 0;
     Upload upload;
-    const uint8_t* max_end = nullptr;
 };
-// By host address; several sizes of one address are rare, so the latest one is kept.
-std::map<const uint8_t*, Entry> g_copies;
+
+struct DedupSpan {
+    const uint8_t* p = nullptr;
+    uint64_t size = 0;
+    uint32_t front_idx = 0;
+};
+// Recorded spans in the current submit for linear invalidation, keeping reserved capacity across submits.
+std::vector<DedupSpan> g_copies;
 uint64_t g_saved = 0, g_copied = 0;
 
-// In front of the map (a tree walk per bound buffer of every draw, and most are hits): a slot per address hash with a
-// copy of that address's entry in g_copies. A slot of the current generation always equals the map's entry: both are
-// written together, dedup_invalidate clears the slot of each entry it erases, dedup_reset starts a new generation.
+// Direct-mapped front cache per address hash. A slot of the current generation holds the submit's latest entry
+// for that address; dedup_invalidate clears matching slots and dedup_reset advances the generation.
 struct Front {
     const uint8_t* p = nullptr;
     uint64_t generation = 0;
@@ -42,9 +46,9 @@ constexpr size_t kFrontSlots = 32768;
 Front g_front[kFrontSlots];
 uint64_t g_generation = 1;
 static uint64_t s_dedup_inval = 1;
-Front& front_of(const uint8_t* p) {
-    uintptr_t v = uintptr_t(p);
-    return g_front[(v >> 4 ^ v >> 13 ^ v >> 22) & (kFrontSlots - 1)];
+inline uint32_t front_index_of(const uint8_t* p) {
+    const uintptr_t v = uintptr_t(p);
+    return uint32_t(((v >> 4) ^ (v >> 13) ^ (v >> 22)) & (kFrontSlots - 1));
 }
 
 // NX_UPLOAD_STATS: bytes copied per kind, and of those the bytes equal to the last copy of the same address and size.
@@ -91,14 +95,9 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
             return s_last_dedup_entry.upload;
         }
     }
-    Front& f = front_of(p);
-    const Entry* e = nullptr;
-    if (!off && f.generation == g_generation && f.p == p) {
-        e = &f.entry;  // the map's entry for p
-    } else if (auto it = off ? g_copies.end() : g_copies.find(p); it != g_copies.end()) {
-        f = {p, g_generation, it->second};
-        e = &f.entry;
-    }
+    const uint32_t f_idx = front_index_of(p);
+    Front& f = g_front[f_idx];
+    const Entry* e = (!off && f.generation == g_generation && f.p == p) ? &f.entry : nullptr;
     if (e && e->size == size && e->padded == padded && e->upload.offset % align == 0) {
         g_saved += padded;
         s_last_dedup_p = p;
@@ -108,21 +107,13 @@ Upload dedup_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t a
     }
     frame_guest_read(p, size);  // deferred write-backs over these bytes land first (nvn_frames.cpp)
     auto record_entry = [&](const Upload& u) {
-        Entry ent{size, padded, u, p + size};
-        auto [it, inserted] = g_copies.insert_or_assign(p, ent);
-        const uint8_t* me = p + size;
-        if (it != g_copies.begin()) {
-            const uint8_t* prev_me = std::prev(it)->second.max_end;
-            if (prev_me > me) me = prev_me;
-        }
-        it->second.max_end = me;
-        for (auto nxt = std::next(it); nxt != g_copies.end() && nxt->second.max_end < me; ++nxt) {
-            nxt->second.max_end = me;
-        }
-        f = {p, g_generation, it->second};
+        Entry ent{size, padded, u};
+        f = {p, g_generation, ent};
         s_last_dedup_p = p;
         s_last_dedup_gen = g_generation;
-        s_last_dedup_entry = it->second;
+        s_last_dedup_entry = ent;
+        if (g_copies.capacity() < 1024) g_copies.reserve(1024);
+        g_copies.push_back({p, size, f_idx});
     };
     Upload u;
     if (g_upload_kind != kUploadOther && cache_upload(p, size, padded, align, u)) {  // nvn_buffer_cache.cpp
@@ -152,15 +143,19 @@ void dedup_invalidate(const uint8_t* p, uint64_t size) {
     index_cache_invalidate(p, size);
     sets_invalidate_range(p, size);
     s_last_dedup_p = nullptr;
-    // Entries starting before p may still reach into it: augmented max_end stops at the first non-reaching prefix.
-    auto it = g_copies.lower_bound(p + size);
-    while (it != g_copies.begin()) {
-        --it;
-        if (it->second.max_end <= p) break;
-        if (it->first + it->second.size <= p) continue;
-        if (Front& f = front_of(it->first); f.p == it->first) f.generation = 0;
-        it = g_copies.erase(it);
+    if (!p || !size || g_copies.empty()) return;
+    const uint8_t* const end = p + size;
+    size_t kept = 0;
+    for (size_t i = 0; i < g_copies.size(); i++) {
+        const DedupSpan& span = g_copies[i];
+        if (span.p < end && span.p + span.size > p) {
+            Front& f = g_front[span.front_idx];
+            if (f.p == span.p) f.generation = 0;
+        } else {
+            g_copies[kept++] = span;
+        }
     }
+    g_copies.resize(kept);
 }
 
 // c[0], the NVN driver's constants, as far as shaders read them (docs/nvn/TRANSLATOR.md): buffer descriptors

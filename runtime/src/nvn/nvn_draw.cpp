@@ -89,7 +89,8 @@ struct Bound {
     VkViewport viewport{};
     VkRect2D scissor{};
     float blend[4] = {};
-    uint32_t raster[10] = {};  // raster_dynamic's inputs: stencil reference and masks per face, the depth bias
+    uint32_t stencil[6] = {};  // stencil reference and masks per face
+    uint32_t bias[4] = {};     // depth bias factor/units/clamp + equal_slack flag
 } g_bound;
 uint64_t g_state_set = 0, g_state_kept = 0;  // state commands recorded and left out, for the log
 VkPipeline g_last_compute_pipeline = VK_NULL_HANDLE;
@@ -156,14 +157,19 @@ void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc) {
     if (differs(!same_bytes(b.scissor, sc))) p_vkCmdSetScissor(cb, 0, 1, &sc), b.scissor = sc;
     if (differs(std::memcmp(b.blend, s.blend_color, sizeof b.blend) != 0))
         p_vkCmdSetBlendConstants(cb, s.blend_color), std::memcpy(b.blend, s.blend_color, sizeof b.blend);
-    uint32_t raster[10] = {s.stencil_ref[0],        s.stencil_ref[1],        s.stencil_compare_mask[0],
-                          s.stencil_compare_mask[1], s.stencil_write_mask[0], s.stencil_write_mask[1]};
-    std::memcpy(raster + 6, &s.bias_factor, 4), std::memcpy(raster + 7, &s.bias_units, 4);
-    std::memcpy(raster + 8, &s.bias_clamp, 4);
+    uint32_t stencil[6] = {s.stencil_ref[0],          s.stencil_ref[1],
+                           s.stencil_compare_mask[0], s.stencil_compare_mask[1],
+                           s.stencil_write_mask[0],   s.stencil_write_mask[1]};
+    if (differs(std::memcmp(b.stencil, stencil, sizeof stencil) != 0))
+        stencil_dynamic(cb), std::memcpy(b.stencil, stencil, sizeof stencil);
+    uint32_t bias[4];
+    std::memcpy(bias + 0, &s.bias_factor, 4);
+    std::memcpy(bias + 1, &s.bias_units, 4);
+    std::memcpy(bias + 2, &s.bias_clamp, 4);
     bool slack = s.depth.depth_test && equal_slack_pass(s.depth);
-    raster[9] = slack;
-    if (differs(std::memcmp(b.raster, raster, sizeof raster) != 0))  // stencil reference and masks, depth bias
-        raster_dynamic(cb, slack), std::memcpy(b.raster, raster, sizeof raster);  // (nvn_raster.cpp)
+    bias[3] = slack;
+    if (differs(std::memcmp(b.bias, bias, sizeof bias) != 0))
+        depth_bias_dynamic(cb, slack), std::memcpy(b.bias, bias, sizeof bias);  // (nvn_raster.cpp)
 }
 
 // No colour image behind any of the targets' colour slots: P5R binds its shadow maps with two empty colour slots.
@@ -1173,7 +1179,6 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
         p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         g_bound.pipeline = pipeline, g_state_set++;
         g_last_compute_pipeline = VK_NULL_HANDLE;
-        std::memset(g_bound.raster, 0xFF, sizeof g_bound.raster);  // Force dynamic raster/stencil rebind on pipeline switch
         if (gpu_profile_on()) gpu_profile_count(1);
     } else {
         g_state_kept++;

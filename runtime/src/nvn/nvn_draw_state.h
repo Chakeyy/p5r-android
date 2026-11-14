@@ -189,6 +189,8 @@ bool debug_shader_overrides(const std::vector<const ShaderInfo*>*& shaders, cons
 // nvn_raster.cpp: the stencil, polygon offset, depth bounds and depth clamp commands into g_state (false for other
 // commands), and their dynamic state for the next draw (stencil reference and masks, depth bias).
 bool raster_command(const Cmd& c);
+void stencil_dynamic(VkCommandBuffer cb);
+void depth_bias_dynamic(VkCommandBuffer cb, bool slack);
 void raster_dynamic(VkCommandBuffer cb, bool slack);  // slack: equal_slack_pass (nvn.h)
 
 void trace_compute_once(const ShaderInfo* cs, uint32_t x, uint32_t y, uint32_t z);
