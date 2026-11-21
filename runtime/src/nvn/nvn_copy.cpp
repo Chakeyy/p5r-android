@@ -84,14 +84,12 @@ void ClearTexture(CPU& c) {
 
 // The image of a texture a copy or clear is about to fill. One never uploaded is cleared, not untiled from its guest
 // memory first: the GPU writes such textures, so that memory holds nothing of them here.
-GpuImage* fill_target(VkCommandBuffer cb, uint64_t texture, bool skip_clear = false) {
+GpuImage* fill_target(VkCommandBuffer cb, uint64_t texture) {
     Texture* t = get<Texture>(texture);
     GpuImage* img = t ? image_of(texture) : nullptr;
     if (!img) return nullptr;
-    if (!img->uploaded && !img->rendered && !t->dirty && !t->has_writes.load(std::memory_order_acquire)) {
-        if (!skip_clear) clear_image(cb, *img);
-        img->uploaded = true;
-    }
+    if (!img->uploaded && !img->rendered && !t->dirty && !t->has_writes.load(std::memory_order_acquire))
+        clear_image(cb, *img), img->uploaded = true;
     return ensure_contents(cb, texture);
 }
 
@@ -238,10 +236,7 @@ void replay_buffer_copy(VkCommandBuffer cb, const Cmd& c, const CmdList& list) {
     static uint64_t copies = 0, failed = 0;
     Texture* t = get<Texture>(c.a[1]);
     const uint8_t* src = replay::guest_bytes(c.a[0]);
-    const bool whole_single = t && t->levels <= 1 && t->depth <= 1 && info.dst_view.base_level == 0 &&
-                              info.dst_view.min_layer == 0 && info.dst[0] <= 0 && info.dst[1] <= 0 &&
-                              info.dst[3] >= int32_t(t->width) && info.dst[4] >= int32_t(t->height);
-    GpuImage* img = t && src ? fill_target(cb, c.a[1], whole_single) : nullptr;
+    GpuImage* img = t && src ? fill_target(cb, c.a[1]) : nullptr;
     if (img && (img->hud || img->low_3d || img->shadow)) img = nullptr;  // unscaled texels for downscaled/upscaled targets
     if (!img || !upload_region(cb, *t, *img, info.dst_view.base_level, info.dst_view.min_layer, info.dst, src)) {
         if (++failed <= 10)
