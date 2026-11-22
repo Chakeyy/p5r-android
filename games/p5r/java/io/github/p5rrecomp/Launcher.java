@@ -815,7 +815,7 @@ public class Launcher extends Activity {
                 "Records engine & GPU details to nx.log (crashes are always logged automatically)",
                 new String[] {"0", "1"},
                 new String[] {"NO", "SÍ"},
-                new String[] {"OFF", "ON"}, 0, false));
+                new String[] {"OFF", "ON"}, 1, false));
 
         // CONTROLS (Touchscreen -> Gamepad)
         options.add(new Option(TAB_CONTROLS, "NX_TOUCH_SHOW",
@@ -2262,6 +2262,13 @@ public class Launcher extends Activity {
 
     void refresh() {
         load();
+        if (!prefs().getBoolean("nx_log_default_on_v1", false)) {
+            prefs().edit().putBoolean("nx_log_default_on_v1", true).apply();
+            config.put("NX_ENABLE_LOG", "1");
+            if (hasAccess() && dataDir().isDirectory()) {
+                writeConfig(new File(dataDir(), "config.txt"), config);
+            }
+        }
         for (Option o : options) {
             String v = config.get(o.key);
             if ("RESOLUTION".equals(o.key) && v == null) {

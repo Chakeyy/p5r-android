@@ -45,10 +45,6 @@
 #include "platform_android.h"
 #include "touch_layout.h"
 
-namespace nx::nvn {
-void debug_request_capture();
-}  // namespace nx::nvn
-
 // Android input: game controllers and touch (split from platform_android.cpp).
 namespace nx::plat {
 
@@ -251,23 +247,6 @@ int32_t on_input(android_app*, AInputEvent* e) {
     if ((src & AINPUT_SOURCE_TOUCHSCREEN) != AINPUT_SOURCE_TOUCHSCREEN) return 0;
     int32_t action = AMotionEvent_getAction(e);
     int32_t kind = action & AMOTION_EVENT_ACTION_MASK;
-    // 3-finger tap anywhere on screen (only when Debug logging / NX_ENABLE_LOG=1 is enabled):
-    // arms a 1-frame draw trace (trace_draws) + frame dump (dump_frames) with a 2-second debounce.
-    if (kind == AMOTION_EVENT_ACTION_POINTER_DOWN && AMotionEvent_getPointerCount(e) == 3) {
-        static const bool log_on = [] {
-            const char* en = std::getenv("NX_ENABLE_LOG");
-            return !en || (en[0] != '0' && std::strcmp(en, "false") != 0);
-        }();
-        static uint64_t s_last_hotkey_ns = 0;
-        const uint64_t now_hk = monotonic_ns();
-        if (log_on && now_hk >= s_last_hotkey_ns + 2'000'000'000ull) {
-            s_last_hotkey_ns = now_hk;
-            nx::nvn::debug_request_capture();
-            nx::log("debug hotkey (3-finger tap): armed trace_draws + dump_hud + dump_frames");
-            show_toast("Debug trace captured");
-        }
-        return 1;
-    }
     if (!touch_enabled()) return 0;  // NX_TOUCH_SHOW=0
     size_t index = size_t((action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
     const uint64_t now = monotonic_ns();
