@@ -65,6 +65,7 @@ std::atomic<uint64_t> g_picture_latency{0};  // ns, smoothed
 bool g_dynamic_rendering = true;  // vkCmdBeginRendering (core 1.3); else render pass objects
 bool g_integrated = false;
 bool g_require_sg32 = false;  // compute pipelines are made with a required subgroup size of 32 (Maxwell's warp)  // the chosen GPU is an integrated one (unified memory, the GPU is the long side)
+bool g_mali_legacy_driver = false;
 VkPhysicalDeviceProperties g_device_props{};
 VkPhysicalDeviceFeatures g_features{};  // the core features enabled (vk_features())
 DynamicStateCaps g_dyn_caps{};
@@ -280,6 +281,16 @@ bool init() {
         has_extension(dext, "VK_EXT_depth_clip_control") ? 1u : 0u);
     log("nvn/vk: portability: format reinterpretation %u, format swizzle %u", fport.fields[2], fport.fields[3]);
     log_device_caps(g_physical, dext);  // nvn_caps.cpp
+    {
+        const bool is_pan = std::strstr(props.deviceName, "Panfrost") != nullptr ||
+                            std::strstr(props.deviceName, "PanVK") != nullptr;
+        const bool has_rob2 = has_extension(dext, "VK_EXT_robustness2");
+        g_mali_legacy_driver = is_mali() && !is_pan && (!has_rob2 || props.driverVersion < 0x0d801000u);
+        if (g_mali_legacy_driver) {
+            log("nvn/vk: older ARM Mali driver detected (driver %#x, robustness2 %u): enabling padded UBOs and full pass barriers",
+                props.driverVersion, has_rob2 ? 1u : 0u);
+        }
+    }
 
     // Dynamic state probing: Vulkan 1.3 promotes EDS1 + EDS2 to core; on 1.1/1.2 fall back to extensions.
     // EDS3 reduces blend/mask/polygonMode/depthClamp/alphaToCoverage pipeline variants further where supported.
@@ -645,6 +656,7 @@ bool is_mali() {
            std::strstr(g_device_props.deviceName, "PanVK") != nullptr ||
            g_device_props.vendorID == 0x13b5;
 }
+bool is_mali_legacy_driver() { return g_mali_legacy_driver; }
 bool is_adreno() {
     return std::strstr(g_device_props.deviceName, "Adreno") != nullptr || g_device_props.vendorID == 0x5143;
 }

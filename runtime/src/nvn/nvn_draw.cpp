@@ -68,7 +68,8 @@ bool narrow_pass_barrier() {
 #if defined(__ANDROID__)
     static const bool on = [] {
         const char* e = std::getenv("NX_PASS_BARRIER_NARROW");
-        return !(e && e[0] == '0');
+        if (e && e[0]) return e[0] != '0';
+        return !is_mali_legacy_driver();
     }();
 #else
     static const bool on = std::getenv("NX_PASS_BARRIER_NARROW") != nullptr;
@@ -1126,7 +1127,7 @@ void set_dynamic(VkCommandBuffer cb, const VkViewport& vp, const VkRect2D& sc, c
 // render pass so Mali TBDR can use VK_ATTACHMENT_LOAD_OP_DONT_CARE instead of loading stale pixels from LPDDR.
 uint32_t compute_dont_care_color_mask(const Targets& tt, const ShaderInfo* vs, const ShaderInfo* fs,
                                       uint32_t mode, bool indexed, const Cmd& c) {
-    static const bool s_no_dont_care = std::getenv("NX_NO_DONT_CARE_LOAD") != nullptr;
+    static const bool s_no_dont_care = std::getenv("NX_NO_DONT_CARE_LOAD") != nullptr || is_mali_legacy_driver();
     if (s_no_dont_care || !vs || !fs || fs->refl.uses_discard || !tt.color_count || tt.color_count > 8) return 0;
     if (g_state.depth.depth_test || g_state.depth.stencil_test || g_state.alpha_to_coverage || g_state.cond_on || s_exp3d)
         return 0;

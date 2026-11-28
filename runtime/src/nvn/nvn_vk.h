@@ -139,6 +139,7 @@ struct DynamicStateCaps {
 const DynamicStateCaps& vk_dynamic_caps();
 bool is_xclipse();
 bool is_mali();
+bool is_mali_legacy_driver();
 bool is_adreno();
 bool is_adreno_8xx();
 bool is_powervr();
