@@ -302,10 +302,21 @@ uint64_t pad_min(uint64_t want) {
 #if defined(__APPLE__)
         return true;
 #else
-        return std::getenv("NX_PAD_BUFFERS") != nullptr || !vk_features().robustBufferAccess;
+        const char* e = std::getenv("NX_PAD_BUFFERS");
+        if (e && e[0] == '0') return false;
+        return (e && e[0] != '\0') || !vk_features().robustBufferAccess;
 #endif
     }();
     return pad ? want : 16;
+}
+
+bool mali_legacy_ubo_pad() {
+    static const bool on = [] {
+        const char* e = std::getenv("NX_PAD_BUFFERS");
+        if (e && e[0] == '0') return false;
+        return is_mali_legacy_driver();
+    }();
+    return on;
 }
 
 // guest: the bytes are guest memory (a copy is shared by later draws of the submit); host scratch data (the support
@@ -905,7 +916,10 @@ void build_sets(VkCommandBuffer cb, const std::vector<const ShaderInfo*>& shader
                 case NvnSource::UniformAsStorage: {
                     const Range& r = b.nvn.index >= 0 && b.nvn.index < 18 ? g_state.uniforms[st][b.nvn.index] : Range{};
                     const uint64_t max_pad = pad_min(0x10000);
-                    const uint64_t want_min = max_pad == 16 ? 16 : pad_min((b.set == 0 && b.binding < 64 && ((s->masks_known ? s->dynamic_uniforms : dynamic_uniform_bindings(s)) >> b.binding & 1)) ? 0x10000 : 0x1000);
+                    const bool pad_ubo = (max_pad != 16) || mali_legacy_ubo_pad();
+                    const bool dyn_ubo = pad_ubo && b.set == 0 && b.binding < 64 &&
+                                         ((s->masks_known ? s->dynamic_uniforms : dynamic_uniform_bindings(s)) >> b.binding & 1);
+                    const uint64_t want_min = pad_ubo ? (dyn_ubo ? 0x10000 : 0x1000) : 16;
                     const size_t ac_base = ((r.address >> 4) ^ (r.address >> 12)) & (kAddrUboCacheSlots - 1);
                     if (shared && st < 2 && b.nvn.index >= 0 && b.nvn.index < 18 && r.address) {
                         SlotBufferCache& slot = s_ubo_cache[st][b.nvn.index];

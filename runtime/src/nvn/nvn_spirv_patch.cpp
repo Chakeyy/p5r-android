@@ -831,10 +831,12 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
     static const bool zero_outputs = [] {  // NX_ZERO_VS_OUTPUTS=0 turns it off (1 turns it on for MoltenVK, not tried)
         const char* e = std::getenv("NX_ZERO_VS_OUTPUTS");
 #if defined(__APPLE__)
-        return e && e[0] == '1';
+        const bool v = e && e[0] == '1';
 #else
-        return !(e && e[0] == '0');
+        const bool v = !(e && e[0] == '0');
 #endif
+        if (e && e[0]) log("nvn/vk: NX_ZERO_VS_OUTPUTS=%s -> %s", e, v ? "on" : "off");
+        return v;
     }();
     if (zero_outputs && s->stage == ShaderStage::Vertex && zero_vertex_outputs(code, next)) code.swap(next);
     static const bool invariant = [] {
@@ -844,7 +846,9 @@ std::vector<uint32_t> patched_spirv(const ShaderInfo* s, const uint8_t* kinds, u
     if (invariant && s->stage == ShaderStage::Vertex && make_position_invariant(code, next)) code.swap(next);
     static const bool fc = [] {
         const char* e = std::getenv("NX_FLOAT_CONTROLS");
-        return e && std::atoi(e) != 0;
+        const bool v = e && std::atoi(e) != 0;
+        if (e && e[0]) log("nvn/vk: NX_FLOAT_CONTROLS=%s -> %s", e, v ? "on" : "off");
+        return v;
     }();
     if (fc && s->stage != ShaderStage::Compute && preserve_inf_nan(code, next)) code.swap(next);
     static const bool mali_opt = [] {
