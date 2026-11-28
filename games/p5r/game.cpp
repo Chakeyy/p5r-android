@@ -738,7 +738,7 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "launcher-a20-fix2";
+static constexpr const char* kPerfBuildTag = "launcher-a20-fix3-chakeyy";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
